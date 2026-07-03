@@ -39,6 +39,7 @@ import { BrokenAssetIcon } from '../shared/BrokenAssetIcon'
 import { getUncroppedSize } from '../shared/crop'
 import type { ShapeOptionsWithDisplayValues } from '../shared/getDisplayValues'
 import { HyperlinkButton } from '../shared/HyperlinkButton'
+import { getMediaBorderStyle } from '../shared/mediaBorder'
 import { useImageOrVideoAsset } from '../shared/useImageOrVideoAsset'
 import { usePrefersReducedMotion } from '../shared/usePrefersReducedMotion'
 import { TRANSPARENT_IMAGE_MIMETYPES, getAlphaData, preloadAlphaData } from './ImageAlphaCache'
@@ -98,6 +99,7 @@ export class ImageShapeUtil extends BaseBoxShapeUtil<TLImageShape> {
 			flipX: false,
 			flipY: false,
 			altText: '',
+			border: 'none',
 		}
 	}
 
@@ -436,6 +438,7 @@ const ImageShape = memo(function ImageShape({ shape }: { shape: TLImageShape }) 
 					width: shape.props.w,
 					height: shape.props.h,
 					borderRadius: shape.props.crop?.isCircle ? '50%' : undefined,
+					...getMediaBorderStyle(shape.props.border),
 				}}
 			>
 				<div className={classNames('tl-image-container')} style={containerStyle}>
