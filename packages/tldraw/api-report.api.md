@@ -2579,7 +2579,7 @@ export class ImageShapeUtil extends BaseBoxShapeUtil<TLImageShape> {
     // (undocumented)
     isAspectRatioLocked(shape: TLImageShape): boolean;
     // (undocumented)
-    isExportBoundsContainer(): boolean;
+    isExportBoundsContainer(shape: TLImageShape): boolean;
     // (undocumented)
     static migrations: TLPropsMigrations;
     // (undocumented)
