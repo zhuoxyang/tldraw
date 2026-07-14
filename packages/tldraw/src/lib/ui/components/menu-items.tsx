@@ -248,6 +248,7 @@ export function CopyAsMenuGroup() {
 			label="context-menu.copy-as"
 			size="small"
 			disabled={!atLeastOneShapeOnPage}
+			requiredActions={['copy-as-svg', 'copy-as-png']}
 		>
 			<TldrawUiMenuGroup id="copy-as-group">
 				<TldrawUiMenuActionItem actionId="copy-as-svg" />
@@ -257,6 +258,26 @@ export function CopyAsMenuGroup() {
 				{isDebugMode && <TldrawUiMenuActionItem actionId="copy-as-json" />}
 			</TldrawUiMenuGroup>
 			<TldrawUiMenuGroup id="copy-as-bg">
+				<ToggleTransparentBgMenuItem />
+			</TldrawUiMenuGroup>
+		</TldrawUiMenuSubmenu>
+	)
+}
+
+/** @public @react */
+export function ExportAsMenuGroup() {
+	return (
+		<TldrawUiMenuSubmenu
+			id="export-as"
+			label="context-menu.export-as"
+			size="small"
+			requiredActions={['export-as-svg', 'export-as-png']}
+		>
+			<TldrawUiMenuGroup id="export-as-group">
+				<TldrawUiMenuActionItem actionId="export-as-svg" />
+				<TldrawUiMenuActionItem actionId="export-as-png" />
+			</TldrawUiMenuGroup>
+			<TldrawUiMenuGroup id="export-as-bg">
 				<ToggleTransparentBgMenuItem />
 			</TldrawUiMenuGroup>
 		</TldrawUiMenuSubmenu>
@@ -301,15 +322,7 @@ export function ConversionsMenuGroup() {
 	return (
 		<TldrawUiMenuGroup id="conversions">
 			<CopyAsMenuGroup />
-			<TldrawUiMenuSubmenu id="export-as" label="context-menu.export-as" size="small">
-				<TldrawUiMenuGroup id="export-as-group">
-					<TldrawUiMenuActionItem actionId="export-as-svg" />
-					<TldrawUiMenuActionItem actionId="export-as-png" />
-				</TldrawUiMenuGroup>
-				<TldrawUiMenuGroup id="export-as-bg">
-					<ToggleTransparentBgMenuItem />
-				</TldrawUiMenuGroup>
-			</TldrawUiMenuSubmenu>
+			<ExportAsMenuGroup />
 			<DownloadOriginalMenuItem />
 		</TldrawUiMenuGroup>
 	)

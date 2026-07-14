@@ -55,7 +55,12 @@ export function DefaultMainMenuContent() {
 /** @public @react */
 export function ExportFileContentSubMenu() {
 	return (
-		<TldrawUiMenuSubmenu id="export-all-as" label="context-menu.export-all-as" size="small">
+		<TldrawUiMenuSubmenu
+			id="export-all-as"
+			label="context-menu.export-all-as"
+			size="small"
+			requiredActions={['export-all-as-svg', 'export-all-as-png']}
+		>
 			<TldrawUiMenuGroup id="export-all-as-group">
 				<TldrawUiMenuActionItem actionId="export-all-as-svg" />
 				<TldrawUiMenuActionItem actionId="export-all-as-png" />

@@ -1933,6 +1933,9 @@ export interface ExampleDialogProps {
 export function exportAs(editor: Editor, ids: TLShapeId[], opts: ExportAsOptions): Promise<void>;
 
 // @public (undocumented)
+export function ExportAsMenuGroup(): JSX.Element;
+
+// @public (undocumented)
 export interface ExportAsOptions extends TLImageExportOptions {
     format: TLExportType;
     name?: string;
@@ -4285,7 +4288,7 @@ export function TldrawUiMenuGroup({ id, label, className, children }: TLUiMenuGr
 export function TldrawUiMenuItem<TranslationKey extends string = string, IconType extends string = string>({ disabled, spinner, readonlyOk, id, kbd, label, icon, iconLeft, onSelect, noClose, isSelected, onDragStart }: TLUiMenuItemProps<TranslationKey, IconType>): JSX.Element | null;
 
 // @public (undocumented)
-export function TldrawUiMenuSubmenu<Translation extends string = string>({ id, disabled, label, size, children }: TLUiMenuSubmenuProps<Translation>): bigint | boolean | JSX.Element | Iterable<ReactNode> | null | number | Promise<bigint | boolean | ReactElement<unknown, JSXElementConstructor<any> | string> | ReactPortal | Iterable<ReactNode> | null | number | string | undefined> | string | undefined;
+export function TldrawUiMenuSubmenu<Translation extends string = string>({ id, disabled, label, size, children, requiredActions }: TLUiMenuSubmenuProps<Translation>): bigint | boolean | JSX.Element | Iterable<ReactNode> | null | number | Promise<bigint | boolean | ReactElement<unknown, JSXElementConstructor<any> | string> | ReactPortal | Iterable<ReactNode> | null | number | string | undefined> | string | undefined;
 
 // @public (undocumented)
 export function TldrawUiMenuToolItem({ toolId, ...rest }: TLUiMenuToolItemProps): JSX.Element | null;
@@ -5428,6 +5431,7 @@ export interface TLUiMenuSubmenuProps<Translation extends string = string> {
     label?: {
         [key: string]: Translation;
     } | Translation;
+    requiredActions?: string[];
     // (undocumented)
     size?: 'medium' | 'small' | 'tiny' | 'wide';
 }

@@ -1,6 +1,7 @@
 import { useContainer } from '@tldraw/editor'
 import { ContextMenu as _ContextMenu } from 'radix-ui'
 import { ReactNode } from 'react'
+import { useActions } from '../../../context/actions'
 import { useMenuIsOpen } from '../../../hooks/useMenuIsOpen'
 import { TLUiTranslationKey } from '../../../hooks/useTranslation/TLUiTranslationKey'
 import { useDirection, useTranslation } from '../../../hooks/useTranslation/useTranslation'
@@ -21,6 +22,12 @@ export interface TLUiMenuSubmenuProps<Translation extends string = string> {
 	disabled?: boolean
 	children: ReactNode
 	size?: 'tiny' | 'small' | 'medium' | 'wide'
+	/**
+	 * Action ids that this submenu's contents depend on. If provided, the submenu renders nothing
+	 * unless at least one of these actions exists. This keeps the submenu from showing an empty (or
+	 * pointless) trigger when a consumer has removed the underlying actions via `overrides`.
+	 */
+	requiredActions?: string[]
 }
 
 /** @public @react */
@@ -30,11 +37,18 @@ export function TldrawUiMenuSubmenu<Translation extends string = string>({
 	label,
 	size = 'small',
 	children,
+	requiredActions,
 }: TLUiMenuSubmenuProps<Translation>) {
 	const { type: menuType, sourceId } = useTldrawUiMenuContext()
+	const actions = useActions()
 	const container = useContainer()
 	const msg = useTranslation()
 	const dir = useDirection()
+
+	if (requiredActions && !requiredActions.some((actionId) => actions[actionId])) {
+		return null
+	}
+
 	const labelToUse = label
 		? typeof label === 'string'
 			? label
