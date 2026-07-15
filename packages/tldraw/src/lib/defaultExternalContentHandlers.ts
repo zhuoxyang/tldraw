@@ -578,12 +578,20 @@ export async function defaultHandleExternalUrlContent(
 	{ point, url }: { point?: VecLike; url: string },
 	{ toasts, msg }: TLDefaultExternalContentHandlerOpts
 ) {
-	// Ignore urls with a protocol we can't turn into a bookmark (bookmark shapes
-	// validate their `url` prop with T.linkUrl). Dropping content from a browser
-	// tab in Chrome with an ad blocker active supplies a url rewritten to
-	// `about:blank#blocked`; these are never user-intended content, so we ignore
-	// them silently rather than crashing on the validation error (#8097).
+	// If the url isn't one we can turn into a bookmark (bookmark shapes validate
+	// their `url` prop with T.linkUrl), fall back to dropping the raw string as a
+	// text shape rather than crashing on the validation error (#8097). Dragging
+	// content from a browser tab in Chrome with an ad blocker active supplies a
+	// url rewritten to `about:blank#blocked`; the text fallback keeps whatever
+	// was dropped visible instead of silently losing it. We skip data: urls,
+	// whose base64 payload would create an unusably large text shape.
+	// Computed before the guard below: T.linkUrl.isValid narrows `url` to `never`
+	// in its false branch, so read the string here while the type still holds.
+	const isDataUrl = url.startsWith('data:')
 	if (!T.linkUrl.isValid(url)) {
+		if (!isDataUrl) {
+			await editor.putExternalContent({ type: 'text', text: url, point })
+		}
 		return
 	}
 
