@@ -110,6 +110,21 @@ export type Awaitable<T> = T | PromiseLike<T>
 export type Required<T, K extends keyof T> = Expand<Omit<T, K> & { [P in K]-?: T[P] }>
 
 /**
+ * Resolves to `true` when `T` is exactly `any`, and `false` otherwise. Useful for guarding
+ * conditional types against `any`, which otherwise satisfies almost every `extends` check.
+ *
+ * @example
+ * ```ts
+ * type A = IsAny<any> // true
+ * type B = IsAny<string> // false
+ * type C = IsAny<unknown> // false
+ * ```
+ *
+ * @public
+ */
+export type IsAny<T> = 0 extends 1 & T ? true : false
+
+/**
  * Automatically makes properties optional if their type includes `undefined`.
  * This transforms properties like `prop: string | undefined` to `prop?: string | undefined`,
  * making the API more ergonomic by not requiring explicit undefined assignments.
@@ -138,12 +153,19 @@ export type Required<T, K extends keyof T> = Expand<Omit<T, K> & { [P in K]-?: T
  * }
  * ```
  *
+ * Properties typed as `any` are treated as required, since `any` technically
+ * includes `undefined` but is not intended to be optional.
+ *
  * @public
  */
 export type MakeUndefinedOptional<T extends object> = Expand<
 	{
-		[P in { [K in keyof T]: undefined extends T[K] ? never : K }[keyof T]]: T[P]
+		[P in {
+			[K in keyof T]: IsAny<T[K]> extends true ? K : undefined extends T[K] ? never : K
+		}[keyof T]]: T[P]
 	} & {
-		[P in { [K in keyof T]: undefined extends T[K] ? K : never }[keyof T]]?: T[P]
+		[P in {
+			[K in keyof T]: IsAny<T[K]> extends true ? never : undefined extends T[K] ? K : never
+		}[keyof T]]?: T[P]
 	}
 >

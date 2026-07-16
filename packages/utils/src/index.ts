@@ -97,6 +97,7 @@ export { Timers } from './lib/timers'
 export {
 	type Awaitable,
 	type Expand,
+	type IsAny,
 	type MakeUndefinedOptional,
 	type RecursivePartial,
 	type Required,

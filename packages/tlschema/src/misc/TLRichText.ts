@@ -39,7 +39,13 @@ export const richTextValidator = T.object({
  * }
  * ```
  */
-export type TLRichText = T.TypeOf<typeof richTextValidator>
+export interface TLRichText {
+	type: string
+	content: unknown[]
+	// Declared explicitly rather than inferred from `richTextValidator`: node attrs are
+	// open-ended, and an optional `any` cannot be expressed through the validator's type.
+	attrs?: any
+}
 
 /**
  * Converts a plain text string into a TLRichText object. Each line of the input

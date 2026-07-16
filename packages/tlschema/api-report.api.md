@@ -7,6 +7,7 @@
 import { BaseRecord } from '@tldraw/store';
 import { Expand } from '@tldraw/utils';
 import { IndexKey } from '@tldraw/utils';
+import { IsAny } from '@tldraw/utils';
 import { JsonObject } from '@tldraw/utils';
 import { LegacyMigrations } from '@tldraw/store';
 import { MakeUndefinedOptional } from '@tldraw/utils';
@@ -163,7 +164,7 @@ export function createAssetValidator<Type extends string, Props extends JsonObje
     [K in keyof Props]: T.Validatable<Props[K]>;
 } | T.Validator<Props>, meta?: {
     [K in keyof Meta]: T.Validatable<Meta[K]>;
-}): T.ObjectValidator<Expand<    { [P in "id" | "meta" | "typeName" | (undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseAsset<Type, Props>[P]; } & { [P in (undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseAsset<Type, Props>[P] | undefined; }>>;
+}): T.ObjectValidator<Expand<    { [P in "id" | "meta" | "typeName" | (IsAny<Props> extends true ? "props" : undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseAsset<Type, Props>[P]; } & { [P in (IsAny<Props> extends true ? never : undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseAsset<Type, Props>[P] | undefined; }>>;
 
 // @public
 export function createBindingId(id?: string): TLBindingId;
@@ -181,7 +182,7 @@ export function createBindingValidator<Type extends string, Props extends JsonOb
     [K in keyof Props]: T.Validatable<Props[K]>;
 }, meta?: {
     [K in keyof Meta]: T.Validatable<Meta[K]>;
-}): T.ObjectValidator<Expand<    { [P in "fromId" | "id" | "meta" | "toId" | "typeName" | (undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseBinding<Type, Props>[P]; } & { [P in (undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseBinding<Type, Props>[P] | undefined; }>>;
+}): T.ObjectValidator<Expand<    { [P in "fromId" | "id" | "meta" | "toId" | "typeName" | (IsAny<Props> extends true ? "props" : undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseBinding<Type, Props>[P]; } & { [P in (IsAny<Props> extends true ? never : undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseBinding<Type, Props>[P] | undefined; }>>;
 
 // @public
 export function createCachedUserResolve(resolveFn: (userId: string) => null | TLUser): (userId: string) => Signal<null | TLUser>;
@@ -222,7 +223,7 @@ export function createShapeValidator<Type extends string, Props extends JsonObje
     [K in keyof Props]: T.Validatable<Props[K]>;
 }, meta?: {
     [K in keyof Meta]: T.Validatable<Meta[K]>;
-}): T.ObjectValidator<Expand<    { [P in "id" | "index" | "isLocked" | "meta" | "opacity" | "parentId" | "rotation" | "typeName" | "x" | "y" | (undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseShape<Type, Props>[P]; } & { [P in (undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseShape<Type, Props>[P] | undefined; }>>;
+}): T.ObjectValidator<Expand<    { [P in "id" | "index" | "isLocked" | "meta" | "opacity" | "parentId" | "rotation" | "typeName" | "x" | "y" | (IsAny<Props> extends true ? "props" : undefined extends Props ? never : "props") | (undefined extends Type ? never : "type")]: TLBaseShape<Type, Props>[P]; } & { [P in (IsAny<Props> extends true ? never : undefined extends Props ? "props" : never) | (undefined extends Type ? "type" : never)]?: TLBaseShape<Type, Props>[P] | undefined; }>>;
 
 // @public
 export function createTLSchema({ shapes, bindings, assets, user, records, migrations }?: {
@@ -753,7 +754,7 @@ export function registerFontsFromThemes(definitions: TLThemes): void;
 
 // @public
 export const richTextValidator: T.ObjectValidator<{
-    attrs?: any;
+    attrs: any;
     content: unknown[];
     type: string;
 }>;
@@ -1594,7 +1595,14 @@ export interface TLRemovedDefaultThemeColors {
 }
 
 // @public
-export type TLRichText = T.TypeOf<typeof richTextValidator>;
+export interface TLRichText {
+    // (undocumented)
+    attrs?: any;
+    // (undocumented)
+    content: unknown[];
+    // (undocumented)
+    type: string;
+}
 
 // @public
 export type TLSchema = StoreSchema<TLRecord, TLStoreProps>;

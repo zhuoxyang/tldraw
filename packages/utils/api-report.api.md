@@ -222,6 +222,9 @@ export type IndexKey = string & {
 export function invLerp(a: number, b: number, t: number): number;
 
 // @public
+export type IsAny<T> = 0 extends 1 & T ? true : false;
+
+// @public
 export function isDefined<T>(value: T): value is typeof value extends undefined ? never : T;
 
 export { isEqual }
@@ -280,11 +283,11 @@ export class LruCache<K, V> {
 // @public
 export type MakeUndefinedOptional<T extends object> = Expand<{
     [P in {
-        [K in keyof T]: undefined extends T[K] ? never : K;
+        [K in keyof T]: IsAny<T[K]> extends true ? K : undefined extends T[K] ? never : K;
     }[keyof T]]: T[P];
 } & {
     [P in {
-        [K in keyof T]: undefined extends T[K] ? K : never;
+        [K in keyof T]: IsAny<T[K]> extends true ? never : undefined extends T[K] ? K : never;
     }[keyof T]]?: T[P];
 }>;
 
