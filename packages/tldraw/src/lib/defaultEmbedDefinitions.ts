@@ -1,4 +1,5 @@
 import { safeParseUrl } from '@tldraw/editor'
+import { oEmbedAspectRatio } from './utils/embeds/oEmbed'
 
 // Only allow multiplayer embeds. If we add additional routes later for example '/help' this won't match
 const TLDRAW_APP_RE = /(^\/[f|p|r|ro|s|v]\/[^/]+\/?$)/
@@ -539,6 +540,7 @@ export const DEFAULT_EMBED_DEFINITIONS = [
 		doesResize: true,
 		isAspectRatioLocked: true,
 		embedOnPaste: true,
+		getAspectRatio: oEmbedAspectRatio('https://vimeo.com/api/oembed.json'),
 		toEmbedUrl: (url) => {
 			const urlObj = safeParseUrl(url)
 			if (urlObj && urlObj.hostname === 'vimeo.com') {
@@ -742,6 +744,14 @@ export interface EmbedDefinition<Config = never> {
 	readonly canEditWhileLocked?: boolean
 	// TODO: FIXME this is ugly be required because some embeds have their own border radius for example spotify embeds
 	readonly overrideOutlineRadius?: number
+	/**
+	 * Optionally resolve the true aspect ratio (`width / height`) of the embedded content at runtime,
+	 * for example via the provider's oEmbed endpoint. When provided, the embed shape corrects its
+	 * size after creation so fixed-aspect media (like video) isn't letterboxed inside the default
+	 * box. Return `undefined` if the ratio can't be determined.
+	 */
+	// eslint-disable-next-line tldraw/method-signature-style
+	readonly getAspectRatio?: (url: string) => Promise<number | undefined>
 	// eslint-disable-next-line tldraw/method-signature-style
 	readonly toEmbedUrl: (url: string, config?: Config) => string | undefined
 	// eslint-disable-next-line tldraw/method-signature-style

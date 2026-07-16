@@ -1072,6 +1072,7 @@ export const DEFAULT_EMBED_DEFINITIONS: readonly [{
     readonly doesResize: true;
     readonly embedOnPaste: true;
     readonly fromEmbedUrl: (url: string) => string | undefined;
+    readonly getAspectRatio: (url: string) => Promise<number | undefined>;
     readonly height: 360;
     readonly hostnames: readonly ["vimeo.com", "player.vimeo.com"];
     readonly isAspectRatioLocked: true;
@@ -1769,6 +1770,7 @@ export interface EmbedDefinition<Config = never> {
     readonly embedOnPaste?: boolean;
     // (undocumented)
     readonly fromEmbedUrl: (url: string) => string | undefined;
+    readonly getAspectRatio?: (url: string) => Promise<number | undefined>;
     // (undocumented)
     readonly height: number;
     // (undocumented)
@@ -1859,6 +1861,7 @@ export class EmbedShapeUtil extends BaseBoxShapeUtil<TLEmbedShape> {
     options: EmbedShapeOptions;
     // (undocumented)
     static props: RecordProps<TLEmbedShape>;
+    resolveAspectRatio(shape: TLEmbedShape): Promise<void>;
     // @deprecated (undocumented)
     static setEmbedDefinitions(embedDefinitions: readonly TLEmbedDefinition[]): void;
     // (undocumented)
@@ -2946,6 +2949,9 @@ export function NoteToolbarItem(): JSX.Element;
 
 // @public
 export function notifyIfFileNotAllowed(editor: Editor, file: File, options: TLDefaultExternalContentHandlerOpts): boolean;
+
+// @public
+export function oEmbedAspectRatio(endpoint: string): (url: string) => Promise<number | undefined>;
 
 // @public (undocumented)
 export function OfflineIndicator(): JSX.Element;

@@ -24,7 +24,7 @@ import {
 	embedShapePermissionDefaults,
 	unknownEmbedShapePermissionOverrides,
 } from '../../defaultEmbedDefinitions'
-import { TLEmbedResult, getEmbedInfo } from '../../utils/embeds/embeds'
+import { TLEmbedResult, getCorrectedEmbedSize, getEmbedInfo } from '../../utils/embeds/embeds'
 import { BookmarkShapeComponent } from '../bookmark/BookmarkShapeUtil'
 import { ShapeOptionsWithDisplayValues, getDisplayValues } from '../shared/getDisplayValues'
 import { getRotatedBoxShadow } from '../shared/rotated-box-shadow'
@@ -101,6 +101,61 @@ export class EmbedShapeUtil extends BaseBoxShapeUtil<TLEmbedShape> {
 
 	getEmbedDefinition(url: string): TLEmbedResult {
 		return getEmbedInfo(this.getEmbedDefs(), url, this.options.embedConfig)
+	}
+
+	/** Resolved aspect ratios keyed by url, so we only hit the network once per url. */
+	private static resolvedAspectRatios = new Map<string, number | undefined>()
+
+	/**
+	 * Resolve the embed's true aspect ratio (if its definition supports it) and correct the shape's
+	 * size to match. Fetches at most once per url. The correction is applied without adding to the
+	 * undo history.
+	 */
+	async resolveAspectRatio(shape: TLEmbedShape) {
+		const { url } = shape.props
+		const definition = this.getEmbedDefinition(url)?.definition
+		if (!definition?.getAspectRatio || !url) return
+
+		let resolvedRatio: number | undefined
+		if (EmbedShapeUtil.resolvedAspectRatios.has(url)) {
+			resolvedRatio = EmbedShapeUtil.resolvedAspectRatios.get(url)
+		} else {
+			resolvedRatio = await definition.getAspectRatio(url)
+			EmbedShapeUtil.resolvedAspectRatios.set(url, resolvedRatio)
+		}
+
+		const latest = this.editor.getShape<TLEmbedShape>(shape.id)
+		// Bail if the shape is gone or its url changed while we were awaiting: a later run for the
+		// new url will handle it, and we must not apply this url's ratio to a different video.
+		if (!latest || latest.props.url !== url) return
+
+		const corrected = getCorrectedEmbedSize({
+			w: latest.props.w,
+			h: latest.props.h,
+			resolvedRatio,
+		})
+		if (!corrected) return
+
+		// Let the editor resize the shape: by default it scales around the shape's page-space center
+		// and along its own rotation axis, so the center stays fixed even if the embed was rotated
+		// before the ratio resolved. No need to compute x/y by hand.
+		//
+		// We pass `isAspectRatioLocked: false` because embeds like Vimeo lock their aspect ratio,
+		// which would otherwise make the editor merge our non-uniform scale into a single uniform
+		// factor — leaving the wrong ratio and defeating the whole correction.
+		this.editor.run(
+			() => {
+				this.editor.resizeShape(
+					latest.id,
+					{
+						x: corrected.w / latest.props.w,
+						y: corrected.h / latest.props.h,
+					},
+					{ isAspectRatioLocked: false }
+				)
+			},
+			{ history: 'ignore' }
+		)
 	}
 
 	override getText(shape: TLEmbedShape) {
@@ -270,6 +325,11 @@ export class EmbedShapeUtil extends BaseBoxShapeUtil<TLEmbedShape> {
 						allowFullScreen
 						style={{
 							border: 0,
+							// Fill the container exactly. Relying on the fixed pixel width/height causes
+							// the flex-centered iframe to be rounded independently from its box at
+							// fractional sizes/zooms, leaving a 1-2px background sliver on one edge.
+							width: '100%',
+							height: '100%',
 							pointerEvents: isInteractive ? 'auto' : 'none',
 							// Fix for safari <https://stackoverflow.com/a/49150908>
 							zIndex: isInteractive ? '' : '-1',
