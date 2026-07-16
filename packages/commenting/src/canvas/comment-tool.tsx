@@ -8,8 +8,12 @@ import {
 } from 'tldraw'
 import { type CommentingOptions, defaultCommentingOptions } from './options'
 import { getRegionCommentOptions } from './region-options'
-import { pendingComment, regionDraft } from './state'
+import { commentsSidebarOpen, pendingComment, regionDraft } from './state'
 import { regionPinPoint, shapeAnchorAt } from './thread-state'
+
+/** Marks the container while the comment tool is active, so `canvas.css` can swap in the
+ *  comment-bubble cursor. Toggled on tool enter/exit. */
+const COMMENT_TOOL_ATTR = 'data-comment-tool-active'
 
 /** A comment being placed but not yet posted: where its composer sits and what it will anchor
  *  to. Shared between the tool (which sets it on click) and the overlay (which renders the
@@ -91,6 +95,16 @@ export class CommentTool extends StateNode {
 
 	override onEnter() {
 		this.editor.setCursor({ type: 'cross', rotation: 0 })
+		this.editor.getContainer().setAttribute(COMMENT_TOOL_ATTR, 'true')
+		// Placing comments is canvas-focused — the thread list gets out of the way while the tool is
+		// active. Reopened via its own control (a button), never by leaving the tool.
+		commentsSidebarOpen.set(this.editor, false)
+	}
+
+	override onExit() {
+		this.editor.getContainer().removeAttribute(COMMENT_TOOL_ATTR)
+		// Drop the hover hint painted while pointing at shapes (see CommentIdle).
+		this.editor.setHintingShapes([])
 	}
 
 	// Escape leaves the tool, like the built-in tools (the editor dispatches `cancel` on Escape).
@@ -102,13 +116,36 @@ export class CommentTool extends StateNode {
 class CommentIdle extends StateNode {
 	static override id = 'idle'
 
+	override onEnter() {
+		this.updateHint()
+	}
+
+	// Hint the shape a click would attach to, using the same hit-test as onPointerUp below. Hinting
+	// shapes render an indicator ungated by the active tool, so this shows the select-style outline
+	// while the comment tool — not select — is active.
+	override onPointerMove() {
+		this.updateHint()
+	}
+
 	override onPointerDown() {
 		this.parent.transition('pointing')
+	}
+
+	private updateHint() {
+		const { editor } = this
+		const hit = editor.getShapeAtPoint(editor.inputs.getCurrentPagePoint(), { hitInside: true })
+		editor.setHintingShapes(hit ? [hit.id] : [])
 	}
 }
 
 class CommentPointing extends StateNode {
 	static override id = 'pointing'
+
+	override onEnter() {
+		// The click will resolve its own anchor on pointer up; drop the idle hover hint so a region
+		// drag doesn't leave a stale single-shape outline under the dashed box.
+		this.editor.setHintingShapes([])
+	}
 
 	// Once the pointer passes the editor's drag threshold this is a region, not a click — but only
 	// when region comments are enabled; otherwise a drag is treated as a click (point/shape).

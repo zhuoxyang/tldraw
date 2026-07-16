@@ -128,7 +128,19 @@
 	box-shadow: var(--tl-shadow-2);
 }
 
-/* The comments list panel — a right-side surface shown while the comment tool is active. Below
+/* While the comment tool is active, the canvas shows a cursor shaped like the comment pin (the
+   `.cmt-pin` teardrop: three rounded corners + a sharp bottom-left point, in the selection blue),
+   so it reads as "drop a comment pin here." The tool sets `data-comment-tool-active` on the
+   container (see comment-tool.tsx); this overrides the reactor-driven `--tl-cursor` var by
+   specificity. Hotspot sits at the pin's sharp corner, where the pin anchors. */
+[data-comment-tool-active='true'] .tl-canvas {
+	cursor:
+		url("data:image/svg+xml,<svg height='32' width='32' viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'><defs><filter id='shadow' y='-40%' x='-40%' width='180px' height='180%' color-interpolation-filters='sRGB'><feDropShadow dx='1' dy='1' stdDeviation='1.2' flood-opacity='.5'/></filter></defs><g filter='url(%23shadow)'><path d='M6 24 L6 14 A10 10 0 0 1 16 4 A10 10 0 0 1 26 14 A10 10 0 0 1 16 24 Z' fill='%233182ed' stroke='white' stroke-width='2' stroke-linejoin='round'/></g></svg>")
+			6 24,
+		crosshair;
+}
+
+/* The comments list panel — a right-side surface shown while the comments sidebar is open. Below
    the popover layer, so an open thread still draws over it. Sits under the top-right share panel
    (top offset clears its ~48px height) and sizes to its content, scrolling past max-height rather
    than stretching the full canvas height. */
