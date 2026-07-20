@@ -61,81 +61,84 @@ const initialVersions: ReviewVersion[] = [
 		createdBy: { avatarUrl: null, id: 11, kind: 'human', login: 'mchen', name: 'Mei Chen' },
 		submittedBy: { avatarUrl: null, id: 11, kind: 'human', login: 'mchen', name: 'Mei Chen' },
 		description: 'Lighting polish pass',
+		entity: { id: 501, name: 'shot_010', type: 'Shot' },
 		id: 301,
 		media: {
-			contentType: 'image/jpeg',
+			contentType: 'image/svg+xml',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: '/mock-media/shot_010_lgt_v014-thumb.jpg',
-			url: '/mock-media/shot_010_lgt_v014.jpg',
+			thumbnailUrl: '/mock-media/northstar-lighting.svg',
+			url: '/mock-media/northstar-lighting.svg',
 			width: 1920,
 		},
 		name: 'shot_010_lgt_v014',
 		playlistId: 201,
 		projectId: 101,
 		statusCode: 'rev',
+		task: { id: 601, name: 'Lighting' },
 	},
 	{
 		createdAt: '2026-07-20T01:35:00.000Z',
 		createdBy: { avatarUrl: null, id: 12, kind: 'human', login: 'akim', name: 'Alex Kim' },
 		submittedBy: { avatarUrl: null, id: 12, kind: 'human', login: 'akim', name: 'Alex Kim' },
 		description: null,
+		entity: { id: 502, name: 'shot_020', type: 'Shot' },
 		id: 302,
 		media: {
-			contentType: 'video/mp4',
-			durationSeconds: 5,
-			frameCount: 120,
-			firstFrame: 1001,
-			frameRate: 24,
+			contentType: 'image/svg+xml',
 			height: 1080,
-			kind: 'video',
-			lastFrame: 1120,
-			thumbnailUrl: '/mock-media/shot_020_comp_v008-thumb.jpg',
-			url: '/mock-media/shot_020_comp_v008.mp4',
+			kind: 'image',
+			thumbnailUrl: '/mock-media/shot-comp.svg',
+			url: '/mock-media/shot-comp.svg',
 			width: 1920,
 		},
 		name: 'shot_020_comp_v008',
 		playlistId: 201,
 		projectId: 101,
 		statusCode: 'chg',
+		task: { id: 602, name: 'Compositing' },
 	},
 	{
 		createdAt: '2026-07-19T08:45:00.000Z',
 		createdBy: { avatarUrl: null, id: 13, kind: 'human', login: 'srivera', name: 'Sam Rivera' },
 		submittedBy: { avatarUrl: null, id: 13, kind: 'human', login: 'srivera', name: 'Sam Rivera' },
 		description: 'Drone animation final',
+		entity: { id: 503, name: 'Drone', type: 'Asset' },
 		id: 303,
 		media: {
-			contentType: 'image/jpeg',
+			contentType: 'image/svg+xml',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: null,
-			url: '/mock-media/drone_v021.jpg',
+			thumbnailUrl: '/mock-media/drone-animation.svg',
+			url: '/mock-media/drone-animation.svg',
 			width: 1920,
 		},
 		name: 'asset_drone_anim_v021',
 		playlistId: 202,
 		projectId: 101,
 		statusCode: 'apr',
+		task: { id: 603, name: 'Animation' },
 	},
 	{
 		createdAt: '2026-07-18T05:10:00.000Z',
 		createdBy: { avatarUrl: null, id: 14, kind: 'human', login: 'jlee', name: 'Jordan Lee' },
 		submittedBy: { avatarUrl: null, id: 14, kind: 'human', login: 'jlee', name: 'Jordan Lee' },
 		description: null,
+		entity: { id: 504, name: 'Market Environment', type: 'Asset' },
 		id: 304,
 		media: {
-			contentType: 'image/jpeg',
+			contentType: 'image/svg+xml',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: null,
-			url: '/mock-media/market_v005.jpg',
+			thumbnailUrl: '/mock-media/market-environment.svg',
+			url: '/mock-media/market-environment.svg',
 			width: 1920,
 		},
 		name: 'env_market_v005',
 		playlistId: 203,
 		projectId: 102,
 		statusCode: 'rev',
+		task: { id: 604, name: 'Surfacing' },
 	},
 ]
 
@@ -177,6 +180,13 @@ export class MockReviewGateway implements ReviewGateway {
 
 	async getCurrentReviewer() {
 		return reviewer
+	}
+
+	async getVersion(playlistId: number, versionId: number) {
+		this.requirePlaylist(playlistId)
+		const version = this.requireVersion(versionId)
+		if (version.playlistId !== playlistId) throw this.notFound('Version')
+		return version
 	}
 
 	async listPlaylists(projectId: number) {

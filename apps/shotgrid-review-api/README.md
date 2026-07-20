@@ -26,3 +26,14 @@ Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browse
 In ShotGrid mode, deploy this service behind a trusted reverse proxy. The proxy must authenticate and authorize every user and action, strip any browser-supplied `X-Review-Proxy-Token` and `X-Review-Authenticated-Login` headers, then inject the server-only proxy token. When `SHOTGRID_SUDO_AS_LOGIN` is configured, the proxy must also inject that exact login so the authenticated identity is bound to ShotGrid impersonation. The proxy token must never be sent to browser code or exposed through CORS.
 
 Project and entity authorization remains the reverse proxy's responsibility until the permission hardening work in issue #12 is complete.
+
+## Review browsing routes
+
+- `GET /api/review/me`
+- `GET /api/review/projects`
+- `GET /api/review/projects/:projectId/playlists`
+- `GET /api/review/playlists/:playlistId/versions`
+- `GET /api/review/playlists/:playlistId/versions/:versionId`
+
+The single-Version route verifies Playlist membership and rereads the standard ShotGrid media fields.
+Clients use it when a Version opens or refreshes so expiring ShotGrid media references are renewed.

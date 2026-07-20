@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+	<title id="title">Market environment review frame</title>
+	<desc id="description">A warm stylized marketplace courtyard at sunset.</desc>
+	<defs>
+		<linearGradient id="sunset" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#442d6b" /><stop offset="0.5" stop-color="#dd7b65" /><stop offset="1" stop-color="#f3c77b" /></linearGradient>
+		<linearGradient id="cloth" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#e15d58" /><stop offset="1" stop-color="#8f343f" /></linearGradient>
+	</defs>
+	<rect width="1280" height="720" fill="url(#sunset)" />
+	<circle cx="678" cy="215" r="92" fill="#ffe3a1" opacity="0.78" />
+	<g fill="#493548">
+		<path d="M0 198h220v390H0z" /><path d="m12 198 96-86 100 86Z" /><path d="M1010 176h270v412h-270z" /><path d="m1030 176 116-104 110 104Z" />
+	</g>
+	<g fill="#72495a">
+		<path d="M196 294h244v310H196z" /><path d="m220 294 96-76 104 76Z" /><path d="M842 265h205v339H842z" /><path d="m862 265 84-78 81 78Z" />
+	</g>
+	<path d="M0 553c227-54 385-19 554 36 221 72 420 54 726-31v162H0Z" fill="#503841" />
+	<g transform="translate(385 338)">
+		<path d="M0 54h508l-55 92H45Z" fill="url(#cloth)" />
+		<path d="M45 146h408v214H45z" fill="#6c493d" />
+		<g fill="#f5c36b">
+			<circle cx="106" cy="214" r="24" /><circle cx="166" cy="228" r="29" /><circle cx="233" cy="208" r="22" /><circle cx="303" cy="226" r="30" /><circle cx="372" cy="210" r="23" />
+		</g>
+		<path d="M0 54 74 0h362l72 54" fill="#d58b57" />
+		<path d="M86 0 70 54M166 0l-8 54M246 0v54M326 0l8 54M406 0l16 54" stroke="#733c42" stroke-width="12" />
+	</g>
+	<g fill="#ffd477" opacity="0.9">
+		<circle cx="168" cy="345" r="8" /><circle cx="275" cy="410" r="8" /><circle cx="927" cy="354" r="8" /><circle cx="1104" cy="332" r="8" />
+	</g>
+	<path d="M150 344 1120 330" stroke="#35273a" stroke-width="5" />
+	<g transform="translate(36 38)">
+		<rect width="268" height="58" rx="10" fill="#261d33" fill-opacity="0.75" />
+		<text x="18" y="26" fill="#fde68a" font-family="system-ui,sans-serif" font-size="13" font-weight="700" letter-spacing="2">ENVIRONMENT MARKET</text>
+		<text x="18" y="46" fill="#fff7ed" font-family="system-ui,sans-serif" font-size="14">Final review · v005</text>
+	</g>
+</svg>

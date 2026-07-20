@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+	<title id="title">Drone animation review frame</title>
+	<desc id="description">A compact drone banking over a desert canyon.</desc>
+	<defs>
+		<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#6dd5ed" /><stop offset="1" stop-color="#e8c590" /></linearGradient>
+		<linearGradient id="rock" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#b8613d" /><stop offset="1" stop-color="#5f2f2a" /></linearGradient>
+	</defs>
+	<rect width="1280" height="720" fill="url(#sky)" />
+	<circle cx="1080" cy="112" r="72" fill="#fff5c2" opacity="0.8" />
+	<path d="M0 405c128-71 220-82 347-28 121 52 219 43 322-34 135-101 273-86 611 34v343H0Z" fill="#c77b51" />
+	<path d="M0 521c190-85 330-67 472 3 133 65 245 64 378-12 142-80 270-72 430-5v213H0Z" fill="url(#rock)" />
+	<path d="M0 621c248-78 405-47 591 21 213 78 377 44 689-43v121H0Z" fill="#3e2527" />
+	<g transform="translate(612 274) rotate(-9)">
+		<ellipse cx="0" cy="55" rx="116" ry="46" fill="#253848" />
+		<path d="M-82 40-210-36M82 40 210-36M-88 68-205 140M88 68l205 72" stroke="#344b5c" stroke-width="22" stroke-linecap="round" />
+		<g fill="#16222e" stroke="#90e8ef" stroke-width="5">
+			<ellipse cx="-222" cy="-44" rx="72" ry="18" /><ellipse cx="222" cy="-44" rx="72" ry="18" />
+			<ellipse cx="-218" cy="149" rx="72" ry="18" /><ellipse cx="218" cy="149" rx="72" ry="18" />
+		</g>
+		<path d="M-58 32h116l34 57L0 126-92 89Z" fill="#4f7183" />
+		<circle cx="0" cy="105" r="18" fill="#f87171" />
+	</g>
+	<path d="M376 333c-103-39-183-39-284-7M899 239c102-37 186-34 285 13" fill="none" stroke="#effcff" stroke-width="8" stroke-linecap="round" opacity="0.42" />
+	<g transform="translate(36 38)">
+		<rect width="250" height="58" rx="10" fill="#132738" fill-opacity="0.74" />
+		<text x="18" y="26" fill="#a5f3fc" font-family="system-ui,sans-serif" font-size="13" font-weight="700" letter-spacing="2">ASSET DRONE</text>
+		<text x="18" y="46" fill="#f8fafc" font-family="system-ui,sans-serif" font-size="14">Animation final · v021</text>
+	</g>
+</svg>

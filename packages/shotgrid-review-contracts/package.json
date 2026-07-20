@@ -1,0 +1,24 @@
+{
+	"name": "@tldraw/shotgrid-review-contracts",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"main": "./src/index.ts",
+	"types": "./.tsbuild/index.d.ts",
+	"files": [],
+	"sideEffects": false,
+	"scripts": {
+		"build": "yarn run -T tsgo --build tsconfig.json",
+		"lint": "yarn run -T tsx ../../internal/scripts/lint.ts",
+		"test": "yarn run -T vitest --passWithNoTests",
+		"test-ci": "yarn run -T vitest run --passWithNoTests",
+		"test-coverage": "yarn run -T vitest run --coverage --passWithNoTests"
+	},
+	"devDependencies": {
+		"typescript": "^5.8.3",
+		"vitest": "^4.1.7"
+	},
+	"engines": {
+		"node": ">=22.12.0"
+	}
+}

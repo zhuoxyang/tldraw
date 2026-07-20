@@ -1,12 +1,15 @@
 import type { ShotGridConnectionConfig } from '../config'
+import { isSafeReviewUrl } from '../contracts'
 import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
+	ReviewEntityLink,
 	ReviewMedia,
 	ReviewNote,
 	ReviewPlaylist,
 	ReviewProject,
 	ReviewStatusResult,
+	ReviewTaskLink,
 	ReviewUser,
 	ReviewVersion,
 	UpdateReviewStatusRequest,
@@ -75,6 +78,22 @@ const MAX_SEARCH_PAGES = 100
 const MAX_SEARCH_ENTITIES = 10_000
 const MAX_SEARCH_AGGREGATE_BYTES = 32 * 1024 * 1024
 const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
+const VERSION_FIELDS = [
+	'code',
+	'description',
+	'project',
+	'playlists',
+	'sg_status_list',
+	'created_at',
+	'created_by',
+	'user',
+	'entity',
+	'sg_task',
+	'image',
+	'sg_uploaded_movie',
+	'frame_count',
+	'frame_rate',
+]
 
 export class ShotGridReviewGateway implements ReviewGateway {
 	private readonly fetch: FetchImplementation
@@ -146,6 +165,16 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		return mapUser(user)
 	}
 
+	async getVersion(playlistId: number, versionId: number): Promise<ReviewVersion> {
+		await this.readEntity('playlists', playlistId, 'Playlist')
+		const entity = await this.readEntity('versions', versionId, 'Version', VERSION_FIELDS)
+		const belongsToPlaylist = readRelationshipList(entity.relationships, 'playlists').some(
+			(playlist) => playlist.type === 'Playlist' && playlist.id === playlistId
+		)
+		if (!belongsToPlaylist) throw reviewItemNotFound()
+		return mapVersion(entity, playlistId)
+	}
+
 	async listProjects(): Promise<ReviewProject[]> {
 		const entities = await this.search(
 			'projects',
@@ -184,41 +213,11 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		const entities = await this.search(
 			'versions',
 			[['playlists', 'in', [{ id: playlistId, type: 'Playlist' }]]],
-			[
-				'code',
-				'description',
-				'project',
-				'playlists',
-				'sg_status_list',
-				'created_at',
-				'created_by',
-				'user',
-				'image',
-				'sg_uploaded_movie',
-				'frame_count',
-				'frame_rate',
-			],
+			VERSION_FIELDS,
 			'code'
 		)
 
-		return entities.map((entity) => {
-			const project = readRelationship(entity.relationships, 'project')
-			const createdBy = readRelationship(entity.relationships, 'created_by')
-			const submittedBy = readRelationship(entity.relationships, 'user')
-			if (!project || project.type !== 'Project') throw invalidShotGridResponse()
-			return {
-				createdAt: readString(entity.attributes, 'created_at'),
-				createdBy: createdBy ? mapRelationshipUser(createdBy) : null,
-				description: readNullableString(entity.attributes, 'description'),
-				id: entity.id,
-				media: mapVersionMedia(entity.attributes),
-				name: readString(entity.attributes, 'code') || `Version ${entity.id}`,
-				playlistId,
-				projectId: project.id,
-				statusCode: readNullableString(entity.attributes, 'sg_status_list'),
-				submittedBy: submittedBy ? mapRelationshipUser(submittedBy) : null,
-			}
-		})
+		return entities.map((entity) => mapVersion(entity, playlistId))
 	}
 
 	async updateVersionStatus(request: UpdateReviewStatusRequest): Promise<ReviewStatusResult> {
@@ -339,7 +338,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		const response = await this.client.request<ShotGridRecordResponse>(`/entity/${entity}/${id}`, {
 			query: { fields: fields.join(',') },
 		})
-		return requireResponseEntity(response, expectedType)
+		return requireResponseEntity(response, expectedType, id)
 	}
 
 	private getConfiguredActor(): ReviewUser {
@@ -463,9 +462,11 @@ function requireEntity(value: unknown, expectedType?: string): ShotGridEntity {
 	return entity as ShotGridEntity
 }
 
-function requireResponseEntity(value: unknown, expectedType: string) {
+function requireResponseEntity(value: unknown, expectedType: string, expectedId?: number) {
 	const response = readRecord(value)
-	return requireEntity(response?.data, expectedType)
+	const entity = requireEntity(response?.data, expectedType)
+	if (expectedId !== undefined && entity.id !== expectedId) throw invalidShotGridResponse()
+	return entity
 }
 
 function readNextLink(response: ShotGridListResponse): string | null {
@@ -510,6 +511,45 @@ function mapUser(entity: ShotGridEntity): ReviewUser {
 		kind: 'human',
 		login: readNullableString(entity.attributes, 'login'),
 		name: readString(entity.attributes, 'name') || `User ${entity.id}`,
+	}
+}
+
+function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
+	const project = readRelationship(entity.relationships, 'project')
+	const createdBy = readRelationship(entity.relationships, 'created_by')
+	const submittedBy = readRelationship(entity.relationships, 'user')
+	if (!project || project.type !== 'Project') throw invalidShotGridResponse()
+	return {
+		createdAt: readString(entity.attributes, 'created_at'),
+		createdBy: createdBy ? mapRelationshipUser(createdBy) : null,
+		description: readNullableString(entity.attributes, 'description'),
+		entity: mapVersionEntity(readRelationship(entity.relationships, 'entity')),
+		id: entity.id,
+		media: mapVersionMedia(entity.attributes),
+		name: readString(entity.attributes, 'code') || `Version ${entity.id}`,
+		playlistId,
+		projectId: project.id,
+		statusCode: readNullableString(entity.attributes, 'sg_status_list'),
+		submittedBy: submittedBy ? mapRelationshipUser(submittedBy) : null,
+		task: mapVersionTask(readRelationship(entity.relationships, 'sg_task')),
+	}
+}
+
+function mapVersionEntity(relationship: ShotGridRelationship | null): ReviewEntityLink | null {
+	if (!relationship) return null
+	return {
+		id: relationship.id,
+		name: relationship.name || `${relationship.type} ${relationship.id}`,
+		type: relationship.type,
+	}
+}
+
+function mapVersionTask(relationship: ShotGridRelationship | null): ReviewTaskLink | null {
+	if (!relationship) return null
+	if (relationship.type !== 'Task') throw invalidShotGridResponse()
+	return {
+		id: relationship.id,
+		name: relationship.name || `Task ${relationship.id}`,
 	}
 }
 
@@ -583,13 +623,8 @@ function readRecord(value: unknown) {
 }
 
 function readUrlValue(value: unknown) {
-	if (typeof value !== 'string') return null
-	try {
-		const url = new URL(value)
-		return url.protocol === 'https:' ? url.toString() : null
-	} catch {
-		return value.startsWith('/') && !value.startsWith('//') && !value.includes('\\') ? value : null
-	}
+	if (!isSafeReviewUrl(value)) return null
+	return value.startsWith('/') ? value : new URL(value).toString()
 }
 
 function readNullableUrl(source: Record<string, unknown> | undefined, key: string) {
@@ -605,7 +640,11 @@ function readRelationship(
 ): ShotGridRelationship | null {
 	const raw = relationships?.[key]
 	const record = readRecord(raw)
-	const value = readRecord(record?.data) ?? record
+	return readRelationshipValue(record?.data ?? record)
+}
+
+function readRelationshipValue(raw: unknown): ShotGridRelationship | null {
+	const value = readRecord(raw)
 	if (
 		!value ||
 		!Number.isSafeInteger(value.id) ||
@@ -626,7 +665,9 @@ function readRelationshipList(relationships: Record<string, unknown> | undefined
 	const raw = relationships?.[key]
 	const record = readRecord(raw)
 	const value = Array.isArray(record?.data) ? record.data : Array.isArray(raw) ? raw : []
-	return value.filter((item) => readRecord(item) && Number.isSafeInteger(readRecord(item)?.id))
+	return value
+		.map((item) => readRelationshipValue(item))
+		.filter((item): item is ShotGridRelationship => item !== null)
 }
 
 function validateUploadUrl(
@@ -701,5 +742,13 @@ function invalidShotGridResponse() {
 		code: 'SHOTGRID_INVALID_RESPONSE',
 		retryable: false,
 		status: 502,
+	})
+}
+
+function reviewItemNotFound() {
+	return new ReviewGatewayError({
+		code: 'NOT_FOUND',
+		retryable: false,
+		status: 404,
 	})
 }

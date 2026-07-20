@@ -25,7 +25,11 @@ export function parseReviewConfig(environment: ReviewRuntimeEnvironment): Review
 	}
 
 	const tldrawLicenseKey = readString(environment, 'VITE_TLDRAW_LICENSE_KEY') || undefined
-	const storageNamespace = readString(environment, 'VITE_REVIEW_STORAGE_NAMESPACE') || 'local-dev'
+	const configuredStorageNamespace = readString(environment, 'VITE_REVIEW_STORAGE_NAMESPACE')
+	if (requestedMode === 'shotgrid' && !configuredStorageNamespace) {
+		throw new Error('ShotGrid mode requires VITE_REVIEW_STORAGE_NAMESPACE')
+	}
+	const storageNamespace = configuredStorageNamespace || 'local-dev'
 	if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(storageNamespace)) {
 		throw new Error('VITE_REVIEW_STORAGE_NAMESPACE contains unsupported characters')
 	}

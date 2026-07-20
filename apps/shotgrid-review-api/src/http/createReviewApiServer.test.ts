@@ -1,5 +1,6 @@
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import type { ReviewVersion } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ReviewGateway } from '../gateway/ReviewGateway'
 import { createReviewApiServer, type ReviewApiServerOptions } from './createReviewApiServer'
@@ -7,6 +8,27 @@ import { createReviewApiServer, type ReviewApiServerOptions } from './createRevi
 const servers: ReturnType<typeof createReviewApiServer>[] = []
 const PNG_BYTES = Buffer.from('89504e470d0a1a0a', 'hex')
 const TRUSTED_PROXY_TOKEN = 'test-trusted-proxy-token-with-32-characters'
+const VERSION_FIXTURE: ReviewVersion = {
+	createdAt: '2026-07-20T00:00:00Z',
+	createdBy: null,
+	description: null,
+	entity: { id: 501, name: 'shot_010', type: 'Shot' },
+	id: 301,
+	media: {
+		contentType: 'image/svg+xml',
+		height: 1080,
+		kind: 'image',
+		thumbnailUrl: '/mock-media/northstar-lighting.svg',
+		url: '/mock-media/northstar-lighting.svg',
+		width: 1920,
+	},
+	name: 'shot_v001',
+	playlistId: 201,
+	projectId: 101,
+	statusCode: 'rev',
+	submittedBy: null,
+	task: { id: 601, name: 'Lighting' },
+}
 
 afterEach(async () => {
 	await Promise.all(
@@ -44,29 +66,13 @@ describe('createReviewApiServer', () => {
 			],
 		})
 		await expectJson(`${baseUrl}/api/review/playlists/201/versions`, 200, {
-			data: [
-				{
-					createdAt: '2026-07-20T00:00:00Z',
-					createdBy: null,
-					description: null,
-					id: 301,
-					media: {
-						contentType: 'image/jpeg',
-						height: 1080,
-						kind: 'image',
-						thumbnailUrl: null,
-						url: '/shot.jpg',
-						width: 1920,
-					},
-					name: 'shot_v001',
-					playlistId: 201,
-					projectId: 101,
-					statusCode: 'rev',
-					submittedBy: null,
-				},
-			],
+			data: [VERSION_FIXTURE],
+		})
+		await expectJson(`${baseUrl}/api/review/playlists/201/versions/301`, 200, {
+			data: VERSION_FIXTURE,
 		})
 
+		expect(gateway.getVersion).toHaveBeenCalledWith(201, 301)
 		expect(gateway.listPlaylists).toHaveBeenCalledWith(101)
 		expect(gateway.listVersions).toHaveBeenCalledWith(201)
 	})
@@ -275,6 +281,12 @@ describe('createReviewApiServer', () => {
 			error: { code: 'INVALID_REQUEST', retryable: false },
 		})
 
+		const invalidNestedId = await fetch(`${baseUrl}/api/review/playlists/201/versions/0`)
+		expect(invalidNestedId.status).toBe(400)
+		expect(await invalidNestedId.json()).toMatchObject({
+			error: { code: 'INVALID_REQUEST', retryable: false },
+		})
+
 		const missing = await fetch(`${baseUrl}/api/unknown`)
 		expect(missing.status).toBe(404)
 		expect(await missing.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
@@ -448,6 +460,11 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 			id: 401,
 		})),
 		getCurrentReviewer: vi.fn(async () => reviewer),
+		getVersion: vi.fn(async (playlistId, versionId) => ({
+			...VERSION_FIXTURE,
+			id: versionId,
+			playlistId,
+		})),
 		listPlaylists: vi.fn(async (projectId) => [
 			{
 				description: null,
@@ -461,27 +478,7 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 		listProjects: vi.fn(async () => [
 			{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null },
 		]),
-		listVersions: vi.fn(async (playlistId) => [
-			{
-				createdAt: '2026-07-20T00:00:00Z',
-				createdBy: null,
-				description: null,
-				id: 301,
-				media: {
-					contentType: 'image/jpeg',
-					height: 1080,
-					kind: 'image' as const,
-					thumbnailUrl: null,
-					url: '/shot.jpg',
-					width: 1920,
-				},
-				name: 'shot_v001',
-				playlistId,
-				projectId: 101,
-				statusCode: 'rev',
-				submittedBy: null,
-			},
-		]),
+		listVersions: vi.fn(async (playlistId) => [{ ...VERSION_FIXTURE, playlistId }]),
 		updateVersionStatus: vi.fn(async (request) => ({
 			statusCode: request.statusCode,
 			updatedAt: '2026-07-20T00:00:00Z',

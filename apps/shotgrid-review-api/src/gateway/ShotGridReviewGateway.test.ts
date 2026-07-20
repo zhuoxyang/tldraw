@@ -40,7 +40,12 @@ describe('ShotGridReviewGateway', () => {
 							updated_at: '2026-07-20T00:00:00Z',
 						},
 						id: 201,
-						relationships: { versions: [{ id: 301 }, { id: 302 }] },
+						relationships: {
+							versions: [
+								{ id: 301, type: 'Version' },
+								{ id: 302, type: 'Version' },
+							],
+						},
 						type: 'Playlist',
 					},
 				],
@@ -67,7 +72,9 @@ describe('ShotGridReviewGateway', () => {
 						id: 301,
 						relationships: {
 							created_by: { data: { id: 10, name: 'Publish Bot', type: 'ApiUser' } },
+							entity: { data: { id: 501, name: 'shot_010', type: 'Shot' } },
 							project: { data: { id: 101, name: 'Northstar', type: 'Project' } },
+							sg_task: { data: { id: 601, name: 'Lighting', type: 'Task' } },
 							user: { data: { id: 11, name: 'Mei Chen', type: 'HumanUser' } },
 						},
 						type: 'Version',
@@ -105,6 +112,7 @@ describe('ShotGridReviewGateway', () => {
 					name: 'Publish Bot',
 				},
 				description: 'Lighting polish',
+				entity: { id: 501, name: 'shot_010', type: 'Shot' },
 				id: 301,
 				media: {
 					contentType: 'video/mp4',
@@ -130,6 +138,7 @@ describe('ShotGridReviewGateway', () => {
 					login: null,
 					name: 'Mei Chen',
 				},
+				task: { id: 601, name: 'Lighting' },
 			},
 		])
 
@@ -146,6 +155,70 @@ describe('ShotGridReviewGateway', () => {
 		}
 		expect(request.mock.calls[1][0]).toBe('/entity/projects/101')
 		expect(request.mock.calls[3][0]).toBe('/entity/playlists/201')
+		expect(request.mock.calls[4][1]?.query?.fields).toContain('entity')
+		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_task')
+	})
+
+	test('re-reads a selected version to refresh media and map standard context', async () => {
+		const playlistResponse = { data: { id: 201, type: 'Playlist' } }
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce(playlistResponse)
+			.mockResolvedValueOnce(makeVersionResponse('https://media.example.com/review-old.mp4'))
+			.mockResolvedValueOnce(playlistResponse)
+			.mockResolvedValueOnce(makeVersionResponse('https://media.example.com/review-fresh.mp4'))
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
+			entity: { id: 501, name: 'shot_010', type: 'Shot' },
+			id: 301,
+			media: { url: 'https://media.example.com/review-old.mp4' },
+			playlistId: 201,
+			task: { id: 601, name: 'Lighting' },
+		})
+		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
+			media: { url: 'https://media.example.com/review-fresh.mp4' },
+		})
+
+		expect(request.mock.calls.map((call) => call[0])).toEqual([
+			'/entity/playlists/201',
+			'/entity/versions/301',
+			'/entity/playlists/201',
+			'/entity/versions/301',
+		])
+		expect(request.mock.calls[1][1]?.query?.fields).toContain('entity')
+		expect(request.mock.calls[1][1]?.query?.fields).toContain('sg_task')
+		expect(request.mock.calls[1][1]?.query?.fields).toContain('sg_uploaded_movie')
+	})
+
+	test('rejects a selected version whose typed playlist relationship does not match', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(
+				makeVersionResponse('https://media.example.com/review.mp4', 201, 'Project')
+			)
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getVersion(201, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+	})
+
+	test('rejects a selected version whose response id does not match the requested id', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(
+				makeVersionResponse('https://media.example.com/review.mp4', 201, 'Playlist', 302)
+			)
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getVersion(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
 	})
 
 	test('follows bounded ShotGrid search pages without trusting the next URL', async () => {
@@ -542,6 +615,38 @@ describe('ShotGridReviewGateway', () => {
 		expect(uploadFetch).not.toHaveBeenCalled()
 	})
 })
+
+function makeVersionResponse(
+	movieUrl: string,
+	playlistId = 201,
+	playlistType = 'Playlist',
+	versionId = 301
+) {
+	return {
+		data: {
+			attributes: {
+				code: 'shot_010_lgt_v014',
+				created_at: '2026-07-20T00:00:00Z',
+				description: 'Lighting polish',
+				frame_count: 120,
+				frame_rate: 24,
+				image: 'https://media.example.com/thumb.jpg',
+				sg_status_list: 'rev',
+				sg_uploaded_movie: { content_type: 'video/mp4', url: movieUrl },
+			},
+			id: versionId,
+			relationships: {
+				entity: { data: { id: 501, name: 'shot_010', type: 'Shot' } },
+				playlists: {
+					data: [{ id: playlistId, name: `Playlist ${playlistId}`, type: playlistType }],
+				},
+				project: { data: { id: 101, name: 'Northstar', type: 'Project' } },
+				sg_task: { data: { id: 601, name: 'Lighting', type: 'Task' } },
+			},
+			type: 'Version',
+		},
+	}
+}
 
 function makeGateway(
 	request: ReturnType<typeof vi.fn>,

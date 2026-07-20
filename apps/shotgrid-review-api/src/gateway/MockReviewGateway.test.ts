@@ -38,6 +38,26 @@ describe('MockReviewGateway', () => {
 		})
 	})
 
+	test('gets a contextual version only from its owning playlist', async () => {
+		const gateway = new MockReviewGateway()
+
+		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
+			entity: { id: 501, name: 'shot_010', type: 'Shot' },
+			id: 301,
+			media: {
+				contentType: 'image/svg+xml',
+				thumbnailUrl: '/mock-media/northstar-lighting.svg',
+				url: '/mock-media/northstar-lighting.svg',
+			},
+			playlistId: 201,
+			task: { id: 601, name: 'Lighting' },
+		})
+		await expect(gateway.getVersion(202, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+	})
+
 	test('only accepts attachments for notes created by this gateway', async () => {
 		const gateway = new MockReviewGateway()
 		const attachment = {

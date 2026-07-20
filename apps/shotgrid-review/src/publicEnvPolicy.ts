@@ -25,4 +25,11 @@ export function validateViteEnvironment(environment: Environment, command: 'buil
 	if (command === 'build' && dataMode === 'shotgrid' && !hasValue(licenseKey)) {
 		throw new Error('ShotGrid production builds require VITE_TLDRAW_LICENSE_KEY')
 	}
+	if (
+		command === 'build' &&
+		dataMode === 'shotgrid' &&
+		!hasValue(environment.VITE_REVIEW_STORAGE_NAMESPACE)
+	) {
+		throw new Error('ShotGrid production builds require VITE_REVIEW_STORAGE_NAMESPACE')
+	}
 }
