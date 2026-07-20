@@ -17,7 +17,9 @@ describe('review API contracts', () => {
 			statusCode: 'rev',
 			createdAt: '2026-07-20T08:00:00.000Z',
 			createdBy: null,
+			entity: { id: 501, name: 'shot_010', type: 'Shot' },
 			submittedBy: null,
+			task: { id: 601, name: 'Lighting' },
 			media: {
 				kind: 'image',
 				url: 'https://media.example.test/version-101.png',

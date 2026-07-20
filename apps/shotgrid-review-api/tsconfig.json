@@ -7,5 +7,6 @@
 		"emitDeclarationOnly": false,
 		"noEmit": true,
 		"types": ["node", "vitest/globals"]
-	}
+	},
+	"references": [{ "path": "../../packages/shotgrid-review-contracts" }]
 }

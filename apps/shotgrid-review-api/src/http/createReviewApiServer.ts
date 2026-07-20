@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type {
 	CreateReviewNoteRequest,
 	ReviewApiErrorCode,
+	ReviewHealth,
 	UpdateReviewStatusRequest,
 	UploadReviewAttachmentRequest,
 } from '../contracts'
@@ -134,7 +135,8 @@ function matchRoute(
 ): RouteMatch | undefined {
 	if (pathname === '/api/health') {
 		return getRoute(async () => {
-			sendJson(response, 200, { mode, status: 'ok' })
+			const health: ReviewHealth = { mode, status: 'ok' }
+			sendJson(response, 200, health)
 		})
 	}
 
@@ -163,6 +165,18 @@ function matchRoute(
 		return getRoute(async () => {
 			const playlistId = requirePositiveId(playlistVersions.id, 'playlistId')
 			sendJson(response, 200, { data: await gateway.listVersions(playlistId) })
+		})
+	}
+
+	const playlistVersion = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)$/
+	)
+	if (playlistVersion.matched) {
+		return getRoute(async () => {
+			const playlistId = requirePositiveId(playlistVersion.firstId, 'playlistId')
+			const versionId = requirePositiveId(playlistVersion.secondId, 'versionId')
+			sendJson(response, 200, { data: await gateway.getVersion(playlistId, versionId) })
 		})
 	}
 
@@ -270,6 +284,13 @@ function parseRequestUrl(rawUrl: string | undefined) {
 function matchIdPath(pathname: string, pattern: RegExp) {
 	const match = pattern.exec(pathname)
 	return match ? { id: match[1], matched: true as const } : { matched: false as const }
+}
+
+function matchTwoIdPath(pathname: string, pattern: RegExp) {
+	const match = pattern.exec(pathname)
+	return match
+		? { firstId: match[1], matched: true as const, secondId: match[2] }
+		: { matched: false as const }
 }
 
 function requirePositiveId(value: string, field: string) {

@@ -3,6 +3,9 @@
 	"version": "0.0.0",
 	"private": true,
 	"type": "module",
+	"dependencies": {
+		"@tldraw/shotgrid-review-contracts": "workspace:*"
+	},
 	"scripts": {
 		"dev": "yarn run -T tsx watch src/server.ts",
 		"build": "yarn run -T tsgo --build tsconfig.json && yarn run -T esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js",

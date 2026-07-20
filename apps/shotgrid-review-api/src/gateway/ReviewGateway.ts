@@ -14,6 +14,7 @@ import type {
 export interface ReviewGateway {
 	createNote(request: CreateReviewNoteRequest): Promise<ReviewNote>
 	getCurrentReviewer(): Promise<ReviewUser>
+	getVersion(playlistId: number, versionId: number): Promise<ReviewVersion>
 	listPlaylists(projectId: number): Promise<ReviewPlaylist[]>
 	listProjects(): Promise<ReviewProject[]>
 	listVersions(playlistId: number): Promise<ReviewVersion[]>

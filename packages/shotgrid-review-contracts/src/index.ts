@@ -1,4 +1,4 @@
-export { REVIEW_API_ERROR_CODES } from '@tldraw/shotgrid-review-contracts'
+export { REVIEW_API_ERROR_CODES } from './contracts'
 export type {
 	CreateReviewNoteRequest,
 	ReviewApiDataEnvelope,
@@ -13,7 +13,6 @@ export type {
 	ReviewNote,
 	ReviewPlaylist,
 	ReviewProject,
-	ReviewRuntimeGuard,
 	ReviewStatusResult,
 	ReviewTaskLink,
 	ReviewUser,
@@ -21,7 +20,7 @@ export type {
 	ReviewVideoMedia,
 	UpdateReviewStatusRequest,
 	UploadReviewAttachmentRequest,
-} from '@tldraw/shotgrid-review-contracts'
+} from './contracts'
 export {
 	isReviewApiDataEnvelope,
 	isReviewApiErrorCode,
@@ -35,4 +34,5 @@ export {
 	isReviewUser,
 	isReviewVersion,
 	isSafeReviewUrl,
-} from '@tldraw/shotgrid-review-contracts'
+} from './guards'
+export type { ReviewRuntimeGuard } from './guards'
