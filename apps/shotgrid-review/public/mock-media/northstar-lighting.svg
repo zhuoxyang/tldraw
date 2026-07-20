@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+	<title id="title">Northstar lighting review frame</title>
+	<desc id="description">A cinematic observatory beneath a blue night sky.</desc>
+	<defs>
+		<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+			<stop offset="0" stop-color="#071229" />
+			<stop offset="0.62" stop-color="#16375a" />
+			<stop offset="1" stop-color="#d08b69" />
+		</linearGradient>
+		<radialGradient id="glow">
+			<stop offset="0" stop-color="#effcff" stop-opacity="0.96" />
+			<stop offset="0.2" stop-color="#7dd3fc" stop-opacity="0.7" />
+			<stop offset="1" stop-color="#38bdf8" stop-opacity="0" />
+		</radialGradient>
+	</defs>
+	<rect width="1280" height="720" fill="url(#sky)" />
+	<g fill="#bde8ff" opacity="0.8">
+		<circle cx="165" cy="132" r="2" /><circle cx="272" cy="88" r="3" /><circle cx="411" cy="178" r="2" />
+		<circle cx="678" cy="92" r="2" /><circle cx="903" cy="142" r="3" /><circle cx="1120" cy="78" r="2" />
+	</g>
+	<circle cx="964" cy="198" r="170" fill="url(#glow)" />
+	<path d="M0 515 176 400 330 492 526 337 742 491 910 370 1100 466 1280 344V720H0Z" fill="#101b2b" />
+	<path d="M0 578 222 471 420 557 682 418 926 552 1115 458 1280 520V720H0Z" fill="#182433" />
+	<g transform="translate(472 286)">
+		<path d="M0 259h336v175H0z" fill="#18202a" />
+		<path d="M42 259c8-121 57-195 126-195s118 74 126 195Z" fill="#dce9ed" />
+		<path d="M57 259c7-105 50-174 111-174s104 69 111 174Z" fill="#315065" />
+		<path d="M168 64V259M72 175h192" stroke="#c6dce3" stroke-width="8" opacity="0.72" />
+		<rect x="118" y="9" width="100" height="68" rx="12" fill="#222c35" />
+		<path d="m202 43 128-73" stroke="#222c35" stroke-width="24" stroke-linecap="round" />
+		<circle cx="168" cy="325" r="32" fill="#f2bd73" opacity="0.9" />
+	</g>
+	<path d="M0 638c188-38 337-20 508 18 211 47 430 31 772-36v100H0Z" fill="#090f18" />
+	<g transform="translate(36 38)">
+		<rect width="226" height="58" rx="10" fill="#07101c" fill-opacity="0.72" />
+		<text x="18" y="26" fill="#7dd3fc" font-family="system-ui,sans-serif" font-size="13" font-weight="700" letter-spacing="2">PROJECT NORTHSTAR</text>
+		<text x="18" y="46" fill="#dbeafe" font-family="system-ui,sans-serif" font-size="14">Lighting · v014</text>
+	</g>
+</svg>

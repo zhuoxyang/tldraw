@@ -21,11 +21,24 @@ describe('public environment policy', () => {
 			validateViteEnvironment(
 				{
 					VITE_REVIEW_DATA_MODE: 'shotgrid',
+					VITE_REVIEW_STORAGE_NAMESPACE: 'studio-sandbox',
 					VITE_TLDRAW_LICENSE_KEY: 'public-license-key',
 				},
 				'build'
 			)
 		).not.toThrow()
+	})
+
+	it('blocks ShotGrid production builds without a storage namespace', () => {
+		expect(() =>
+			validateViteEnvironment(
+				{
+					VITE_REVIEW_DATA_MODE: 'shotgrid',
+					VITE_TLDRAW_LICENSE_KEY: 'public-license-key',
+				},
+				'build'
+			)
+		).toThrow('ShotGrid production builds require VITE_REVIEW_STORAGE_NAMESPACE')
 	})
 
 	it('blocks ShotGrid production builds without a tldraw license key', () => {
