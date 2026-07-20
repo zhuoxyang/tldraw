@@ -1,0 +1,11 @@
+{
+	"extends": "../../internal/config/tsconfig.base.json",
+	"include": ["src"],
+	"exclude": ["node_modules", "dist", ".tsbuild*"],
+	"compilerOptions": {
+		"allowImportingTsExtensions": true,
+		"emitDeclarationOnly": false,
+		"noEmit": true,
+		"types": ["node", "vitest/globals"]
+	}
+}
