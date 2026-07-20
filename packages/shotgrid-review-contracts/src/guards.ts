@@ -36,6 +36,7 @@ const MAX_PUBLICATION_TIMESTAMP_LENGTH = 32
 const MAX_DECISION_OPTIONS = 32
 const MAX_DECISION_HISTORY_ENTRIES = 500
 const MAX_DECISION_LABEL_LENGTH = 100
+const MAX_MEDIA_FILE_NAME_LENGTH = 255
 const DECISION_KEY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
 const DECISION_STATUS_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
@@ -369,7 +370,9 @@ export function isReviewVersion(value: unknown): value is ReviewVersion {
 		(record.submittedBy === null || isReviewUser(record.submittedBy)) &&
 		(record.entity === null || isReviewEntityLink(record.entity)) &&
 		(record.task === null || isReviewTaskLink(record.task)) &&
-		(record.media === null || isReviewMedia(record.media))
+		(record.media === null ||
+			(isReviewMedia(record.media) &&
+				isReviewMediaBoundToVersion(record.media, record.playlistId, record.id)))
 	)
 }
 
@@ -528,6 +531,16 @@ function isReviewMedia(value: unknown): value is ReviewMedia {
 	return false
 }
 
+function isReviewMediaBoundToVersion(media: ReviewMedia, playlistId: unknown, versionId: unknown) {
+	if (media.kind === 'image') return true
+	if (!isPositiveId(playlistId) || !isPositiveId(versionId)) return false
+	const base = `/review/playlists/${playlistId}/versions/${versionId}/media`
+	return (
+		media.url === `${base}/video/${media.attachmentId}` &&
+		(media.thumbnailUrl === null || media.thumbnailUrl === `${base}/image`)
+	)
+}
+
 function isReviewImageMedia(value: unknown): value is ReviewImageMedia {
 	const record = readRecord(value)
 	return (
@@ -545,11 +558,14 @@ function isReviewVideoMedia(value: unknown): value is ReviewVideoMedia {
 	return (
 		record !== null &&
 		hasOnlyKeys(record, [
+			'attachmentId',
 			'contentType',
 			'durationSeconds',
+			'fileName',
 			'firstFrame',
 			'frameCount',
 			'frameRate',
+			'frameRateMode',
 			'height',
 			'kind',
 			'lastFrame',
@@ -559,13 +575,22 @@ function isReviewVideoMedia(value: unknown): value is ReviewVideoMedia {
 		]) &&
 		record.kind === 'video' &&
 		isMediaBase(record) &&
-		isNullableFiniteNumber(record.width) &&
-		isNullableFiniteNumber(record.height) &&
-		isNullableFiniteNumber(record.durationSeconds) &&
-		isNullableFiniteNumber(record.frameCount) &&
-		isNullableFiniteNumber(record.frameRate) &&
-		isNullableFiniteNumber(record.firstFrame) &&
-		isNullableFiniteNumber(record.lastFrame)
+		isPositiveId(record.attachmentId) &&
+		isMp4Basename(record.fileName) &&
+		record.contentType === 'video/mp4' &&
+		isNullablePositiveFiniteNumber(record.width) &&
+		isNullablePositiveFiniteNumber(record.height) &&
+		isNullablePositiveFiniteNumber(record.durationSeconds) &&
+		isNullablePositiveInteger(record.frameCount) &&
+		isNullablePositiveFiniteNumber(record.frameRate) &&
+		(record.frameRateMode === 'constant' ||
+			record.frameRateMode === 'unknown' ||
+			record.frameRateMode === 'variable') &&
+		isNullableNonNegativeInteger(record.firstFrame) &&
+		isNullableNonNegativeInteger(record.lastFrame) &&
+		(record.firstFrame === null ||
+			record.lastFrame === null ||
+			Number(record.lastFrame) >= Number(record.firstFrame))
 	)
 }
 
@@ -613,6 +638,18 @@ function isNullableFiniteNumber(value: unknown): value is number | null {
 	return value === null || (typeof value === 'number' && Number.isFinite(value))
 }
 
+function isNullablePositiveFiniteNumber(value: unknown): value is number | null {
+	return value === null || (typeof value === 'number' && Number.isFinite(value) && value > 0)
+}
+
+function isNullablePositiveInteger(value: unknown): value is number | null {
+	return value === null || (Number.isSafeInteger(value) && Number(value) > 0)
+}
+
+function isNullableNonNegativeInteger(value: unknown): value is number | null {
+	return value === null || isNonNegativeInteger(value)
+}
+
 function isTypedReviewEntityLink(value: unknown, expectedType: string) {
 	return isReviewEntityLink(value) && value.type === expectedType
 }
@@ -635,6 +672,20 @@ function isCanonicalUuid(value: unknown): value is string {
 function isPngBasename(value: string) {
 	return (
 		value.toLowerCase().endsWith('.png') &&
+		value !== '.' &&
+		value !== '..' &&
+		value === value.replaceAll('\\', '/').split('/').at(-1) &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(value)
+	)
+}
+
+function isMp4Basename(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		value.length > 0 &&
+		value.length <= MAX_MEDIA_FILE_NAME_LENGTH &&
+		value.trim() === value &&
+		value.toLowerCase().endsWith('.mp4') &&
 		value !== '.' &&
 		value !== '..' &&
 		value === value.replaceAll('\\', '/').split('/').at(-1) &&

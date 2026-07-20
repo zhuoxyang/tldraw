@@ -116,6 +116,10 @@ describe('MockReviewGateway', () => {
 			code: 'NOT_FOUND',
 			status: 404,
 		})
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
 	})
 
 	test('derives publication links and project-scoped recipients from the selected version', async () => {

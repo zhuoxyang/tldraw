@@ -36,6 +36,7 @@ export interface ReviewGatewayErrorOptions {
 	status: number
 	retryable: boolean
 	publication?: ReviewPublicationErrorContext
+	rangeResourceLength?: number
 	upstreamStatus?: number
 	cause?: unknown
 }
@@ -45,6 +46,7 @@ export class ReviewGatewayError extends Error {
 	readonly status: number
 	readonly retryable: boolean
 	readonly publication?: ReviewPublicationErrorContext
+	readonly rangeResourceLength?: number
 	readonly upstreamStatus?: number
 
 	constructor(options: ReviewGatewayErrorOptions) {
@@ -54,6 +56,7 @@ export class ReviewGatewayError extends Error {
 		this.status = options.status
 		this.retryable = options.retryable
 		this.publication = options.publication
+		this.rangeResourceLength = options.rangeResourceLength
 		this.upstreamStatus = options.upstreamStatus
 	}
 

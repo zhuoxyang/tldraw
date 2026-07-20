@@ -55,15 +55,18 @@ export interface ReviewImageMedia {
 }
 
 export interface ReviewVideoMedia {
+	attachmentId: ReviewEntityId
 	kind: 'video'
+	fileName: string
 	url: string
 	thumbnailUrl: string | null
-	contentType: string
+	contentType: 'video/mp4'
 	width: number | null
 	height: number | null
 	durationSeconds: number | null
 	frameCount: number | null
 	frameRate: number | null
+	frameRateMode: 'constant' | 'unknown' | 'variable'
 	firstFrame: number | null
 	lastFrame: number | null
 }

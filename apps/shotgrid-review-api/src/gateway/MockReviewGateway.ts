@@ -20,6 +20,7 @@ import type {
 	ReviewGateway,
 	ReviewImageProxyPayload,
 	ReviewPublicationNoteResult,
+	ReviewVideoByteRange,
 	UpdateReviewDecisionGatewayRequest,
 } from './ReviewGateway'
 
@@ -266,6 +267,16 @@ export class MockReviewGateway implements ReviewGateway {
 		_signal?: AbortSignal
 	): Promise<ReviewImageProxyPayload> {
 		throw this.notFound('Version image')
+	}
+
+	async getVersionVideo(
+		_playlistId: number,
+		_versionId: number,
+		_attachmentId: number,
+		_range: ReviewVideoByteRange | null,
+		_signal?: AbortSignal
+	): Promise<never> {
+		throw this.notFound('Version video')
 	}
 
 	async listPlaylists(projectId: number) {

@@ -26,6 +26,7 @@ const MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES = Math.max(
 )
 
 export interface ShotGridConnectionConfig {
+	frameRateMode: 'constant' | 'unknown' | 'variable'
 	siteUrl: string
 	scriptName: string
 	scriptKey: string
@@ -115,6 +116,17 @@ function parseOrigin(environment: GatewayEnvironment): string {
 	}
 
 	return url.origin
+}
+
+function parseVideoFrameRateMode(environment: GatewayEnvironment) {
+	const value = environment.SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE?.trim() || 'unknown'
+	if (value !== 'constant' && value !== 'unknown' && value !== 'variable') {
+		throw configurationError(
+			'SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE',
+			'must be constant, variable, or unknown'
+		)
+	}
+	return value
 }
 
 function parseSiteUrl(rawValue: string): string {
@@ -256,6 +268,7 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		publicationStoreDir,
 		trustedProxyToken,
 		shotgrid: {
+			frameRateMode: parseVideoFrameRateMode(environment),
 			siteUrl: parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL')),
 			scriptName,
 			scriptKey,

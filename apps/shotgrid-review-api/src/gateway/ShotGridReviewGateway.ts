@@ -26,6 +26,8 @@ import type {
 	ReviewGateway,
 	ReviewImageProxyPayload,
 	ReviewPublicationNoteResult,
+	ReviewVideoByteRange,
+	ReviewVideoProxyPayload,
 	UpdateReviewDecisionGatewayRequest,
 } from './ReviewGateway'
 
@@ -90,7 +92,9 @@ interface ShotGridActivityStreamResponse {
 
 interface ShotGridReviewGatewayOptions {
 	fetch?: FetchImplementation
+	maxVideoResponseBytes?: number
 	now?(): number
+	videoTransferTimeoutMs?: number
 }
 
 const SEARCH_PAGE_SIZE = 500
@@ -102,6 +106,10 @@ const MAX_CONCURRENT_REVIEW_IMAGE_REQUESTS = 4
 const MAX_REVIEW_IMAGE_DIMENSION = 8_192
 const MAX_REVIEW_IMAGE_PIXELS = 16_777_216
 const MAX_REVIEW_IMAGE_REDIRECTS = 3
+const MAX_CONCURRENT_REVIEW_VIDEO_REQUESTS = 8
+const DEFAULT_MAX_REVIEW_VIDEO_RESPONSE_BYTES = 2 * 1024 * 1024 * 1024
+const MAX_REVIEW_VIDEO_REDIRECTS = 3
+const DEFAULT_REVIEW_VIDEO_TRANSFER_TIMEOUT_MS = 30 * 60 * 1_000
 const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
 const MAX_NOTE_RECIPIENT_OPTIONS = 500
 const MAX_DECISION_ACTIVITY_UPDATES = 500
@@ -115,6 +123,7 @@ const REVIEW_IMAGE_CONTENT_TYPES = new Set<ReviewImageProxyPayload['contentType'
 	'image/webp',
 ])
 const REVIEW_IMAGE_ACCEPT = [...REVIEW_IMAGE_CONTENT_TYPES].join(', ')
+const REVIEW_VIDEO_CONTENT_TYPE = 'video/mp4' as const
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const VERSION_FIELDS = [
 	'code',
@@ -129,14 +138,19 @@ const VERSION_FIELDS = [
 	'sg_task',
 	'image',
 	'sg_uploaded_movie',
+	'sg_first_frame',
+	'sg_last_frame',
 	'frame_count',
 	'frame_rate',
 ]
 
 export class ShotGridReviewGateway implements ReviewGateway {
 	private activeReviewImageRequests = 0
+	private activeReviewVideoRequests = 0
 	private readonly fetch: FetchImplementation
+	private readonly maxVideoResponseBytes: number
 	private readonly now: () => number
+	private readonly videoTransferTimeoutMs: number
 
 	constructor(
 		private readonly client: Pick<ShotGridClient, 'request'>,
@@ -144,7 +158,17 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		options: ShotGridReviewGatewayOptions = {}
 	) {
 		this.fetch = options.fetch ?? fetch
+		this.maxVideoResponseBytes =
+			options.maxVideoResponseBytes ?? DEFAULT_MAX_REVIEW_VIDEO_RESPONSE_BYTES
 		this.now = options.now ?? Date.now
+		this.videoTransferTimeoutMs =
+			options.videoTransferTimeoutMs ?? DEFAULT_REVIEW_VIDEO_TRANSFER_TIMEOUT_MS
+		if (!Number.isSafeInteger(this.maxVideoResponseBytes) || this.maxVideoResponseBytes <= 0) {
+			throw new RangeError('maxVideoResponseBytes must be a positive safe integer')
+		}
+		if (!Number.isSafeInteger(this.videoTransferTimeoutMs) || this.videoTransferTimeoutMs <= 0) {
+			throw new RangeError('videoTransferTimeoutMs must be a positive safe integer')
+		}
 	}
 
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
@@ -310,7 +334,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 
 	async getVersion(playlistId: number, versionId: number): Promise<ReviewVersion> {
 		const entity = await this.readVersionForPlaylist(playlistId, versionId)
-		return mapVersion(entity, playlistId)
+		return mapVersion(entity, playlistId, this.config.frameRateMode)
 	}
 
 	async getVersionImage(
@@ -329,6 +353,30 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			return await this.fetchReviewImage(imageUrl, signal)
 		} finally {
 			this.activeReviewImageRequests--
+		}
+	}
+
+	async getVersionVideo(
+		playlistId: number,
+		versionId: number,
+		attachmentId: number,
+		range: ReviewVideoByteRange | null,
+		signal?: AbortSignal
+	): Promise<ReviewVideoProxyPayload> {
+		if (this.activeReviewVideoRequests >= MAX_CONCURRENT_REVIEW_VIDEO_REQUESTS) {
+			throw reviewVideoCapacityExceeded()
+		}
+		this.activeReviewVideoRequests++
+		let retained = false
+		try {
+			const entity = await this.readVersionForPlaylist(playlistId, versionId)
+			const movie = readVersionMovie(entity.attributes)
+			if (!movie || movie.attachmentId !== attachmentId) throw reviewItemNotFound()
+			const payload = await this.fetchReviewVideo(movie.url, range, signal)
+			retained = true
+			return payload
+		} finally {
+			if (!retained) this.activeReviewVideoRequests--
 		}
 	}
 
@@ -374,7 +422,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			'code'
 		)
 
-		return entities.map((entity) => mapVersion(entity, playlistId))
+		return entities.map((entity) => mapVersion(entity, playlistId, this.config.frameRateMode))
 	}
 
 	async updateVersionDecision(
@@ -783,6 +831,115 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		}
 	}
 
+	private async fetchReviewVideo(
+		urlValue: string,
+		range: ReviewVideoByteRange | null,
+		externalSignal?: AbortSignal
+	): Promise<ReviewVideoProxyPayload> {
+		let url = validateReviewImageUrl(urlValue, this.config.siteUrl)
+		const controller = new AbortController()
+		let timedOut = false
+		let handedOff = false
+		let response: Response | undefined
+		const handleExternalAbort = () => controller.abort()
+		externalSignal?.addEventListener('abort', handleExternalAbort, { once: true })
+		if (externalSignal?.aborted) controller.abort()
+		const timeout = setTimeout(() => {
+			timedOut = true
+			controller.abort()
+		}, this.config.timeoutMs)
+
+		try {
+			for (let redirectCount = 0; ; redirectCount++) {
+				response = await this.fetch(url, {
+					cache: 'no-store',
+					credentials: 'omit',
+					headers: {
+						Accept: REVIEW_VIDEO_CONTENT_TYPE,
+						'Accept-Encoding': 'identity',
+						...(range ? { Range: formatReviewVideoRange(range) } : undefined),
+					},
+					method: 'GET',
+					redirect: 'manual',
+					referrerPolicy: 'no-referrer',
+					signal: controller.signal,
+				})
+
+				if (REDIRECT_STATUSES.has(response.status)) {
+					await cancelResponseBody(response)
+					if (redirectCount >= MAX_REVIEW_VIDEO_REDIRECTS) throw invalidShotGridResponse()
+					const location = response.headers.get('location')
+					if (!location) throw invalidShotGridResponse()
+					url = resolveReviewImageRedirect(location, url, this.config.siteUrl)
+					continue
+				}
+
+				if (response.status >= 300 && response.status < 400) {
+					await cancelResponseBody(response)
+					throw invalidShotGridResponse()
+				}
+				if (!response.ok) {
+					let rangeResourceLength: number | undefined
+					try {
+						rangeResourceLength =
+							response.status === 416 ? readUnsatisfiedVideoRangeLength(response) : undefined
+					} finally {
+						await cancelResponseBody(response)
+					}
+					throw reviewVideoRequestFailed(response.status, rangeResourceLength)
+				}
+
+				let metadata: Omit<ReviewVideoProxyPayload, 'body' | 'dispose'>
+				try {
+					metadata = readReviewVideoResponseMetadata(response, range, this.maxVideoResponseBytes)
+				} catch (error) {
+					await cancelResponseBody(response)
+					throw error
+				}
+				const body = response.body
+				if (!body) throw invalidShotGridResponse()
+				clearTimeout(timeout)
+				const streamedBody = createTimedReviewVideoStream(
+					body,
+					controller,
+					this.config.timeoutMs,
+					this.videoTransferTimeoutMs
+				)
+
+				let disposed = false
+				handedOff = true
+				return {
+					...metadata,
+					body: streamedBody.body,
+					dispose: async () => {
+						if (disposed) return
+						disposed = true
+						controller.abort()
+						clearTimeout(timeout)
+						externalSignal?.removeEventListener('abort', handleExternalAbort)
+						try {
+							await streamedBody.cancel()
+						} finally {
+							this.activeReviewVideoRequests--
+						}
+					},
+				}
+			}
+		} catch (error) {
+			if (error instanceof ReviewGatewayError) throw error
+			throw new ReviewGatewayError({
+				code: timedOut ? 'SHOTGRID_TIMEOUT' : 'SHOTGRID_REQUEST_FAILED',
+				retryable: false,
+				status: timedOut ? 504 : 502,
+			})
+		} finally {
+			if (!handedOff) {
+				clearTimeout(timeout)
+				externalSignal?.removeEventListener('abort', handleExternalAbort)
+			}
+		}
+	}
+
 	private getConfiguredActor(): ReviewUser {
 		if (this.config.sudoAsLogin) {
 			const login = publicationDisplayText(this.config.sudoAsLogin, 'ShotGrid reviewer')
@@ -999,7 +1156,11 @@ function mapActivityReviewer(value: unknown): ReviewUser | null {
 	}
 }
 
-function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
+function mapVersion(
+	entity: ShotGridEntity,
+	playlistId: number,
+	frameRateMode: ShotGridConnectionConfig['frameRateMode']
+): ReviewVersion {
 	const project = readRelationship(entity.relationships, 'project')
 	const createdBy = readRelationship(entity.relationships, 'created_by')
 	const submittedBy = readRelationship(entity.relationships, 'user')
@@ -1010,7 +1171,7 @@ function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
 		description: readNullableString(entity.attributes, 'description'),
 		entity: mapVersionEntity(readRelationship(entity.relationships, 'entity')),
 		id: entity.id,
-		media: mapVersionMedia(entity.attributes, playlistId, entity.id),
+		media: mapVersionMedia(entity.attributes, playlistId, entity.id, frameRateMode),
 		name: readString(entity.attributes, 'code') || `Version ${entity.id}`,
 		playlistId,
 		projectId: project.id,
@@ -1143,25 +1304,31 @@ function mapOptionalRelationshipUser(relationship: ShotGridRelationship | null):
 function mapVersionMedia(
 	attributes: Record<string, unknown> | undefined,
 	playlistId: number,
-	versionId: number
+	versionId: number,
+	frameRateMode: ShotGridConnectionConfig['frameRateMode']
 ): ReviewMedia | null {
-	const movie = readRecord(attributes?.sg_uploaded_movie)
-	const movieUrl = readUrlValue(movie?.url)
+	const movie = readSupportedVersionMovie(attributes)
 	const thumbnailUrl = readNullableUrl(attributes, 'image')
-	if (movieUrl) {
-		const frameCount = readNumber(attributes, 'frame_count')
-		const frameRate = readNumber(attributes, 'frame_rate')
+	if (movie) {
+		const firstFrame = readOptionalNonNegativeInteger(attributes, 'sg_first_frame')
+		const lastFrame = readOptionalNonNegativeInteger(attributes, 'sg_last_frame')
+		if (firstFrame !== null && lastFrame !== null && lastFrame < firstFrame) {
+			throw invalidShotGridResponse()
+		}
 		return {
-			contentType: readString(movie, 'content_type') || 'video/mp4',
-			durationSeconds: frameCount && frameRate ? frameCount / frameRate : null,
-			firstFrame: null,
-			frameCount,
-			frameRate,
+			attachmentId: movie.attachmentId,
+			contentType: REVIEW_VIDEO_CONTENT_TYPE,
+			durationSeconds: null,
+			fileName: movie.fileName,
+			firstFrame,
+			frameCount: readOptionalPositiveInteger(attributes, 'frame_count'),
+			frameRate: readOptionalPositiveNumber(attributes, 'frame_rate'),
+			frameRateMode,
 			height: null,
 			kind: 'video',
-			lastFrame: null,
-			thumbnailUrl,
-			url: movieUrl,
+			lastFrame,
+			thumbnailUrl: thumbnailUrl ? buildReviewImageProxyUrl(playlistId, versionId) : null,
+			url: buildReviewVideoProxyUrl(playlistId, versionId, movie.attachmentId),
 			width: null,
 		}
 	}
@@ -1181,10 +1348,52 @@ function buildReviewImageProxyUrl(playlistId: number, versionId: number) {
 	return `/review/playlists/${playlistId}/versions/${versionId}/media/image`
 }
 
+function buildReviewVideoProxyUrl(playlistId: number, versionId: number, attachmentId: number) {
+	return `/review/playlists/${playlistId}/versions/${versionId}/media/video/${attachmentId}`
+}
+
 function readVersionImageSourceUrl(attributes: Record<string, unknown> | undefined) {
-	const movie = readRecord(attributes?.sg_uploaded_movie)
-	if (readUrlValue(movie?.url)) return null
 	return readNullableUrl(attributes, 'image')
+}
+
+function readVersionMovie(attributes: Record<string, unknown> | undefined) {
+	const value = attributes?.sg_uploaded_movie
+	if (value === undefined || value === null) return null
+	const movie = readRecord(value)
+	const attachmentId = movie?.id
+	const fileName = movie?.name
+	const url = readUrlValue(movie?.url)
+	if (
+		!movie ||
+		!Number.isSafeInteger(attachmentId) ||
+		Number(attachmentId) <= 0 ||
+		movie.type !== 'Attachment' ||
+		movie.content_type !== REVIEW_VIDEO_CONTENT_TYPE ||
+		!isMp4Basename(fileName) ||
+		!url
+	) {
+		throw invalidShotGridResponse()
+	}
+	return { attachmentId: Number(attachmentId), fileName, url }
+}
+
+function readSupportedVersionMovie(attributes: Record<string, unknown> | undefined) {
+	const value = attributes?.sg_uploaded_movie
+	if (value === undefined || value === null) return null
+	const movie = readRecord(value)
+	if (
+		!movie ||
+		!Number.isSafeInteger(movie.id) ||
+		Number(movie.id) <= 0 ||
+		movie.type !== 'Attachment' ||
+		!isSafeMediaBasename(movie.name)
+	) {
+		throw invalidShotGridResponse()
+	}
+	if (movie.content_type !== REVIEW_VIDEO_CONTENT_TYPE || !isMp4Basename(movie.name)) return null
+	const url = readUrlValue(movie.url)
+	if (!url) return null
+	return { attachmentId: Number(movie.id), fileName: movie.name, url }
 }
 
 function readString(source: Record<string, unknown> | undefined, key: string) {
@@ -1196,9 +1405,27 @@ function readNullableString(source: Record<string, unknown> | undefined, key: st
 	return readString(source, key) || null
 }
 
-function readNumber(source: Record<string, unknown> | undefined, key: string) {
+function readOptionalPositiveNumber(source: Record<string, unknown> | undefined, key: string) {
 	const value = source?.[key]
-	return typeof value === 'number' && Number.isFinite(value) ? value : null
+	if (value === undefined || value === null) return null
+	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+		throw invalidShotGridResponse()
+	}
+	return value
+}
+
+function readOptionalPositiveInteger(source: Record<string, unknown> | undefined, key: string) {
+	const value = source?.[key]
+	if (value === undefined || value === null) return null
+	if (!Number.isSafeInteger(value) || Number(value) <= 0) throw invalidShotGridResponse()
+	return Number(value)
+}
+
+function readOptionalNonNegativeInteger(source: Record<string, unknown> | undefined, key: string) {
+	const value = source?.[key]
+	if (value === undefined || value === null) return null
+	if (!Number.isSafeInteger(value) || Number(value) < 0) throw invalidShotGridResponse()
+	return Number(value)
 }
 
 function readRecord(value: unknown) {
@@ -1217,6 +1444,23 @@ function readNullableUrl(source: Record<string, unknown> | undefined, key: strin
 	if (typeof value === 'string') return readUrlValue(value)
 	const record = readRecord(value)
 	return readUrlValue(record?.url)
+}
+
+function isMp4Basename(value: unknown): value is string {
+	return isSafeMediaBasename(value) && value.toLowerCase().endsWith('.mp4')
+}
+
+function isSafeMediaBasename(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		value.length > 0 &&
+		value.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		value.trim() === value &&
+		value !== '.' &&
+		value !== '..' &&
+		value === value.replaceAll('\\', '/').split('/').at(-1) &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(value)
+	)
 }
 
 function readRelationship(
@@ -1337,6 +1581,192 @@ async function cancelResponseBody(response: Response) {
 	} catch {
 		// The response is already being rejected; cancellation is best-effort cleanup.
 	}
+}
+
+function createTimedReviewVideoStream(
+	upstream: ReadableStream<Uint8Array>,
+	controller: AbortController,
+	timeoutMs: number,
+	transferTimeoutMs: number
+) {
+	const reader = upstream.getReader()
+	let released = false
+	let timeout: ReturnType<typeof setTimeout> | undefined
+	let transferTimedOut = false
+	const transferTimeout = setTimeout(() => {
+		transferTimedOut = true
+		controller.abort()
+	}, transferTimeoutMs)
+	transferTimeout.unref?.()
+	const release = () => {
+		if (released) return
+		released = true
+		if (timeout !== undefined) clearTimeout(timeout)
+		clearTimeout(transferTimeout)
+		reader.releaseLock()
+	}
+	const cancel = async (reason?: unknown) => {
+		if (released) return
+		controller.abort()
+		if (timeout !== undefined) clearTimeout(timeout)
+		try {
+			await reader.cancel(reason)
+		} catch {
+			// Cancellation is best-effort; the owning request is already closing.
+		} finally {
+			release()
+		}
+	}
+	const body = new ReadableStream<Uint8Array>(
+		{
+			async cancel(reason) {
+				await cancel(reason)
+			},
+			async pull(streamController) {
+				if (transferTimedOut) {
+					release()
+					streamController.error(reviewVideoTimeoutError())
+					return
+				}
+				let timedOut = false
+				timeout = setTimeout(() => {
+					timedOut = true
+					controller.abort()
+				}, timeoutMs)
+				try {
+					const result = await reader.read()
+					clearTimeout(timeout)
+					timeout = undefined
+					if (result.done) {
+						release()
+						streamController.close()
+						return
+					}
+					streamController.enqueue(result.value)
+				} catch (error) {
+					release()
+					streamController.error(timedOut || transferTimedOut ? reviewVideoTimeoutError() : error)
+				}
+			},
+		},
+		{ highWaterMark: 0 }
+	)
+	return { body, cancel }
+}
+
+function reviewVideoTimeoutError() {
+	return new ReviewGatewayError({
+		code: 'SHOTGRID_TIMEOUT',
+		retryable: false,
+		status: 504,
+	})
+}
+
+function formatReviewVideoRange(range: ReviewVideoByteRange) {
+	if (range.kind === 'closed') {
+		if (
+			!Number.isSafeInteger(range.start) ||
+			range.start < 0 ||
+			!Number.isSafeInteger(range.end) ||
+			range.end < range.start
+		) {
+			throw invalidReviewVideoRange()
+		}
+		return `bytes=${range.start}-${range.end}`
+	}
+	if (range.kind === 'open') {
+		if (!Number.isSafeInteger(range.start) || range.start < 0) throw invalidReviewVideoRange()
+		return `bytes=${range.start}-`
+	}
+	if (!Number.isSafeInteger(range.length) || range.length <= 0) throw invalidReviewVideoRange()
+	return `bytes=-${range.length}`
+}
+
+function readReviewVideoResponseMetadata(
+	response: Response,
+	range: ReviewVideoByteRange | null,
+	maxResponseBytes: number
+): Omit<ReviewVideoProxyPayload, 'body' | 'dispose'> {
+	if (response.status !== (range ? 206 : 200)) throw invalidShotGridResponse()
+	const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+	if (contentType !== REVIEW_VIDEO_CONTENT_TYPE) throw invalidShotGridResponse()
+	if (response.headers.get('accept-ranges')?.trim().toLowerCase() !== 'bytes') {
+		throw invalidShotGridResponse()
+	}
+	const contentEncoding = response.headers.get('content-encoding')
+	if (contentEncoding !== null && contentEncoding.trim().toLowerCase() !== 'identity') {
+		throw invalidShotGridResponse()
+	}
+	const contentLength = readRequiredReviewVideoIntegerHeader(response, 'content-length')
+	if (contentLength <= 0 || contentLength > maxResponseBytes) throw invalidShotGridResponse()
+
+	const contentRange = response.headers.get('content-range')
+	if (!range) {
+		if (contentRange !== null) throw invalidShotGridResponse()
+		return {
+			contentLength,
+			contentRange: null,
+			contentType: REVIEW_VIDEO_CONTENT_TYPE,
+			status: 200,
+		}
+	}
+
+	if (!contentRange) throw invalidShotGridResponse()
+	const match = /^bytes (0|[1-9]\d*)-(0|[1-9]\d*)\/(0|[1-9]\d*)$/.exec(contentRange)
+	if (!match) throw invalidShotGridResponse()
+	const start = Number(match[1])
+	const end = Number(match[2])
+	const total = Number(match[3])
+	if (
+		!Number.isSafeInteger(start) ||
+		!Number.isSafeInteger(end) ||
+		!Number.isSafeInteger(total) ||
+		total <= 0 ||
+		start > end ||
+		end >= total ||
+		contentLength !== end - start + 1 ||
+		!matchesReviewVideoRange(range, start, end, total)
+	) {
+		throw invalidShotGridResponse()
+	}
+	return {
+		contentLength,
+		contentRange,
+		contentType: REVIEW_VIDEO_CONTENT_TYPE,
+		status: 206,
+	}
+}
+
+function readRequiredReviewVideoIntegerHeader(response: Response, name: string) {
+	const value = response.headers.get(name)
+	if (!value || !/^(?:0|[1-9]\d*)$/.test(value)) throw invalidShotGridResponse()
+	const number = Number(value)
+	if (!Number.isSafeInteger(number)) throw invalidShotGridResponse()
+	return number
+}
+
+function readUnsatisfiedVideoRangeLength(response: Response) {
+	const value = response.headers.get('content-range')
+	const match = value ? /^bytes \*\/(0|[1-9]\d*)$/.exec(value) : null
+	if (!match) throw invalidShotGridResponse()
+	const total = Number(match[1])
+	if (!Number.isSafeInteger(total) || total <= 0) throw invalidShotGridResponse()
+	return total
+}
+
+function matchesReviewVideoRange(
+	range: ReviewVideoByteRange,
+	start: number,
+	end: number,
+	total: number
+) {
+	if (range.kind === 'closed') {
+		return range.start < total && start === range.start && end === Math.min(range.end, total - 1)
+	}
+	if (range.kind === 'open') {
+		return range.start < total && start === range.start && end === total - 1
+	}
+	return start === Math.max(total - range.length, 0) && end === total - 1
 }
 
 function validateReviewImageBytes(
@@ -1516,6 +1946,30 @@ function reviewImageCapacityExceeded() {
 		code: 'SHOTGRID_RATE_LIMITED',
 		retryable: true,
 		status: 429,
+	})
+}
+
+function reviewVideoRequestFailed(upstreamStatus: number, rangeResourceLength?: number) {
+	if (upstreamStatus === 416) return invalidReviewVideoRange(upstreamStatus, rangeResourceLength)
+	return reviewImageRequestFailed(upstreamStatus)
+}
+
+function reviewVideoCapacityExceeded() {
+	return new ReviewGatewayError({
+		code: 'SHOTGRID_RATE_LIMITED',
+		retryable: true,
+		status: 429,
+	})
+}
+
+function invalidReviewVideoRange(upstreamStatus?: number, rangeResourceLength?: number) {
+	return new ReviewGatewayError({
+		code: 'INVALID_REQUEST',
+		message: 'The requested video byte range is invalid or unavailable.',
+		retryable: false,
+		status: 416,
+		...(rangeResourceLength === undefined ? undefined : { rangeResourceLength }),
+		...(upstreamStatus === undefined ? undefined : { upstreamStatus }),
 	})
 }
 

@@ -152,6 +152,257 @@ describe('createReviewApiServer', () => {
 		expect(signal).toBeInstanceOf(AbortSignal)
 	})
 
+	test('streams a full video payload and disposes its upstream resource', async () => {
+		const bytes = Buffer.from('browser-playable-mp4')
+		const dispose = vi.fn(async () => {})
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(async () => ({
+			body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(bytes.subarray(0, 5))
+					controller.enqueue(bytes.subarray(5))
+					controller.close()
+				},
+			}),
+			contentLength: bytes.byteLength,
+			contentRange: null,
+			contentType: 'video/mp4',
+			dispose,
+			status: 200,
+		}))
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`)
+
+		expect(response.status).toBe(200)
+		expect(response.headers.get('accept-ranges')).toBe('bytes')
+		expect(response.headers.get('cache-control')).toBe('no-store')
+		expect(response.headers.get('content-length')).toBe(String(bytes.byteLength))
+		expect(response.headers.get('content-range')).toBeNull()
+		expect(response.headers.get('content-type')).toBe('video/mp4')
+		expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+		expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes)
+		expect(dispose).toHaveBeenCalledOnce()
+		expect(getVersionVideo).toHaveBeenCalledOnce()
+		const [playlistId, versionId, attachmentId, range, signal] = getVersionVideo.mock.calls[0]
+		expect({ attachmentId, playlistId, range, versionId }).toEqual({
+			attachmentId: 901,
+			playlistId: 201,
+			range: null,
+			versionId: 301,
+		})
+		expect(signal).toBeInstanceOf(AbortSignal)
+	})
+
+	test.each([
+		['bytes=2-5', { end: 5, kind: 'closed', start: 2 }],
+		['bytes=6-', { kind: 'open', start: 6 }],
+		['bytes=-3', { kind: 'suffix', length: 3 }],
+	] as const)('accepts one canonical %s range', async (header, expectedRange) => {
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(
+			async (_playlistId, _versionId, _attachmentId, range) => {
+				expect(range).toEqual(expectedRange)
+				const contentRange =
+					range?.kind === 'closed'
+						? 'bytes 2-5/10'
+						: range?.kind === 'open'
+							? 'bytes 6-9/10'
+							: 'bytes 7-9/10'
+				const bytes = Buffer.alloc(range?.kind === 'suffix' ? 3 : 4, 7)
+				return {
+					body: new ReadableStream({
+						start(controller) {
+							controller.enqueue(bytes)
+							controller.close()
+						},
+					}),
+					contentLength: bytes.byteLength,
+					contentRange,
+					contentType: 'video/mp4',
+					dispose: async () => {},
+					status: 206,
+				}
+			}
+		)
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+
+		const response = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`,
+			{ headers: { Range: header } }
+		)
+
+		expect(response.status).toBe(206)
+		expect(response.headers.get('content-range')).toMatch(/^bytes /)
+		await response.arrayBuffer()
+		expect(getVersionVideo).toHaveBeenCalledOnce()
+	})
+
+	test.each([
+		'items=0-1',
+		'bytes=',
+		'bytes=0-1,2-3',
+		'bytes=5-4',
+		'bytes=-0',
+		'bytes=01-2',
+		'bytes=9007199254740992-',
+		'bytes =0-1',
+	])('rejects malformed or multiple video range %s before gateway work', async (range) => {
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>()
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+
+		const response = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`,
+			{ headers: { Range: range } }
+		)
+
+		expect(response.status).toBe(416)
+		expect(await response.json()).toMatchObject({
+			error: { code: 'INVALID_REQUEST', retryable: false },
+		})
+		expect(getVersionVideo).not.toHaveBeenCalled()
+	})
+
+	test('returns the validated resource length for an unsatisfied upstream range', async () => {
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(async () => {
+			throw new ReviewGatewayError({
+				code: 'INVALID_REQUEST',
+				rangeResourceLength: 10,
+				retryable: false,
+				status: 416,
+				upstreamStatus: 416,
+			})
+		})
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+
+		const response = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`,
+			{ headers: { Range: 'bytes=10-' } }
+		)
+
+		expect(response.status).toBe(416)
+		expect(response.headers.get('content-range')).toBe('bytes */10')
+		expect(await response.json()).toMatchObject({
+			error: { code: 'INVALID_REQUEST', upstreamStatus: 416 },
+		})
+	})
+
+	test('disposes a video stream when its declared length does not match', async () => {
+		const dispose = vi.fn(async () => {})
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(async () => ({
+			body: new ReadableStream({
+				start(controller) {
+					controller.enqueue(Uint8Array.from([1]))
+					controller.close()
+				},
+			}),
+			contentLength: 2,
+			contentRange: null,
+			contentType: 'video/mp4',
+			dispose,
+			status: 200,
+		}))
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+
+		await expect(
+			fetch(`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`).then((response) =>
+				response.arrayBuffer()
+			)
+		).rejects.toThrow()
+		expect(dispose).toHaveBeenCalledOnce()
+	})
+
+	test('propagates a disconnected video client to the gateway abort signal', async () => {
+		let gatewaySignal: AbortSignal | undefined
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(
+			async (_playlistId, _versionId, _attachmentId, _range, signal) => {
+				gatewaySignal = signal
+				return await new Promise((_resolve, reject) => {
+					signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+				})
+			}
+		)
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+		const clientController = new AbortController()
+		const pending = fetch(`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`, {
+			signal: clientController.signal,
+		})
+		await vi.waitFor(() => expect(getVersionVideo).toHaveBeenCalledOnce())
+
+		clientController.abort()
+		await expect(pending).rejects.toThrow()
+		await vi.waitFor(() => expect(gatewaySignal?.aborted).toBe(true))
+	})
+
+	test('releases a late video chunk after the client disconnects during an upstream read', async () => {
+		let releaseChunk!: () => void
+		let markPullStarted!: () => void
+		const pullStarted = new Promise<void>((resolve) => {
+			markPullStarted = resolve
+		})
+		const chunkGate = new Promise<void>((resolve) => {
+			releaseChunk = resolve
+		})
+		const dispose = vi.fn(async () => {})
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(async () => ({
+			body: new ReadableStream({
+				async pull(controller) {
+					markPullStarted()
+					await chunkGate
+					controller.enqueue(Uint8Array.from([1]))
+					controller.close()
+				},
+			}),
+			contentLength: 1,
+			contentRange: null,
+			contentType: 'video/mp4',
+			dispose,
+			status: 200,
+		}))
+		const baseUrl = await start(makeGateway({ getVersionVideo }))
+		const clientController = new AbortController()
+		const response = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`,
+			{ signal: clientController.signal }
+		)
+		const body = response.arrayBuffer()
+		await pullStarted
+
+		clientController.abort()
+		releaseChunk()
+		await expect(body).rejects.toThrow()
+		await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce())
+	})
+
+	test('times out a stalled downstream video client and disposes upstream capacity', async () => {
+		const bytes = Buffer.alloc(64 * 1024, 7)
+		const dispose = vi.fn(async () => {})
+		const getVersionVideo = vi.fn<ReviewGateway['getVersionVideo']>(async () => ({
+			body: new ReadableStream({
+				start(controller) {
+					controller.enqueue(bytes)
+					controller.close()
+				},
+			}),
+			contentLength: bytes.byteLength,
+			contentRange: null,
+			contentType: 'video/mp4',
+			dispose,
+			status: 200,
+		}))
+		const baseUrl = await start(makeGateway({ getVersionVideo }), undefined, {
+			mode: 'mock',
+			videoDownstreamIdleTimeoutMs: 10,
+		})
+		const server = servers.at(-1)
+		if (!server) throw new Error('Expected a test server')
+		server.prependListener('request', (_request, response) => {
+			response.write = vi.fn(() => false) as typeof response.write
+		})
+
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/media/video/901`)
+		await expect(response.arrayBuffer()).rejects.toThrow()
+		await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce())
+	})
+
 	test('keeps health public but requires the trusted proxy for live review routes', async () => {
 		const gateway = makeGateway()
 		const logger = { error: vi.fn() }
@@ -1035,6 +1286,9 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 			body: PNG_BYTES,
 			contentType: 'image/png' as const,
 		})),
+		getVersionVideo: vi.fn(async () => {
+			throw new ReviewGatewayError({ code: 'NOT_FOUND', retryable: false, status: 404 })
+		}),
 		listPlaylists: vi.fn(async (projectId) => [
 			{
 				description: null,
@@ -1164,6 +1418,7 @@ async function start(
 		| 'publicationStore'
 		| 'sudoAsLogin'
 		| 'trustedProxyToken'
+		| 'videoDownstreamIdleTimeoutMs'
 	> = {
 		mode: 'mock',
 	}
@@ -1187,6 +1442,9 @@ async function start(
 		...(options.trustedProxyToken === undefined
 			? undefined
 			: { trustedProxyToken: options.trustedProxyToken }),
+		...(options.videoDownstreamIdleTimeoutMs === undefined
+			? undefined
+			: { videoDownstreamIdleTimeoutMs: options.videoDownstreamIdleTimeoutMs }),
 	})
 	servers.push(server)
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

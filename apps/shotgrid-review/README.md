@@ -61,3 +61,21 @@ history and warns that older changes may exist; it must not be treated as a comp
 Service identities do not initialize or display decision context and never send decision GET or PUT
 requests from the browser. Configure `SHOTGRID_SUDO_AS_LOGIN` to expose decisions to a resolved
 human reviewer.
+
+## MP4 review
+
+Browser-playable MP4 Versions use a Playlist/Version/Attachment-bound same-origin stream; the
+browser never receives ShotGrid's source movie URL. Playback is read-only, while paused frames can
+be annotated with an inclusive frame range or millisecond time range. Previous/next navigation uses
+frame centers when the gateway explicitly declares CFR media and 100 ms steps otherwise.
+
+Frame numbering and non-drop-frame timecode require the gateway's deployment-level CFR guarantee.
+Movies declared `variable`, movies with an `unknown` rate mode, missing frame metadata, or
+inconsistent count/rate/duration values fall back to decoded media time and never display invented
+frame numbers. See the API README before enabling the CFR setting.
+
+`Export current frame PNG` pauses and seeks the real video element, composites only annotations
+visible at the browser-presented media time, and writes a 1:1 PNG at the decoded source dimensions.
+Editable video snapshots contain no movie URL or asset bytes and are bound to the Project, Version,
+Attachment, dimensions, decoded duration, frame-rate policy, and ShotGrid timing metadata. A stale
+or cross-review snapshot is rejected instead of being applied to changed media.

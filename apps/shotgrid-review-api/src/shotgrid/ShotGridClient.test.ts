@@ -9,6 +9,7 @@ function connectionConfig(
 	overrides: Partial<ShotGridConnectionConfig> = {}
 ): ShotGridConnectionConfig {
 	return {
+		frameRateMode: 'unknown',
 		siteUrl: 'https://studio.example.com',
 		scriptName: 'review-script',
 		scriptKey: 'script-secret',

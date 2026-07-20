@@ -19,16 +19,19 @@ import {
 } from './index'
 
 const videoMedia: ReviewVideoMedia = {
+	attachmentId: 901,
 	contentType: 'video/mp4',
 	durationSeconds: 5,
+	fileName: 'shot-comp.mp4',
 	firstFrame: null,
 	frameCount: 120,
 	frameRate: 24,
+	frameRateMode: 'constant',
 	height: null,
 	kind: 'video',
 	lastFrame: null,
-	thumbnailUrl: '/mock-media/shot-comp.svg',
-	url: 'https://media.example.test/review.mp4',
+	thumbnailUrl: '/review/playlists/201/versions/301/media/image',
+	url: '/review/playlists/201/versions/301/media/video/901',
 	width: null,
 }
 
@@ -91,6 +94,17 @@ describe('review contract runtime guards', () => {
 		expect(isReviewVersion({ ...version, entity: undefined })).toBe(false)
 		expect(isReviewVersion({ ...version, unexpected: true })).toBe(false)
 		expect(isReviewVersion({ ...version, task: { id: 601, name: ' ' } })).toBe(false)
+		for (const media of [
+			{ ...videoMedia, attachmentId: 0 },
+			{ ...videoMedia, contentType: 'video/quicktime' },
+			{ ...videoMedia, fileName: '../review.mp4' },
+			{ ...videoMedia, fileName: 'review.mov' },
+			{ ...videoMedia, frameCount: 1.5 },
+			{ ...videoMedia, frameRate: 0 },
+			{ ...videoMedia, firstFrame: -1 },
+		]) {
+			expect(isReviewVersion({ ...version, media })).toBe(false)
+		}
 	})
 
 	test('validates exact decision context, request, result, and audit relationships', () => {
@@ -195,6 +209,21 @@ describe('review contract runtime guards', () => {
 	test('accepts only HTTPS or same-origin media URLs', () => {
 		expect(isSafeReviewUrl('https://media.example.test/review.mp4')).toBe(true)
 		expect(isSafeReviewUrl('/mock-media/review.svg')).toBe(true)
+		expect(
+			isReviewVersion({
+				...version,
+				media: { ...videoMedia, url: 'https://media.example.test/review.mp4' },
+			})
+		).toBe(false)
+		expect(
+			isReviewVersion({
+				...version,
+				media: {
+					...videoMedia,
+					thumbnailUrl: '/review/playlists/201/versions/999/media/image',
+				},
+			})
+		).toBe(false)
 		for (const unsafe of [
 			'http://media.example.test/review.mp4',
 			'javascript:alert(1)',
