@@ -15,13 +15,25 @@ export interface ShotGridConnectionConfig {
 	maxRetries: number
 }
 
-export interface GatewayConfig {
-	mode: 'mock' | 'shotgrid'
+interface GatewayConfigBase {
 	host: string
 	port: number
 	allowedOrigin: string
-	shotgrid?: ShotGridConnectionConfig
 }
+
+export type GatewayConfig = GatewayConfigBase &
+	(
+		| {
+				mode: 'mock'
+				shotgrid?: never
+				trustedProxyToken?: never
+		  }
+		| {
+				mode: 'shotgrid'
+				shotgrid: ShotGridConnectionConfig
+				trustedProxyToken: string
+		  }
+	)
 
 type GatewayEnvironment = Readonly<Record<string, string | undefined>>
 
@@ -122,6 +134,13 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 
 	const scriptName = readRequired(environment, 'SHOTGRID_SCRIPT_NAME').trim()
 	const scriptKey = readRequired(environment, 'SHOTGRID_SCRIPT_KEY')
+	const trustedProxyToken = readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN').trim()
+	if (trustedProxyToken.length < 32 || /\p{Cc}/u.test(trustedProxyToken)) {
+		throw configurationError(
+			'REVIEW_API_TRUSTED_PROXY_TOKEN',
+			'must contain at least 32 characters'
+		)
+	}
 	const sudoAsLogin = environment.SHOTGRID_SUDO_AS_LOGIN?.trim() || undefined
 
 	return {
@@ -129,6 +148,7 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		host,
 		port,
 		allowedOrigin,
+		trustedProxyToken,
 		shotgrid: {
 			siteUrl: parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL')),
 			scriptName,

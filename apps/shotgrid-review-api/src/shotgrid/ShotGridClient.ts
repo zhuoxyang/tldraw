@@ -38,6 +38,11 @@ interface AccessTokenResponse {
 	token_type?: unknown
 }
 
+interface FetchAttemptResult {
+	bodyText: string | undefined
+	response: Response
+}
+
 type FetchFailureKind = 'network' | 'timeout'
 
 class FetchAttemptFailure extends Error {
@@ -48,12 +53,13 @@ class FetchAttemptFailure extends Error {
 
 const API_PATH = '/api/v1.1/'
 const AUTH_PATH = '/api/v1.1/auth/access_token'
+const MAX_SUCCESS_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 const MAX_RETRY_DELAY_MS = 30_000
 const MAX_BACKOFF_DELAY_MS = 5_000
 const INITIAL_BACKOFF_DELAY_MS = 250
 const MAX_TOKEN_EXPIRY_SKEW_MS = 30_000
 const MIN_TOKEN_EXPIRY_SKEW_MS = 1_000
-const TRANSIENT_STATUSES = new Set([429, 502, 503, 504])
+const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504])
 const DEFAULT_IDEMPOTENT_METHODS = new Set<ShotGridHttpMethod>(['GET', 'HEAD'])
 const FORBIDDEN_HEADER_NAMES = new Set([
 	'authorization',
@@ -121,9 +127,9 @@ export class ShotGridClient {
 			const token = await this.getAccessToken()
 			headers.set('Authorization', `Bearer ${token.accessToken}`)
 
-			let response: Response
+			let attempt: FetchAttemptResult
 			try {
-				response = await this.fetchAttempt(url, {
+				attempt = await this.fetchAttempt(url, {
 					body,
 					headers,
 					method,
@@ -138,11 +144,11 @@ export class ShotGridClient {
 					continue
 				}
 
-				throw this.normalizeFetchFailure(error.kind)
+				throw this.normalizeFetchFailure(error.kind, idempotent)
 			}
+			const { bodyText, response } = attempt
 
 			if (response.status === 401 && !authenticationReplayed) {
-				await this.discardResponseBody(response)
 				this.invalidateTokenIfUsed(token.accessToken)
 				authenticationReplayed = true
 				continue
@@ -154,18 +160,16 @@ export class ShotGridClient {
 				transientRetries < this.maxRetries
 			) {
 				const retryDelay = this.getRetryDelay(response, transientRetries)
-				await this.discardResponseBody(response)
 				await this.sleep(retryDelay)
 				transientRetries += 1
 				continue
 			}
 
 			if (!response.ok) {
-				await this.discardResponseBody(response)
-				throw this.normalizeUpstreamResponse(response.status)
+				throw this.normalizeUpstreamResponse(response.status, idempotent)
 			}
 
-			return await this.parseSuccessfulResponse<T>(response, method)
+			return this.parseSuccessfulResponse<T>(response, method, bodyText)
 		}
 	}
 
@@ -193,10 +197,10 @@ export class ShotGridClient {
 
 		for (;;) {
 			const requestedAt = this.now()
-			let response: Response
+			let attempt: FetchAttemptResult
 
 			try {
-				response = await this.fetchAttempt(this.authUrl, {
+				attempt = await this.fetchAttempt(this.authUrl, {
 					body: this.createAuthenticationBody(),
 					headers: {
 						Accept: 'application/json',
@@ -216,21 +220,20 @@ export class ShotGridClient {
 
 				throw this.normalizeFetchFailure(error.kind)
 			}
+			const { bodyText, response } = attempt
 
 			if (TRANSIENT_STATUSES.has(response.status) && transientRetries < this.maxRetries) {
 				const retryDelay = this.getRetryDelay(response, transientRetries)
-				await this.discardResponseBody(response)
 				await this.sleep(retryDelay)
 				transientRetries += 1
 				continue
 			}
 
 			if (!response.ok) {
-				await this.discardResponseBody(response)
 				throw this.normalizeAuthenticationResponse(response.status)
 			}
 
-			const payload = await this.parseJsonObject<AccessTokenResponse>(response)
+			const payload = this.parseJsonObject<AccessTokenResponse>(bodyText)
 			const token = this.validateAccessToken(payload, requestedAt)
 			this.cachedToken = token
 			return token
@@ -394,56 +397,118 @@ export class ShotGridClient {
 		}
 	}
 
-	private async fetchAttempt(url: URL, init: RequestInit): Promise<Response> {
+	private async fetchAttempt(url: URL, init: RequestInit): Promise<FetchAttemptResult> {
 		const controller = new AbortController()
-		const timeout = setTimeout(() => controller.abort(), this.timeoutMs)
+		let timeout: ReturnType<typeof setTimeout> | undefined
+		const timeoutFailure = new Promise<never>((_resolve, reject) => {
+			timeout = setTimeout(() => {
+				controller.abort()
+				reject(new FetchAttemptFailure('timeout'))
+			}, this.timeoutMs)
+		})
 
 		try {
-			return await this.fetch(url, { ...init, signal: controller.signal })
-		} catch {
-			throw new FetchAttemptFailure(controller.signal.aborted ? 'timeout' : 'network')
+			const attempt = (async (): Promise<FetchAttemptResult> => {
+				const response = await this.fetch(url, { ...init, signal: controller.signal })
+				const hasBody =
+					response.ok &&
+					init.method !== 'HEAD' &&
+					response.status !== 204 &&
+					response.status !== 205
+				const bodyText = hasBody ? await this.readSuccessfulResponseBody(response) : undefined
+				if (!hasBody) await this.cancelResponseBody(response)
+				if (controller.signal.aborted) throw new FetchAttemptFailure('timeout')
+				return { bodyText, response }
+			})()
+
+			return await Promise.race([attempt, timeoutFailure])
+		} catch (error) {
+			if (controller.signal.aborted) throw new FetchAttemptFailure('timeout')
+			if (error instanceof FetchAttemptFailure || error instanceof ReviewGatewayError) throw error
+			throw new FetchAttemptFailure('network')
 		} finally {
-			clearTimeout(timeout)
+			if (timeout !== undefined) clearTimeout(timeout)
 		}
 	}
 
-	private async parseSuccessfulResponse<T>(
+	private async readSuccessfulResponseBody(response: Response): Promise<string> {
+		if (!response.body) return ''
+
+		const reader = response.body.getReader()
+		const decoder = new TextDecoder('utf-8', { fatal: true })
+		const decodedChunks: string[] = []
+		let byteLength = 0
+
+		try {
+			for (;;) {
+				const { done, value } = await reader.read()
+				if (done) break
+
+				byteLength += value.byteLength
+				if (byteLength > MAX_SUCCESS_RESPONSE_BODY_BYTES) {
+					await this.cancelReader(reader)
+					throw this.invalidUpstreamResponse()
+				}
+
+				try {
+					decodedChunks.push(decoder.decode(value, { stream: true }))
+				} catch {
+					await this.cancelReader(reader)
+					throw this.invalidUpstreamResponse()
+				}
+			}
+
+			try {
+				decodedChunks.push(decoder.decode())
+			} catch {
+				throw this.invalidUpstreamResponse()
+			}
+
+			return decodedChunks.join('')
+		} finally {
+			reader.releaseLock()
+		}
+	}
+
+	private async cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+		try {
+			await reader.cancel()
+		} catch {
+			// Preserve the invalid-response classification that caused cancellation.
+		}
+	}
+
+	private async cancelResponseBody(response: Response): Promise<void> {
+		try {
+			await response.body?.cancel()
+		} catch {
+			// The upstream status remains authoritative when discarding an error response fails.
+		}
+	}
+
+	private parseSuccessfulResponse<T>(
 		response: Response,
-		method: ShotGridHttpMethod
-	): Promise<T> {
+		method: ShotGridHttpMethod,
+		bodyText: string | undefined
+	): T {
 		if (method === 'HEAD' || response.status === 204 || response.status === 205) {
-			await this.discardResponseBody(response)
 			return undefined as T
 		}
 
-		let text: string
-		try {
-			text = await response.text()
-		} catch {
-			throw this.invalidUpstreamResponse()
-		}
-
-		if (text.trim() === '') return undefined as T
+		if (bodyText === undefined || bodyText.trim() === '') return undefined as T
 
 		try {
-			return JSON.parse(text) as T
+			return JSON.parse(bodyText) as T
 		} catch {
 			throw this.invalidUpstreamResponse()
 		}
 	}
 
-	private async parseJsonObject<T extends object>(response: Response): Promise<T> {
-		let text: string
-		try {
-			text = await response.text()
-		} catch {
-			throw this.invalidUpstreamResponse()
-		}
-
-		if (text.trim() === '') throw this.invalidUpstreamResponse()
+	private parseJsonObject<T extends object>(bodyText: string | undefined): T {
+		if (bodyText === undefined || bodyText.trim() === '') throw this.invalidUpstreamResponse()
 
 		try {
-			const parsed: unknown = JSON.parse(text)
+			const parsed: unknown = JSON.parse(bodyText)
 			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
 				throw this.invalidUpstreamResponse()
 			}
@@ -451,14 +516,6 @@ export class ShotGridClient {
 		} catch (error) {
 			if (error instanceof ReviewGatewayError) throw error
 			throw this.invalidUpstreamResponse()
-		}
-	}
-
-	private async discardResponseBody(response: Response): Promise<void> {
-		try {
-			await response.body?.cancel()
-		} catch {
-			// Discard failures are intentionally ignored; the original status determines the outcome.
 		}
 	}
 
@@ -480,13 +537,13 @@ export class ShotGridClient {
 		return Math.min(MAX_BACKOFF_DELAY_MS, INITIAL_BACKOFF_DELAY_MS * 2 ** retryIndex)
 	}
 
-	private normalizeFetchFailure(kind: FetchFailureKind): ReviewGatewayError {
+	private normalizeFetchFailure(kind: FetchFailureKind, retryable = true): ReviewGatewayError {
 		if (kind === 'timeout') {
 			return this.createError({
 				code: 'SHOTGRID_TIMEOUT',
 				status: 504,
 				message: 'ShotGrid did not respond in time.',
-				retryable: true,
+				retryable,
 			})
 		}
 
@@ -494,7 +551,7 @@ export class ShotGridClient {
 			code: 'SHOTGRID_UNAVAILABLE',
 			status: 503,
 			message: 'ShotGrid is temporarily unavailable.',
-			retryable: true,
+			retryable,
 		})
 	}
 
@@ -528,7 +585,10 @@ export class ShotGridClient {
 		})
 	}
 
-	private normalizeUpstreamResponse(upstreamStatus: number): ReviewGatewayError {
+	private normalizeUpstreamResponse(
+		upstreamStatus: number,
+		retryable: boolean
+	): ReviewGatewayError {
 		if (upstreamStatus === 401) {
 			return this.createError({
 				code: 'SHOTGRID_AUTH_FAILED',
@@ -549,27 +609,42 @@ export class ShotGridClient {
 			})
 		}
 
+		if (upstreamStatus === 404) {
+			return this.createError({
+				code: 'NOT_FOUND',
+				status: 404,
+				message: 'The requested ShotGrid item was not found.',
+				retryable: false,
+				upstreamStatus,
+			})
+		}
+
 		if (upstreamStatus === 429) {
 			return this.createError({
 				code: 'SHOTGRID_RATE_LIMITED',
 				status: 503,
 				message: 'ShotGrid is temporarily rate limited.',
-				retryable: true,
+				retryable,
 				upstreamStatus,
 			})
 		}
 
-		if (upstreamStatus === 502 || upstreamStatus === 503 || upstreamStatus === 504) {
+		if (
+			upstreamStatus === 500 ||
+			upstreamStatus === 502 ||
+			upstreamStatus === 503 ||
+			upstreamStatus === 504
+		) {
 			return this.createError({
 				code: 'SHOTGRID_UNAVAILABLE',
 				status: 503,
 				message: 'ShotGrid is temporarily unavailable.',
-				retryable: true,
+				retryable,
 				upstreamStatus,
 			})
 		}
 
-		const clientStatus = [400, 404, 409, 422].includes(upstreamStatus) ? upstreamStatus : 502
+		const clientStatus = [400, 409, 422].includes(upstreamStatus) ? upstreamStatus : 502
 		return this.createError({
 			code: 'SHOTGRID_REQUEST_FAILED',
 			status: clientStatus,
@@ -601,6 +676,7 @@ export class ShotGridClient {
 		code:
 			| 'CONFIGURATION_ERROR'
 			| 'INVALID_SHOTGRID_PATH'
+			| 'NOT_FOUND'
 			| 'SHOTGRID_AUTH_FAILED'
 			| 'SHOTGRID_INVALID_RESPONSE'
 			| 'SHOTGRID_PERMISSION_DENIED'

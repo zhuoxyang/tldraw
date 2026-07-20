@@ -5,6 +5,8 @@ import type { ReviewGateway } from '../gateway/ReviewGateway'
 import { createReviewApiServer, type ReviewApiServerOptions } from './createReviewApiServer'
 
 const servers: ReturnType<typeof createReviewApiServer>[] = []
+const PNG_BYTES = Buffer.from('89504e470d0a1a0a', 'hex')
+const TRUSTED_PROXY_TOKEN = 'test-trusted-proxy-token-with-32-characters'
 
 afterEach(async () => {
 	await Promise.all(
@@ -60,12 +62,95 @@ describe('createReviewApiServer', () => {
 					playlistId: 201,
 					projectId: 101,
 					statusCode: 'rev',
+					submittedBy: null,
 				},
 			],
 		})
 
 		expect(gateway.listPlaylists).toHaveBeenCalledWith(101)
 		expect(gateway.listVersions).toHaveBeenCalledWith(201)
+	})
+
+	test('keeps health public but requires the trusted proxy for live review routes', async () => {
+		const gateway = makeGateway()
+		const logger = { error: vi.fn() }
+		const baseUrl = await start(gateway, logger, {
+			mode: 'shotgrid',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+
+		await expectJson(`${baseUrl}/api/health`, 200, { mode: 'shotgrid', status: 'ok' })
+
+		const unauthenticatedRequests: RequestInit[] = [
+			{},
+			{ headers: { 'X-Review-Proxy-Token': 'incorrect-token' } },
+		]
+		for (const request of unauthenticatedRequests) {
+			const response = await fetch(`${baseUrl}/api/review/projects`, request)
+			expect(response.status).toBe(401)
+			expect(await response.json()).toEqual({
+				error: {
+					code: 'AUTHENTICATION_REQUIRED',
+					message: 'Authentication is required.',
+					requestId: 'test-request-id',
+					retryable: false,
+				},
+			})
+		}
+
+		expect(gateway.listProjects).not.toHaveBeenCalled()
+		await expectJson(
+			`${baseUrl}/api/review/projects`,
+			200,
+			{ data: [{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null }] },
+			{ headers: { 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN } }
+		)
+		expect(logger.error).not.toHaveBeenCalled()
+	})
+
+	test('binds a trusted proxy request to the configured sudo login', async () => {
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway, undefined, {
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+
+		const invalidIdentityHeaders: HeadersInit[] = [
+			{ 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN },
+			{
+				'X-Review-Authenticated-Login': 'another-reviewer@example.test',
+				'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
+			},
+		]
+		for (const headers of invalidIdentityHeaders) {
+			const response = await fetch(`${baseUrl}/api/review/projects`, { headers })
+			expect(response.status).toBe(401)
+			expect(await response.json()).toMatchObject({
+				error: { code: 'AUTHENTICATION_REQUIRED', retryable: false },
+			})
+		}
+
+		await expectJson(
+			`${baseUrl}/api/review/projects`,
+			200,
+			{ data: [{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null }] },
+			{
+				headers: {
+					'X-Review-Authenticated-Login': 'reviewer@example.test',
+					'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
+				},
+			}
+		)
+	})
+
+	test('does not require proxy headers in local mock mode', async () => {
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway)
+
+		const response = await fetch(`${baseUrl}/api/review/projects`)
+		expect(response.status).toBe(200)
+		expect(gateway.listProjects).toHaveBeenCalledOnce()
 	})
 
 	test('validates and forwards review mutations', async () => {
@@ -115,12 +200,12 @@ describe('createReviewApiServer', () => {
 					fileName: 'annotation.png',
 					id: 501,
 					noteId: 401,
-					sizeBytes: 10,
+					sizeBytes: PNG_BYTES.byteLength,
 				},
 			},
 			{
 				body: JSON.stringify({
-					contentBase64: Buffer.from('annotation').toString('base64'),
+					contentBase64: PNG_BYTES.toString('base64'),
 					contentType: 'image/png',
 					fileName: 'annotation.png',
 					noteId: 401,
@@ -135,7 +220,6 @@ describe('createReviewApiServer', () => {
 			200,
 			{
 				data: {
-					previousStatusCode: null,
 					statusCode: 'apr',
 					updatedAt: '2026-07-20T00:00:00Z',
 					versionId: 301,
@@ -153,6 +237,31 @@ describe('createReviewApiServer', () => {
 			frame: 18,
 			projectId: 101,
 			subject: 'Lighting note',
+			versionId: 301,
+		})
+	})
+
+	test('accepts an explicit null frame for an unframed note', async () => {
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway)
+		const response = await fetch(`${baseUrl}/api/review/notes`, {
+			body: JSON.stringify({
+				content: 'General review note',
+				frame: null,
+				projectId: 101,
+				subject: 'Overall feedback',
+				versionId: 301,
+			}),
+			headers: { 'Content-Type': 'application/json' },
+			method: 'POST',
+		})
+
+		expect(response.status).toBe(201)
+		expect(gateway.createNote).toHaveBeenCalledWith({
+			content: 'General review note',
+			frame: null,
+			projectId: 101,
+			subject: 'Overall feedback',
 			versionId: 301,
 		})
 	})
@@ -199,6 +308,32 @@ describe('createReviewApiServer', () => {
 		expect(response.status).toBe(400)
 		expect(gateway.uploadAttachment).not.toHaveBeenCalled()
 	})
+
+	test.each([
+		['mismatched extension', 'review.html', 'image/png', PNG_BYTES],
+		['forged PNG bytes', 'annotation.png', 'image/png', Buffer.from('<html>unsafe</html>')],
+		['invalid JSON', 'snapshot.tldr', 'application/vnd.tldraw+json', Buffer.from('{broken')],
+		['bidirectional file name', 'annotation\u202egnp.exe.png', 'image/png', PNG_BYTES],
+	] as const)(
+		'rejects attachment content with %s',
+		async (_name, fileName, contentType, content) => {
+			const gateway = makeGateway()
+			const baseUrl = await start(gateway)
+			const response = await fetch(`${baseUrl}/api/review/attachments`, {
+				body: JSON.stringify({
+					contentBase64: content.toString('base64'),
+					contentType,
+					fileName,
+					noteId: 401,
+				}),
+				headers: { 'Content-Type': 'application/json' },
+				method: 'POST',
+			})
+
+			expect(response.status).toBe(400)
+			expect(gateway.uploadAttachment).not.toHaveBeenCalled()
+		}
+	)
 
 	test('normalizes gateway and unknown errors without leaking raw details', async () => {
 		const secret = 'SCRIPT-KEY-DO-NOT-LEAK'
@@ -265,17 +400,25 @@ describe('createReviewApiServer', () => {
 			method: 'OPTIONS',
 		})
 		expect(preflight.status).toBe(204)
+		expect(preflight.headers.get('access-control-allow-headers')).toBe('Content-Type')
 		expect(preflight.headers.get('access-control-allow-methods')).toBe('POST')
 
-		const unsafePreflight = await fetch(`${baseUrl}/api/review/notes`, {
-			headers: {
-				'Access-Control-Request-Headers': 'authorization',
-				'Access-Control-Request-Method': 'POST',
-				Origin: allowedOrigin,
-			},
-			method: 'OPTIONS',
-		})
-		expect(unsafePreflight.status).toBe(403)
+		for (const requestedHeader of [
+			'authorization',
+			'x-review-proxy-token',
+			'x-review-authenticated-login',
+		]) {
+			const unsafePreflight = await fetch(`${baseUrl}/api/review/notes`, {
+				headers: {
+					'Access-Control-Request-Headers': requestedHeader,
+					'Access-Control-Request-Method': 'POST',
+					Origin: allowedOrigin,
+				},
+				method: 'OPTIONS',
+			})
+			expect(unsafePreflight.status).toBe(403)
+			expect(unsafePreflight.headers.get('access-control-allow-headers')).toBeNull()
+		}
 	})
 
 	test('sets no-store and request correlation headers on every JSON response', async () => {
@@ -336,10 +479,10 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 				playlistId,
 				projectId: 101,
 				statusCode: 'rev',
+				submittedBy: null,
 			},
 		]),
 		updateVersionStatus: vi.fn(async (request) => ({
-			previousStatusCode: null,
 			statusCode: request.statusCode,
 			updatedAt: '2026-07-20T00:00:00Z',
 			versionId: request.versionId,
@@ -355,13 +498,23 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 	}
 }
 
-async function start(gateway: ReviewGateway, logger?: ReviewApiServerOptions['logger']) {
+async function start(
+	gateway: ReviewGateway,
+	logger?: ReviewApiServerOptions['logger'],
+	options: Pick<ReviewApiServerOptions, 'mode' | 'sudoAsLogin' | 'trustedProxyToken'> = {
+		mode: 'mock',
+	}
+) {
 	const server = createReviewApiServer({
 		allowedOrigin: 'http://127.0.0.1:5430',
 		gateway,
 		logger,
-		mode: 'mock',
+		mode: options.mode,
 		requestId: () => 'test-request-id',
+		...(options.sudoAsLogin === undefined ? undefined : { sudoAsLogin: options.sudoAsLogin }),
+		...(options.trustedProxyToken === undefined
+			? undefined
+			: { trustedProxyToken: options.trustedProxyToken }),
 	})
 	servers.push(server)
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

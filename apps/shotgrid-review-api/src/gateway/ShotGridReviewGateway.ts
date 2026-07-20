@@ -27,6 +27,9 @@ interface ShotGridEntity {
 
 interface ShotGridListResponse {
 	data: ShotGridEntity[]
+	links?: {
+		next?: null | string
+	}
 }
 
 interface ShotGridRecordResponse {
@@ -61,6 +64,9 @@ interface ShotGridReviewGatewayOptions {
 	now?(): number
 }
 
+const SEARCH_PAGE_SIZE = 500
+const MAX_SEARCH_PAGES = 100
+
 export class ShotGridReviewGateway implements ReviewGateway {
 	private readonly fetch: FetchImplementation
 	private readonly now: () => number
@@ -75,11 +81,21 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
+		const version = await this.readEntity('versions', request.versionId, 'Version', ['project'])
+		const versionProject = readRelationship(version.relationships, 'project')
+		if (!versionProject) throw invalidShotGridResponse()
+		if (versionProject.id !== request.projectId) {
+			throw new ReviewGatewayError({
+				code: 'INVALID_REQUEST',
+				retryable: false,
+				status: 400,
+			})
+		}
 		const response = await this.client.request<ShotGridRecordResponse>('/entity/notes', {
 			body: {
 				content: request.content,
 				note_links: [{ id: request.versionId, type: 'Version' }],
-				project: { id: request.projectId, type: 'Project' },
+				project: { id: versionProject.id, type: 'Project' },
 				subject: request.subject,
 			},
 			method: 'POST',
@@ -137,6 +153,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async listPlaylists(projectId: number): Promise<ReviewPlaylist[]> {
+		await this.readEntity('projects', projectId, 'Project')
 		const entities = await this.search(
 			'playlists',
 			[['project', 'is', { id: projectId, type: 'Project' }]],
@@ -154,6 +171,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async listVersions(playlistId: number): Promise<ReviewVersion[]> {
+		await this.readEntity('playlists', playlistId, 'Playlist')
 		const entities = await this.search(
 			'versions',
 			[['playlists', 'in', [{ id: playlistId, type: 'Playlist' }]]],
@@ -164,6 +182,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 				'playlists',
 				'sg_status_list',
 				'created_at',
+				'created_by',
 				'user',
 				'image',
 				'sg_uploaded_movie',
@@ -175,7 +194,8 @@ export class ShotGridReviewGateway implements ReviewGateway {
 
 		return entities.map((entity) => {
 			const project = readRelationship(entity.relationships, 'project')
-			const createdBy = readRelationship(entity.relationships, 'user')
+			const createdBy = readRelationship(entity.relationships, 'created_by')
+			const submittedBy = readRelationship(entity.relationships, 'user')
 			if (!project) throw invalidShotGridResponse()
 			return {
 				createdAt: readString(entity.attributes, 'created_at'),
@@ -187,6 +207,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 				playlistId,
 				projectId: project.id,
 				statusCode: readNullableString(entity.attributes, 'sg_status_list'),
+				submittedBy: submittedBy ? mapRelationshipUser(submittedBy) : null,
 			}
 		})
 	}
@@ -197,12 +218,11 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			{
 				body: { sg_status_list: request.statusCode },
 				method: 'PUT',
-				query: { fields: 'sg_status_list' },
+				query: { 'options[fields]': 'sg_status_list' },
 			}
 		)
 		const entity = requireResponseEntity(response, 'Version')
 		return {
-			previousStatusCode: null,
 			statusCode: readString(entity.attributes, 'sg_status_list') || request.statusCode,
 			updatedAt: new Date(this.now()).toISOString(),
 			versionId: request.versionId,
@@ -229,7 +249,13 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		}
 
 		const bytes = Buffer.from(request.contentBase64, 'base64')
-		const uploadResponse = await this.putUpload(ticket.links.upload, bytes, request.contentType)
+		const uploadResponse = await this.putUpload(
+			ticket.links.upload,
+			bytes,
+			request.contentType,
+			request.noteId,
+			ticket.data.storage_service
+		)
 		const uploadInfo = {
 			...ticket.data,
 			...(uploadResponse.data?.upload_id
@@ -259,14 +285,40 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		fields: string[],
 		sort?: string
 	): Promise<ShotGridEntity[]> {
-		const response = await this.client.request<ShotGridListResponse>(`/entity/${entity}/_search`, {
-			body: { filters },
-			idempotent: true,
-			method: 'POST',
-			query: { fields: fields.join(','), ...(sort ? { sort } : undefined) },
+		const entities: ShotGridEntity[] = []
+		for (let pageNumber = 1; pageNumber <= MAX_SEARCH_PAGES; pageNumber++) {
+			const response = await this.client.request<ShotGridListResponse>(
+				`/entity/${entity}/_search`,
+				{
+					body: { filters },
+					headers: { 'Content-Type': 'application/vnd+shotgun.api3_array+json' },
+					idempotent: true,
+					method: 'POST',
+					query: {
+						fields: fields.join(','),
+						'page[number]': pageNumber,
+						'page[size]': SEARCH_PAGE_SIZE,
+						...(sort ? { sort } : undefined),
+					},
+				}
+			)
+			if (!response || !Array.isArray(response.data)) throw invalidShotGridResponse()
+			entities.push(...response.data.map((item) => requireEntity(item)))
+			if (!readNextLink(response)) return entities
+		}
+		throw invalidShotGridResponse()
+	}
+
+	private async readEntity(
+		entity: string,
+		id: number,
+		expectedType: string,
+		fields: string[] = []
+	): Promise<ShotGridEntity> {
+		const response = await this.client.request<ShotGridRecordResponse>(`/entity/${entity}/${id}`, {
+			query: { fields: fields.join(',') },
 		})
-		if (!response || !Array.isArray(response.data)) throw invalidShotGridResponse()
-		return response.data.map((item) => requireEntity(item))
+		return requireResponseEntity(response, expectedType)
 	}
 
 	private getConfiguredActor(): ReviewUser {
@@ -288,8 +340,14 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		}
 	}
 
-	private async putUpload(urlValue: string, body: Buffer, contentType: string) {
-		const url = validateUploadUrl(urlValue, this.config.siteUrl)
+	private async putUpload(
+		urlValue: string,
+		body: Buffer,
+		contentType: string,
+		noteId: number,
+		storageService: 's3' | 'sg'
+	) {
+		const url = validateUploadUrl(urlValue, this.config.siteUrl, noteId, storageService)
 		const uploadBody = Uint8Array.from(body).buffer
 		const controller = new AbortController()
 		const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs)
@@ -350,6 +408,20 @@ function requireResponseEntity(value: unknown, expectedType: string) {
 	return requireEntity(response?.data, expectedType)
 }
 
+function readNextLink(response: ShotGridListResponse): string | null {
+	if (
+		response.links === undefined ||
+		response.links.next === undefined ||
+		response.links.next === null
+	) {
+		return null
+	}
+	if (typeof response.links.next !== 'string' || response.links.next.length === 0) {
+		throw invalidShotGridResponse()
+	}
+	return response.links.next
+}
+
 function requireUploadTicket(value: unknown): UploadTicket {
 	const ticket = readRecord(value)
 	const data = readRecord(ticket?.data)
@@ -408,10 +480,11 @@ function mapVersionMedia(attributes: Record<string, unknown> | undefined): Revie
 			contentType: readString(movie, 'content_type') || 'video/mp4',
 			durationSeconds: frameCount && frameRate ? frameCount / frameRate : null,
 			firstFrame: null,
+			frameCount,
 			frameRate,
 			height: null,
 			kind: 'video',
-			lastFrame: frameCount,
+			lastFrame: null,
 			thumbnailUrl,
 			url: movieUrl,
 			width: null,
@@ -486,7 +559,12 @@ function readRelationshipList(relationships: Record<string, unknown> | undefined
 	return value.filter((item) => readRecord(item) && Number.isSafeInteger(readRecord(item)?.id))
 }
 
-function validateUploadUrl(value: string, siteUrl: string) {
+function validateUploadUrl(
+	value: string,
+	siteUrl: string,
+	noteId: number,
+	storageService: 's3' | 'sg'
+) {
 	let url: URL
 	try {
 		url = new URL(value, siteUrl)
@@ -494,16 +572,58 @@ function validateUploadUrl(value: string, siteUrl: string) {
 		throw invalidShotGridResponse()
 	}
 	const site = new URL(siteUrl)
-	const isTrustedStorage = url.hostname === site.hostname || url.hostname.endsWith('.amazonaws.com')
+	if (url.protocol !== 'https:' || url.username !== '' || url.password !== '') {
+		throw invalidShotGridResponse()
+	}
+
+	if (storageService === 'sg') {
+		const expectedPath = `/api/v1.1/entity/notes/${noteId}/_upload`
+		if (url.origin !== site.origin || url.pathname !== expectedPath || !hasUploadSignature(url)) {
+			throw invalidShotGridResponse()
+		}
+		return url
+	}
+
 	if (
-		url.protocol !== 'https:' ||
-		url.username !== '' ||
-		url.password !== '' ||
-		!isTrustedStorage
+		url.port !== '' ||
+		!isAmazonS3Hostname(url.hostname) ||
+		url.pathname === '/' ||
+		!hasUploadSignature(url)
 	) {
 		throw invalidShotGridResponse()
 	}
 	return url
+}
+
+function hasUploadSignature(url: URL) {
+	return [...url.searchParams.keys()].some((key) => {
+		const normalized = key.toLowerCase()
+		return normalized === 'signature' || normalized === 'x-amz-signature'
+	})
+}
+
+function isAmazonS3Hostname(hostname: string) {
+	const suffix = '.amazonaws.com'
+	if (!hostname.endsWith(suffix)) return false
+	const labels = hostname.slice(0, -suffix.length).split('.')
+	const s3Index = labels.findIndex((label) => label === 's3' || label.startsWith('s3-'))
+	if (s3Index < 0) return false
+
+	const s3Label = labels[s3Index]
+	const tail = labels.slice(s3Index + 1)
+	if (s3Label === 's3-accelerate') {
+		return tail.length === 0 || (tail.length === 1 && tail[0] === 'dualstack')
+	}
+	if (s3Label.startsWith('s3-')) {
+		return tail.length === 0 && isAwsRegion(s3Label.slice(3))
+	}
+	if (tail.length === 0) return true
+	if (tail.length === 1) return isAwsRegion(tail[0])
+	return tail.length === 2 && tail[0] === 'dualstack' && isAwsRegion(tail[1])
+}
+
+function isAwsRegion(value: string) {
+	return /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(value)
 }
 
 function invalidShotGridResponse() {

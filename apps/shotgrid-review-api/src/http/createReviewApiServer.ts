@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type {
 	CreateReviewNoteRequest,
@@ -12,6 +12,8 @@ import type { ReviewGateway } from '../gateway/ReviewGateway'
 const JSON_BODY_LIMIT = 1024 * 1024
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const ATTACHMENT_BODY_LIMIT = Math.ceil((MAX_ATTACHMENT_BYTES * 4) / 3) + 4096
+const HEADERS_TIMEOUT_MS = 10_000
+const REQUEST_TIMEOUT_MS = 30_000
 const MUTATION_METHODS = ['PATCH', 'POST'] as const
 
 type GatewayMode = 'mock' | 'shotgrid'
@@ -26,6 +28,8 @@ export interface ReviewApiServerOptions {
 	logger?: SafeLogger
 	mode: GatewayMode
 	requestId?(): string
+	sudoAsLogin?: string
+	trustedProxyToken?: string
 }
 
 interface RouteMatch {
@@ -37,7 +41,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 	const createRequestId = options.requestId ?? randomUUID
 	const logger = options.logger ?? console
 
-	return createServer(async (request, response) => {
+	const server = createServer(async (request, response) => {
 		const requestId = createRequestId()
 		setStandardHeaders(response, requestId)
 
@@ -53,6 +57,14 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 
 			if (request.method === 'OPTIONS') {
 				handlePreflight(request, response, requestId, route.allowedMethods)
+				return
+			}
+
+			if (
+				options.mode === 'shotgrid' &&
+				url.pathname.startsWith('/api/review/') &&
+				!authenticateTrustedProxy(request, response, requestId, options)
+			) {
 				return
 			}
 
@@ -74,6 +86,44 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			sendJson(response, normalized.status, normalized.toApiErrorEnvelope(requestId))
 		}
 	})
+	server.headersTimeout = HEADERS_TIMEOUT_MS
+	server.keepAliveTimeout = 5_000
+	server.maxHeadersCount = 100
+	server.maxRequestsPerSocket = 100
+	server.requestTimeout = REQUEST_TIMEOUT_MS
+	return server
+}
+
+function authenticateTrustedProxy(
+	request: IncomingMessage,
+	response: ServerResponse,
+	requestId: string,
+	options: ReviewApiServerOptions
+) {
+	const providedToken = readSingleHeader(request, 'x-review-proxy-token') ?? ''
+	const expectedToken = options.trustedProxyToken ?? ''
+	const tokenMatches = expectedToken.length >= 32 && constantTimeEqual(providedToken, expectedToken)
+	const authenticatedLogin = readSingleHeader(request, 'x-review-authenticated-login')
+	const loginMatches =
+		options.sudoAsLogin === undefined || authenticatedLogin === options.sudoAsLogin
+
+	if (!tokenMatches || !loginMatches) {
+		sendError(response, 401, 'AUTHENTICATION_REQUIRED', false, requestId)
+		return false
+	}
+
+	return true
+}
+
+function readSingleHeader(request: IncomingMessage, headerName: string) {
+	const value = request.headers[headerName]
+	return typeof value === 'string' ? value : undefined
+}
+
+function constantTimeEqual(provided: string, expected: string) {
+	const providedDigest = createHash('sha256').update(provided, 'utf8').digest()
+	const expectedDigest = createHash('sha256').update(expected, 'utf8').digest()
+	return timingSafeEqual(providedDigest, expectedDigest)
 }
 
 function matchRoute(
@@ -268,7 +318,7 @@ function parseNoteRequest(value: unknown): CreateReviewNoteRequest {
 	const body = requireRecord(value)
 	return {
 		content: requireString(body.content, 'content', 1, 10_000),
-		frame: optionalNonNegativeInteger(body.frame, 'frame') ?? null,
+		frame: body.frame === null ? null : (optionalNonNegativeInteger(body.frame, 'frame') ?? null),
 		projectId: requireBodyId(body.projectId, 'projectId'),
 		subject: requireString(body.subject, 'subject', 1, 255),
 		versionId: requireBodyId(body.versionId, 'versionId'),
@@ -282,7 +332,7 @@ function parseAttachmentRequest(value: unknown): UploadReviewAttachmentRequest {
 		fileName === '.' ||
 		fileName === '..' ||
 		fileName !== fileName.replaceAll('\\', '/').split('/').at(-1) ||
-		/\p{Cc}/u.test(fileName)
+		/[\p{Bidi_Control}\p{Cc}]/u.test(fileName)
 	) {
 		throw invalidRequest('fileName must not contain a path')
 	}
@@ -298,7 +348,8 @@ function parseAttachmentRequest(value: unknown): UploadReviewAttachmentRequest {
 
 	const contentBase64 = requireString(body.contentBase64, 'contentBase64', 1, ATTACHMENT_BODY_LIMIT)
 	if (!isCanonicalBase64(contentBase64)) throw invalidRequest('contentBase64 must be valid base64')
-	if (Buffer.byteLength(contentBase64, 'base64') > MAX_ATTACHMENT_BYTES) {
+	const content = Buffer.from(contentBase64, 'base64')
+	if (content.byteLength > MAX_ATTACHMENT_BYTES) {
 		throw new ReviewGatewayError({
 			code: 'INVALID_REQUEST',
 			message: 'Attachment is too large',
@@ -306,12 +357,52 @@ function parseAttachmentRequest(value: unknown): UploadReviewAttachmentRequest {
 			status: 413,
 		})
 	}
+	validateAttachmentContent(fileName, contentType, content)
 
 	return {
 		contentBase64,
 		contentType,
 		fileName,
 		noteId: requireBodyId(body.noteId, 'noteId'),
+	}
+}
+
+function validateAttachmentContent(fileName: string, contentType: string, content: Buffer) {
+	const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+	if (contentType === 'image/png') {
+		if (
+			extension !== '.png' ||
+			!content.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+		) {
+			throw invalidRequest('PNG attachment content does not match its file type')
+		}
+		return
+	}
+
+	if (contentType === 'image/jpeg') {
+		if (
+			!['.jpeg', '.jpg'].includes(extension) ||
+			!content.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))
+		) {
+			throw invalidRequest('JPEG attachment content does not match its file type')
+		}
+		return
+	}
+
+	const requiredExtension = contentType === 'application/vnd.tldraw+json' ? '.tldr' : '.json'
+	if (extension !== requiredExtension) {
+		throw invalidRequest('JSON attachment extension does not match its content type')
+	}
+	try {
+		const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(content))
+		if (
+			contentType === 'application/vnd.tldraw+json' &&
+			(!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+		) {
+			throw new Error('Expected a tldraw object')
+		}
+	} catch {
+		throw invalidRequest('JSON attachment content is invalid')
 	}
 }
 

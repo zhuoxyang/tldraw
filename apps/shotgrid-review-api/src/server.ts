@@ -20,6 +20,14 @@ const server = createReviewApiServer({
 	allowedOrigin: config.allowedOrigin,
 	gateway,
 	mode: config.mode,
+	...(config.mode === 'shotgrid'
+		? {
+				...(config.shotgrid?.sudoAsLogin === undefined
+					? undefined
+					: { sudoAsLogin: config.shotgrid.sudoAsLogin }),
+				trustedProxyToken: config.trustedProxyToken,
+			}
+		: undefined),
 })
 
 server.listen(config.port, config.host, () => {

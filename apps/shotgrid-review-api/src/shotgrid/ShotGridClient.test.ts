@@ -283,7 +283,7 @@ describe('ShotGridClient', () => {
 		expect(clearTimeoutSpy).toHaveBeenCalledTimes(3)
 	})
 
-	test('does not retry a POST mutation by default', async () => {
+	test('does not retry a POST mutation or advertise a 503 as safely retryable', async () => {
 		let resourceCalls = 0
 		const sleep = vi.fn(async () => undefined)
 		const fetch = asFetch(async (input) => {
@@ -295,9 +295,46 @@ describe('ShotGridClient', () => {
 
 		await expect(
 			client.request('/entity/Note', { method: 'POST', body: { subject: 'Review note' } })
-		).rejects.toMatchObject({ code: 'SHOTGRID_UNAVAILABLE', upstreamStatus: 503 })
+		).rejects.toMatchObject({
+			code: 'SHOTGRID_UNAVAILABLE',
+			retryable: false,
+			upstreamStatus: 503,
+		})
 		expect(resourceCalls).toBe(1)
 		expect(sleep).not.toHaveBeenCalled()
+	})
+
+	test('retries an upstream 500 for an idempotent request', async () => {
+		let resourceCalls = 0
+		const sleep = vi.fn(async () => undefined)
+		const fetch = asFetch(async (input) => {
+			if (requestUrl(input) === AUTH_URL) return tokenResponse('server-error-token')
+			resourceCalls += 1
+			return resourceCalls === 1
+				? jsonResponse({ error: 'internal upstream detail' }, 500)
+				: jsonResponse({ ok: true })
+		})
+		const client = new ShotGridClient(connectionConfig({ maxRetries: 1 }), { fetch, sleep })
+
+		await expect(client.request('/entity/Project')).resolves.toEqual({ ok: true })
+		expect(resourceCalls).toBe(2)
+		expect(sleep).toHaveBeenCalledWith(250)
+	})
+
+	test('maps an upstream 404 to the public not-found error', async () => {
+		const fetch = asFetch(async (input) =>
+			requestUrl(input) === AUTH_URL
+				? tokenResponse('not-found-token')
+				: jsonResponse({ detail: 'private upstream detail' }, 404)
+		)
+		const client = new ShotGridClient(connectionConfig(), { fetch })
+
+		await expect(client.request('/entity/Version/404')).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+			retryable: false,
+			upstreamStatus: 404,
+		})
 	})
 
 	test('allows a semantically idempotent search POST to opt into retry', async () => {
@@ -352,6 +389,119 @@ describe('ShotGridClient', () => {
 
 		expect(resourceStarted).toBe(true)
 		await rejection
+	})
+
+	test('times out while a successful response body is still streaming', async () => {
+		vi.useFakeTimers()
+		let bodyStarted = false
+		const fetch = asFetch(async (input, init) => {
+			if (requestUrl(input) === AUTH_URL) return tokenResponse('slow-body-token')
+
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						bodyStarted = true
+						init?.signal?.addEventListener(
+							'abort',
+							() => controller.error(new Error('private slow body detail')),
+							{ once: true }
+						)
+					},
+				})
+			)
+		})
+		const client = new ShotGridClient(connectionConfig({ timeoutMs: 50 }), { fetch })
+
+		const request = client.request('/entity/Project')
+		const rejection = expect(request).rejects.toMatchObject({
+			code: 'SHOTGRID_TIMEOUT',
+			status: 504,
+			retryable: true,
+		})
+		await vi.runAllTimersAsync()
+
+		expect(bodyStarted).toBe(true)
+		await rejection
+	})
+
+	test('marks a non-idempotent body timeout as unsafe to retry', async () => {
+		vi.useFakeTimers()
+		let resourceStarted = false
+		const fetch = asFetch(async (input) => {
+			if (requestUrl(input) === AUTH_URL) return tokenResponse('mutation-timeout-token')
+			resourceStarted = true
+			return new Response(new ReadableStream<Uint8Array>())
+		})
+		const client = new ShotGridClient(connectionConfig({ timeoutMs: 50, maxRetries: 3 }), {
+			fetch,
+		})
+
+		const request = client.request('/entity/Note', {
+			method: 'POST',
+			body: { subject: 'Review note' },
+		})
+		const rejection = expect(request).rejects.toMatchObject({
+			code: 'SHOTGRID_TIMEOUT',
+			status: 504,
+			retryable: false,
+		})
+		await vi.runAllTimersAsync()
+
+		expect(resourceStarted).toBe(true)
+		await rejection
+		expect(fetch).toHaveBeenCalledTimes(2)
+	})
+
+	test('rejects and cancels a successful response body larger than 16 MiB', async () => {
+		const cancel = vi.fn()
+		let resourceCalls = 0
+		const sleep = vi.fn(async () => undefined)
+		const fetch = asFetch(async (input) => {
+			if (requestUrl(input) === AUTH_URL) return tokenResponse('oversized-body-token')
+			resourceCalls += 1
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array(16 * 1024 * 1024 + 1))
+					},
+					cancel,
+				}),
+				{ headers: { 'Content-Type': 'application/json' } }
+			)
+		})
+		const client = new ShotGridClient(connectionConfig({ maxRetries: 2 }), { fetch, sleep })
+
+		await expect(client.request('/entity/Project')).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+			retryable: false,
+		})
+		expect(resourceCalls).toBe(1)
+		expect(cancel).toHaveBeenCalledOnce()
+		expect(sleep).not.toHaveBeenCalled()
+	})
+
+	test('normalizes malformed successful response bytes without leaking the body', async () => {
+		const fetch = asFetch(async (input) =>
+			requestUrl(input) === AUTH_URL
+				? tokenResponse('malformed-body-token')
+				: new Response(Uint8Array.from([0xff, 0x70, 0x72, 0x69, 0x76, 0x61, 0x74, 0x65]))
+		)
+		const client = new ShotGridClient(connectionConfig(), { fetch })
+
+		let caught: unknown
+		try {
+			await client.request('/entity/Project')
+		} catch (error) {
+			caught = error
+		}
+
+		expect(caught).toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+			retryable: false,
+		})
+		expect(JSON.stringify(caught)).not.toContain('private')
 	})
 
 	test('never includes server credentials, tokens, or upstream text in an error', async () => {

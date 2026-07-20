@@ -6,11 +6,13 @@ function hasValue(value: Environment[string]) {
 
 export function assertNoPublicShotGridEnvironment(environment: Environment) {
 	const exposedName = Object.keys(environment).find(
-		(name) => name.startsWith('VITE_SHOTGRID_') && hasValue(environment[name])
+		(name) =>
+			(name.startsWith('VITE_SHOTGRID_') || name === 'VITE_REVIEW_API_TRUSTED_PROXY_TOKEN') &&
+			hasValue(environment[name])
 	)
 	if (exposedName) {
 		throw new Error(
-			`${exposedName} uses Vite's public environment prefix; keep all ShotGrid configuration server-side`
+			`${exposedName} uses Vite's public environment prefix; keep all ShotGrid and trusted proxy configuration server-side`
 		)
 	}
 }

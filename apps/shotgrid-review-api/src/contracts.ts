@@ -42,6 +42,7 @@ export interface ReviewVideoMedia {
 	width: number | null
 	height: number | null
 	durationSeconds: number | null
+	frameCount: number | null
 	frameRate: number | null
 	firstFrame: number | null
 	lastFrame: number | null
@@ -58,6 +59,7 @@ export interface ReviewVersion {
 	statusCode: string | null
 	createdAt: string
 	createdBy: ReviewUser | null
+	submittedBy: ReviewUser | null
 	media: ReviewMedia | null
 }
 
@@ -102,7 +104,6 @@ export interface UpdateReviewStatusRequest {
 
 export interface ReviewStatusResult {
 	versionId: ReviewEntityId
-	previousStatusCode: string | null
 	statusCode: string
 	updatedAt: string
 }

@@ -17,6 +17,7 @@ describe('review API contracts', () => {
 			statusCode: 'rev',
 			createdAt: '2026-07-20T08:00:00.000Z',
 			createdBy: null,
+			submittedBy: null,
 			media: {
 				kind: 'image',
 				url: 'https://media.example.test/version-101.png',

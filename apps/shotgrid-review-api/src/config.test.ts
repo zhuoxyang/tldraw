@@ -7,6 +7,7 @@ const LIVE_ENVIRONMENT = {
 	SHOTGRID_SITE_URL: 'https://studio.shotgrid.autodesk.com',
 	SHOTGRID_SCRIPT_NAME: 'review-gateway',
 	SHOTGRID_SCRIPT_KEY: 'private-test-key',
+	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
 } as const
 
 function expectConfigurationError(environment: Record<string, string | undefined>) {
@@ -50,6 +51,7 @@ describe('parseGatewayConfig', () => {
 			host: '0.0.0.0',
 			port: 6543,
 			allowedOrigin: 'https://review.example.test',
+			trustedProxyToken: 'trusted-proxy-token-with-32-characters',
 			shotgrid: {
 				siteUrl: 'https://studio.shotgrid.autodesk.com',
 				scriptName: 'review-gateway',
@@ -74,12 +76,26 @@ describe('parseGatewayConfig', () => {
 		expectConfigurationError({ [name]: value })
 	})
 
-	it.each(['SHOTGRID_SITE_URL', 'SHOTGRID_SCRIPT_NAME', 'SHOTGRID_SCRIPT_KEY'])(
-		'requires %s in ShotGrid mode',
-		(name) => {
-			expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
-		}
-	)
+	it.each([
+		'SHOTGRID_SITE_URL',
+		'SHOTGRID_SCRIPT_NAME',
+		'SHOTGRID_SCRIPT_KEY',
+		'REVIEW_API_TRUSTED_PROXY_TOKEN',
+	])('requires %s in ShotGrid mode', (name) => {
+		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
+	})
+
+	it('requires a strong trusted proxy token without leaking it', () => {
+		const secret = 'short-proxy-secret'
+		const error = expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			REVIEW_API_TRUSTED_PROXY_TOKEN: secret,
+		})
+
+		expect(error.message).not.toContain(secret)
+		expect(String(error.cause)).not.toContain(secret)
+		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
+	})
 
 	it.each([
 		'http://studio.shotgrid.autodesk.com',

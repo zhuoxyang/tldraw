@@ -57,6 +57,7 @@ const initialVersions: ReviewVersion[] = [
 	{
 		createdAt: '2026-07-20T02:15:00.000Z',
 		createdBy: { avatarUrl: null, id: 11, kind: 'human', login: 'mchen', name: 'Mei Chen' },
+		submittedBy: { avatarUrl: null, id: 11, kind: 'human', login: 'mchen', name: 'Mei Chen' },
 		description: 'Lighting polish pass',
 		id: 301,
 		media: {
@@ -75,11 +76,13 @@ const initialVersions: ReviewVersion[] = [
 	{
 		createdAt: '2026-07-20T01:35:00.000Z',
 		createdBy: { avatarUrl: null, id: 12, kind: 'human', login: 'akim', name: 'Alex Kim' },
+		submittedBy: { avatarUrl: null, id: 12, kind: 'human', login: 'akim', name: 'Alex Kim' },
 		description: null,
 		id: 302,
 		media: {
 			contentType: 'video/mp4',
 			durationSeconds: 5,
+			frameCount: 120,
 			firstFrame: 1001,
 			frameRate: 24,
 			height: 1080,
@@ -97,6 +100,7 @@ const initialVersions: ReviewVersion[] = [
 	{
 		createdAt: '2026-07-19T08:45:00.000Z',
 		createdBy: { avatarUrl: null, id: 13, kind: 'human', login: 'srivera', name: 'Sam Rivera' },
+		submittedBy: { avatarUrl: null, id: 13, kind: 'human', login: 'srivera', name: 'Sam Rivera' },
 		description: 'Drone animation final',
 		id: 303,
 		media: {
@@ -115,6 +119,7 @@ const initialVersions: ReviewVersion[] = [
 	{
 		createdAt: '2026-07-18T05:10:00.000Z',
 		createdBy: { avatarUrl: null, id: 14, kind: 'human', login: 'jlee', name: 'Jordan Lee' },
+		submittedBy: { avatarUrl: null, id: 14, kind: 'human', login: 'jlee', name: 'Jordan Lee' },
 		description: null,
 		id: 304,
 		media: {
@@ -138,7 +143,14 @@ export class MockReviewGateway implements ReviewGateway {
 	private readonly versions = initialVersions.map((version) => ({ ...version }))
 
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
-		this.requireVersion(request.versionId)
+		const version = this.requireVersion(request.versionId)
+		if (version.projectId !== request.projectId) {
+			throw new ReviewGatewayError({
+				code: 'INVALID_REQUEST',
+				retryable: false,
+				status: 400,
+			})
+		}
 
 		return {
 			content: request.content,
@@ -172,10 +184,8 @@ export class MockReviewGateway implements ReviewGateway {
 
 	async updateVersionStatus(request: UpdateReviewStatusRequest): Promise<ReviewStatusResult> {
 		const version = this.requireVersion(request.versionId)
-		const previousStatusCode = version.statusCode
 		version.statusCode = request.statusCode
 		return {
-			previousStatusCode,
 			statusCode: version.statusCode,
 			updatedAt: new Date(0).toISOString(),
 			versionId: request.versionId,
