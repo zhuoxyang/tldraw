@@ -4,6 +4,7 @@ import 'tldraw/tldraw.css'
 import { reviewConfig } from './config'
 import { createReviewApiClient } from './reviewApiClient'
 import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowser'
+import { ReviewDecisionPanel, reviewDecisionAccessForReviewerKind } from './ReviewDecisionPanel'
 import { ReviewImageCanvas, reviewPublicationAccessForReviewerKind } from './ReviewImageCanvas'
 import { useReviewBrowser } from './useReviewBrowser'
 
@@ -222,6 +223,14 @@ function ActiveReview({
 					<span>{version.entity?.name ?? 'No entity'}</span>
 					<span>{version.task?.name ?? 'No task'}</span>
 					{reviewer.kind === 'service' ? <span>Session-only canvas</span> : null}
+					<ReviewDecisionPanel
+						access={reviewDecisionAccessForReviewerKind(reviewer.kind)}
+						api={reviewApi}
+						disabled={busy || refreshing}
+						onStatusRefresh={onRefresh}
+						playlistId={playlist.id}
+						versionId={version.id}
+					/>
 					{refreshError ? (
 						<span className="refresh-error" role="alert" title={refreshError.message}>
 							Refresh failed
@@ -341,12 +350,7 @@ function Metadata({ label, value }: { label: string; value: string }) {
 
 function formatStatus(statusCode: string | null) {
 	if (!statusCode) return 'No status'
-	const labels: Record<string, string> = {
-		apr: 'Approved',
-		chg: 'Needs changes',
-		rev: 'Pending review',
-	}
-	return labels[statusCode] ?? statusCode.toUpperCase()
+	return statusCode.toUpperCase()
 }
 
 function formatDate(value: string) {

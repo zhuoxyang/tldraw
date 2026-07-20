@@ -3,6 +3,10 @@ import { isSafeReviewUrl } from '../contracts'
 import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
+	ReviewDecisionContext,
+	ReviewDecisionHistoryEntry,
+	ReviewDecisionOption,
+	ReviewDecisionResult,
 	ReviewEntityLink,
 	ReviewMedia,
 	ReviewNote,
@@ -10,20 +14,19 @@ import type {
 	ReviewPlaylist,
 	ReviewProject,
 	ReviewPublicationLinks,
-	ReviewStatusResult,
 	ReviewTaskLink,
 	ReviewUser,
 	ReviewVersion,
-	UpdateReviewStatusRequest,
 	UploadReviewAttachmentRequest,
 } from '../contracts'
-import { ReviewGatewayError } from '../errors'
+import { isReviewGatewayError, ReviewGatewayError } from '../errors'
 import type { ShotGridClient } from '../shotgrid/ShotGridClient'
 import type {
 	CreateReviewPublicationNoteRequest,
 	ReviewGateway,
 	ReviewImageProxyPayload,
 	ReviewPublicationNoteResult,
+	UpdateReviewDecisionGatewayRequest,
 } from './ReviewGateway'
 
 type FetchImplementation = typeof fetch
@@ -75,6 +78,16 @@ interface UploadResponse {
 	}
 }
 
+interface ShotGridActivityStreamResponse {
+	data: {
+		earliest_update_id?: number
+		entity_id: number
+		entity_type: string
+		latest_update_id?: number
+		updates: unknown[]
+	}
+}
+
 interface ShotGridReviewGatewayOptions {
 	fetch?: FetchImplementation
 	now?(): number
@@ -91,9 +104,11 @@ const MAX_REVIEW_IMAGE_PIXELS = 16_777_216
 const MAX_REVIEW_IMAGE_REDIRECTS = 3
 const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
 const MAX_NOTE_RECIPIENT_OPTIONS = 500
+const MAX_DECISION_ACTIVITY_UPDATES = 500
 const MAX_PUBLICATION_DISPLAY_TEXT_LENGTH = 255
 const MAX_PUBLICATION_CREATED_AT_SKEW_MS = 24 * 60 * 60 * 1000
 const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+const DECISION_STATUS_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const REVIEW_IMAGE_CONTENT_TYPES = new Set<ReviewImageProxyPayload['contentType']>([
 	'image/jpeg',
 	'image/png',
@@ -228,14 +243,44 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			['login', 'name', 'image']
 		)
 		const user = users[0]
-		if (!user) {
+		if (users.length === 0) {
 			throw new ReviewGatewayError({
 				code: 'SHOTGRID_AUTH_FAILED',
 				retryable: false,
 				status: 502,
 			})
 		}
+		if (
+			users.length !== 1 ||
+			user.type !== 'HumanUser' ||
+			readString(user.attributes, 'login') !== this.config.sudoAsLogin
+		) {
+			throw invalidShotGridResponse()
+		}
 		return mapUser(user)
+	}
+
+	async getDecisionContext(
+		playlistId: number,
+		versionId: number,
+		decisions: readonly ReviewDecisionOption[]
+	): Promise<ReviewDecisionContext> {
+		const version = await this.readVersionForPlaylist(playlistId, versionId)
+		const project = readRelationship(version.relationships, 'project')
+		if (!project || project.type !== 'Project') throw invalidShotGridResponse()
+		const currentStatusCode = readDecisionStatusCode(version.attributes?.sg_status_list)
+		const [, audit] = await Promise.all([
+			this.validateDecisionSchema(project.id, decisions),
+			this.readDecisionHistory(versionId, decisions),
+		])
+		return {
+			currentStatusCode,
+			decisions: decisions.map((decision) => ({ ...decision })),
+			history: audit.history,
+			historyTruncated: audit.historyTruncated,
+			playlistId,
+			versionId,
+		}
 	}
 
 	async getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions> {
@@ -332,19 +377,71 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		return entities.map((entity) => mapVersion(entity, playlistId))
 	}
 
-	async updateVersionStatus(request: UpdateReviewStatusRequest): Promise<ReviewStatusResult> {
-		const response = await this.client.request<ShotGridRecordResponse>(
-			`/entity/versions/${request.versionId}`,
-			{
-				body: { sg_status_list: request.statusCode },
-				method: 'PUT',
-				query: { 'options[fields]': 'sg_status_list' },
+	async updateVersionDecision(
+		request: UpdateReviewDecisionGatewayRequest
+	): Promise<ReviewDecisionResult> {
+		const configuredDecision = request.decisions.find(({ key }) => key === request.decision.key)
+		if (!configuredDecision || configuredDecision.statusCode !== request.decision.statusCode) {
+			throw invalidDecisionRequest()
+		}
+
+		const version = await this.readVersionForPlaylist(request.playlistId, request.versionId)
+		const project = readRelationship(version.relationships, 'project')
+		if (!project || project.type !== 'Project') throw invalidShotGridResponse()
+		const previousStatusCode = readDecisionStatusCode(version.attributes?.sg_status_list)
+		if (previousStatusCode !== request.expectedStatusCode) throw decisionConflict()
+		await this.validateDecisionSchema(project.id, request.decisions)
+
+		if (previousStatusCode === request.decision.statusCode) {
+			return {
+				changed: false,
+				decisionKey: request.decision.key,
+				playlistId: request.playlistId,
+				previousStatusCode,
+				reviewer: null,
+				statusCode: request.decision.statusCode,
+				updatedAt: null,
+				versionId: request.versionId,
 			}
-		)
-		const entity = requireResponseEntity(response, 'Version')
+		}
+
+		const reviewer = boundDecisionReviewer(await this.getCurrentReviewer())
+		if (reviewer.kind !== 'human' || reviewer.id === null || !this.config.sudoAsLogin) {
+			throw new ReviewGatewayError({
+				code: 'PERMISSION_DENIED',
+				retryable: false,
+				status: 403,
+			})
+		}
+
+		let updatedAt: string
+		try {
+			const response = await this.client.request<ShotGridRecordResponse>(
+				`/entity/versions/${request.versionId}`,
+				{
+					body: { sg_status_list: request.decision.statusCode },
+					method: 'PUT',
+					query: { 'options[fields]': 'sg_status_list,updated_at' },
+				}
+			)
+			const entity = requireResponseEntity(response, 'Version', request.versionId)
+			if (entity.attributes?.sg_status_list !== request.decision.statusCode) {
+				throw invalidShotGridResponse()
+			}
+			updatedAt = requireDecisionTimestamp(entity.attributes?.updated_at)
+		} catch (error) {
+			if (isKnownRejectedDecision(error)) throw error
+			throw decisionIndeterminate(error)
+		}
+
 		return {
-			statusCode: readString(entity.attributes, 'sg_status_list') || request.statusCode,
-			updatedAt: new Date(this.now()).toISOString(),
+			changed: true,
+			decisionKey: request.decision.key,
+			playlistId: request.playlistId,
+			previousStatusCode,
+			reviewer,
+			statusCode: request.decision.statusCode,
+			updatedAt,
 			versionId: request.versionId,
 		}
 	}
@@ -429,6 +526,122 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			throw invalidPublicationRecipient()
 		}
 		return users
+	}
+
+	private async validateDecisionSchema(
+		projectId: number,
+		decisions: readonly ReviewDecisionOption[]
+	): Promise<void> {
+		const response = await this.client.request<unknown>('/schema/versions/fields/sg_status_list', {
+			query: { project_id: projectId },
+		})
+		const envelope = readRecord(response)
+		const data = readRecord(envelope?.data)
+		const entityType = readRecord(data?.entity_type)
+		const dataType = readRecord(data?.data_type)
+		const editable = readRecord(data?.editable)
+		const properties = readRecord(data?.properties)
+		const validValues = readRecord(properties?.valid_values)
+		const hiddenValues = readRecord(properties?.hidden_values)
+		const visible = readRecord(data?.visible)
+		if (
+			!data ||
+			entityType?.value !== 'Version' ||
+			dataType?.value !== 'status_list' ||
+			typeof editable?.value !== 'boolean' ||
+			typeof visible?.value !== 'boolean' ||
+			!Array.isArray(validValues?.value) ||
+			validValues.value.length > 1_000 ||
+			!validValues.value.every(isDecisionStatusCode) ||
+			!hiddenValues ||
+			!Array.isArray(hiddenValues.value) ||
+			hiddenValues.value.length > 1_000 ||
+			!hiddenValues.value.every(isDecisionStatusCode)
+		) {
+			throw invalidShotGridResponse()
+		}
+		const validStatusValues = validValues.value as string[]
+		const hiddenStatusValues = hiddenValues.value as string[]
+		const allowedStatusCodes = new Set(validStatusValues)
+		const hiddenStatusCodes = new Set(hiddenStatusValues)
+		if (
+			allowedStatusCodes.size !== validStatusValues.length ||
+			hiddenStatusCodes.size !== hiddenStatusValues.length ||
+			hiddenStatusValues.some((statusCode) => !allowedStatusCodes.has(statusCode))
+		) {
+			throw invalidShotGridResponse()
+		}
+		if (
+			editable.value !== true ||
+			visible.value !== true ||
+			decisions.some(
+				({ statusCode }) => !allowedStatusCodes.has(statusCode) || hiddenStatusCodes.has(statusCode)
+			)
+		) {
+			throw decisionConfigurationError()
+		}
+	}
+
+	private async readDecisionHistory(
+		versionId: number,
+		decisions: readonly ReviewDecisionOption[]
+	): Promise<{
+		history: ReviewDecisionHistoryEntry[]
+		historyTruncated: boolean
+	}> {
+		const response = await this.client.request<ShotGridActivityStreamResponse>(
+			`/entity/versions/${versionId}/activity_stream`,
+			{ query: { limit: MAX_DECISION_ACTIVITY_UPDATES } }
+		)
+		const envelope = readRecord(response)
+		const data = readRecord(envelope?.data)
+		if (
+			!data ||
+			data.entity_type !== 'Version' ||
+			data.entity_id !== versionId ||
+			!Array.isArray(data.updates) ||
+			data.updates.length > MAX_DECISION_ACTIVITY_UPDATES
+		) {
+			throw invalidShotGridResponse()
+		}
+
+		const history: ReviewDecisionHistoryEntry[] = []
+		const ids = new Set<number>()
+		for (const rawUpdate of data.updates) {
+			const update = readRecord(rawUpdate)
+			if (!update) throw invalidShotGridResponse()
+			const meta = readRecord(update.meta)
+			if (meta?.attribute_name !== 'sg_status_list') continue
+			if (
+				update.update_type !== 'update' ||
+				meta.type !== 'attribute_change' ||
+				meta.entity_type !== 'Version' ||
+				meta.entity_id !== versionId ||
+				meta.field_data_type !== 'status_list' ||
+				!Number.isSafeInteger(update.id) ||
+				Number(update.id) <= 0 ||
+				ids.has(Number(update.id))
+			) {
+				throw invalidShotGridResponse()
+			}
+			const previousStatusCode = readDecisionStatusCode(meta.old_value)
+			const resultingStatusCode = readDecisionStatusCode(meta.new_value)
+			const id = Number(update.id)
+			ids.add(id)
+			history.push({
+				decidedAt: requireDecisionTimestamp(update.created_at),
+				decisionKey:
+					decisions.find(({ statusCode }) => statusCode === resultingStatusCode)?.key ?? null,
+				id,
+				previousStatusCode,
+				resultingStatusCode,
+				reviewer: mapActivityReviewer(update.created_by),
+			})
+		}
+		return {
+			history,
+			historyTruncated: data.updates.length === MAX_DECISION_ACTIVITY_UPDATES,
+		}
 	}
 
 	private async search(
@@ -745,6 +958,47 @@ function mapUser(entity: ShotGridEntity): ReviewUser {
 	}
 }
 
+function boundDecisionReviewer(user: ReviewUser): ReviewUser {
+	return {
+		avatarUrl: user.avatarUrl,
+		id: user.id,
+		kind: user.kind,
+		login:
+			user.login === null
+				? null
+				: decisionDisplayText(user.login, 'User ' + (user.id ?? 'unknown')),
+		name: decisionDisplayText(user.name, 'User ' + (user.id ?? 'unknown')),
+	}
+}
+
+function mapActivityReviewer(value: unknown): ReviewUser | null {
+	if (value === undefined || value === null) return null
+	const record = readRecord(value)
+	if (
+		!record ||
+		!Number.isSafeInteger(record.id) ||
+		Number(record.id) <= 0 ||
+		typeof record.type !== 'string' ||
+		(record.type !== 'HumanUser' && record.type !== 'ApiUser')
+	) {
+		return null
+	}
+	const id = Number(record.id)
+	const avatarUrl =
+		record.image === undefined || record.image === null
+			? null
+			: isSafeReviewUrl(record.image)
+				? record.image
+				: null
+	return {
+		avatarUrl,
+		id,
+		kind: record.type === 'HumanUser' ? 'human' : 'service',
+		login: null,
+		name: decisionDisplayText(record.name, record.type + ' ' + id),
+	}
+}
+
 function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
 	const project = readRelationship(entity.relationships, 'project')
 	const createdBy = readRelationship(entity.relationships, 'created_by')
@@ -824,6 +1078,39 @@ function publicationDisplayText(value: unknown, fallback: string) {
 		!/[\p{Bidi_Control}\p{Cc}]/u.test(normalized)
 		? normalized
 		: fallback
+}
+
+function decisionDisplayText(value: unknown, fallback: string) {
+	if (typeof value !== 'string') return fallback
+	const normalized = value.trim()
+	return normalized.length > 0 &&
+		normalized.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(normalized)
+		? normalized
+		: fallback
+}
+
+function isDecisionStatusCode(value: unknown): value is string {
+	return typeof value === 'string' && DECISION_STATUS_CODE_PATTERN.test(value)
+}
+
+function readDecisionStatusCode(value: unknown): string | null {
+	if (value === null) return null
+	if (!isDecisionStatusCode(value)) throw invalidShotGridResponse()
+	return value
+}
+
+function requireDecisionTimestamp(value: unknown) {
+	const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN
+	if (
+		typeof value !== 'string' ||
+		value.length === 0 ||
+		value.length > 32 ||
+		!Number.isFinite(parsed)
+	) {
+		throw invalidShotGridResponse()
+	}
+	return new Date(parsed).toISOString()
 }
 
 function publicationCreatedAt(value: unknown, nowMs: number) {
@@ -1302,6 +1589,59 @@ function isAwsRegion(value: string) {
 function invalidShotGridResponse() {
 	return new ReviewGatewayError({
 		code: 'SHOTGRID_INVALID_RESPONSE',
+		retryable: false,
+		status: 502,
+	})
+}
+
+function invalidDecisionRequest() {
+	return new ReviewGatewayError({
+		code: 'INVALID_REQUEST',
+		retryable: false,
+		status: 400,
+	})
+}
+
+function decisionConflict() {
+	return new ReviewGatewayError({
+		code: 'DECISION_CONFLICT',
+		retryable: false,
+		status: 409,
+	})
+}
+
+function decisionConfigurationError() {
+	return new ReviewGatewayError({
+		code: 'CONFIGURATION_ERROR',
+		retryable: false,
+		status: 500,
+	})
+}
+
+function isKnownRejectedDecision(error: unknown) {
+	if (!isReviewGatewayError(error)) return false
+	if (
+		error.code === 'AUTHENTICATION_REQUIRED' ||
+		error.code === 'PERMISSION_DENIED' ||
+		error.code === 'NOT_FOUND' ||
+		error.code === 'SHOTGRID_AUTH_FAILED' ||
+		error.code === 'SHOTGRID_PERMISSION_DENIED' ||
+		error.code === 'SHOTGRID_RATE_LIMITED'
+	) {
+		return true
+	}
+	return (
+		error.code === 'SHOTGRID_REQUEST_FAILED' &&
+		error.upstreamStatus !== undefined &&
+		error.upstreamStatus >= 400 &&
+		error.upstreamStatus < 500
+	)
+}
+
+function decisionIndeterminate(cause: unknown) {
+	return new ReviewGatewayError({
+		cause,
+		code: 'DECISION_INDETERMINATE',
 		retryable: false,
 		status: 502,
 	})

@@ -259,6 +259,19 @@ describe('createReviewApiServer', () => {
 			error: { code: 'PERMISSION_DENIED', retryable: false },
 		})
 
+		const decisionContext = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/decision-context`,
+			{ headers }
+		)
+		expect(decisionContext.status).toBe(403)
+
+		const decision = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: 'not-json-and-must-not-be-parsed',
+			headers: { ...headers, 'Content-Type': 'application/json' },
+			method: 'PUT',
+		})
+		expect(decision.status).toBe(403)
+
 		const publication = await fetch(
 			`${baseUrl}/api/review/playlists/201/versions/301/publications/${PUBLICATION_ID}`,
 			{
@@ -273,10 +286,88 @@ describe('createReviewApiServer', () => {
 		})
 
 		expect(gateway.getNoteOptions).not.toHaveBeenCalled()
+		expect(gateway.getDecisionContext).not.toHaveBeenCalled()
+		expect(gateway.updateVersionDecision).not.toHaveBeenCalled()
 		expect(gateway.createPublicationNote).not.toHaveBeenCalled()
 		expect(gateway.uploadAttachment).not.toHaveBeenCalled()
 		expect(publicationStore.initialize).not.toHaveBeenCalled()
 		expect(publicationStore.runExclusive).not.toHaveBeenCalled()
+	})
+
+	test('keeps browse-only live deployments running but fails decision routes without mappings', async () => {
+		const gateway = makeGateway()
+		const logger = { error: vi.fn() }
+		const baseUrl = await start(gateway, logger, {
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+		const headers = {
+			'X-Review-Authenticated-Login': 'reviewer@example.test',
+			'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
+		}
+
+		const context = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/decision-context`,
+			{ headers }
+		)
+		expect(context.status).toBe(500)
+		expect(await context.json()).toMatchObject({
+			error: { code: 'CONFIGURATION_ERROR', retryable: false },
+		})
+		const decision = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
+			headers: { ...headers, 'Content-Type': 'application/json' },
+			method: 'PUT',
+		})
+		expect(decision.status).toBe(500)
+		expect(gateway.getDecisionContext).not.toHaveBeenCalled()
+		expect(gateway.updateVersionDecision).not.toHaveBeenCalled()
+	})
+
+	test('rejects non-exact decision bodies before the gateway', async () => {
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway)
+		for (const body of [
+			{ decisionKey: 'approve' },
+			{ decisionKey: 'Approve', expectedStatusCode: 'rev' },
+			{ decisionKey: 'approve', expectedStatusCode: 'status code' },
+			{ decisionKey: 'approve', expectedStatusCode: 'rev', statusCode: 'apr' },
+		]) {
+			const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+				body: JSON.stringify(body),
+				headers: { 'Content-Type': 'application/json' },
+				method: 'PUT',
+			})
+			expect(response.status).toBe(400)
+			expect(await response.json()).toMatchObject({
+				error: { code: 'INVALID_REQUEST', retryable: false },
+			})
+		}
+		expect(gateway.updateVersionDecision).not.toHaveBeenCalled()
+	})
+
+	test('returns a stable decision conflict without presenting success', async () => {
+		const gateway = makeGateway({
+			updateVersionDecision: vi.fn(async () => {
+				throw new ReviewGatewayError({
+					code: 'DECISION_CONFLICT',
+					retryable: false,
+					status: 409,
+				})
+			}),
+		})
+		const baseUrl = await start(gateway)
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
+			headers: { 'Content-Type': 'application/json' },
+			method: 'PUT',
+		})
+
+		expect(response.status).toBe(409)
+		expect(await response.json()).toMatchObject({
+			error: { code: 'DECISION_CONFLICT', retryable: false },
+		})
 	})
 
 	test('does not require proxy headers in local mock mode', async () => {
@@ -347,22 +438,58 @@ describe('createReviewApiServer', () => {
 			}
 		)
 
+		await expectJson(`${baseUrl}/api/review/playlists/201/versions/301/decision-context`, 200, {
+			data: {
+				currentStatusCode: 'rev',
+				decisions: [
+					{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+					{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+					{
+						key: 'pending-clarification',
+						label: 'Pending clarification',
+						statusCode: 'rev',
+					},
+				],
+				history: [],
+				historyTruncated: false,
+				playlistId: 201,
+				versionId: 301,
+			},
+		})
+
 		await expectJson(
-			`${baseUrl}/api/review/versions/301/status`,
+			`${baseUrl}/api/review/playlists/201/versions/301/decision`,
 			200,
 			{
 				data: {
+					changed: true,
+					decisionKey: 'approve',
+					playlistId: 201,
+					previousStatusCode: 'rev',
+					reviewer: {
+						avatarUrl: null,
+						id: 7,
+						kind: 'human',
+						login: 'reviewer',
+						name: 'Reviewer',
+					},
 					statusCode: 'apr',
 					updatedAt: '2026-07-20T00:00:00Z',
 					versionId: 301,
 				},
 			},
 			{
-				body: JSON.stringify({ statusCode: 'apr' }),
+				body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
 				headers: { 'Content-Type': 'application/json' },
-				method: 'PATCH',
+				method: 'PUT',
 			}
 		)
+		const legacyStatus = await fetch(`${baseUrl}/api/review/versions/301/status`, {
+			body: JSON.stringify({ statusCode: 'apr' }),
+			headers: { 'Content-Type': 'application/json' },
+			method: 'PATCH',
+		})
+		expect(legacyStatus.status).toBe(404)
 
 		expect(gateway.createPublicationNote).toHaveBeenCalledWith(201, 301, {
 			content: 'Move the highlight left',
@@ -885,6 +1012,16 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 			},
 		})),
 		getCurrentReviewer: vi.fn(async () => reviewer),
+		getDecisionContext: vi.fn<ReviewGateway['getDecisionContext']>(
+			async (playlistId, versionId, decisions) => ({
+				currentStatusCode: 'rev',
+				decisions: decisions.map((decision) => ({ ...decision })),
+				history: [],
+				historyTruncated: false,
+				playlistId,
+				versionId,
+			})
+		),
 		getNoteOptions: vi.fn(async () => ({
 			links: PUBLICATION_LINKS,
 			recipients: [reviewer],
@@ -912,8 +1049,13 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 			{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null },
 		]),
 		listVersions: vi.fn(async (playlistId) => [{ ...VERSION_FIXTURE, playlistId }]),
-		updateVersionStatus: vi.fn(async (request) => ({
-			statusCode: request.statusCode,
+		updateVersionDecision: vi.fn(async (request) => ({
+			changed: request.expectedStatusCode !== request.decision.statusCode,
+			decisionKey: request.decision.key,
+			playlistId: request.playlistId,
+			previousStatusCode: request.expectedStatusCode,
+			reviewer,
+			statusCode: request.decision.statusCode,
 			updatedAt: '2026-07-20T00:00:00Z',
 			versionId: request.versionId,
 		})),
@@ -1016,13 +1158,19 @@ async function start(
 	logger?: ReviewApiServerOptions['logger'],
 	options: Pick<
 		ReviewApiServerOptions,
-		'mode' | 'publicationDeploymentScope' | 'publicationStore' | 'sudoAsLogin' | 'trustedProxyToken'
+		| 'decisions'
+		| 'mode'
+		| 'publicationDeploymentScope'
+		| 'publicationStore'
+		| 'sudoAsLogin'
+		| 'trustedProxyToken'
 	> = {
 		mode: 'mock',
 	}
 ) {
 	const server = createReviewApiServer({
 		allowedOrigin: 'http://127.0.0.1:5430',
+		...(options.decisions === undefined ? undefined : { decisions: options.decisions }),
 		gateway,
 		logger,
 		mode: options.mode,

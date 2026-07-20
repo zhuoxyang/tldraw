@@ -9,6 +9,9 @@ const CLIENT_MESSAGES: Record<ReviewApiErrorCode, string> = {
 	AUTHENTICATION_REQUIRED: 'Authentication is required.',
 	PERMISSION_DENIED: 'You do not have permission to perform this review action.',
 	NOT_FOUND: 'The requested review item was not found.',
+	DECISION_CONFLICT: 'The Version status changed. Refresh the review decision before trying again.',
+	DECISION_INDETERMINATE:
+		'The review decision outcome is uncertain. Refresh it from ShotGrid before trying again.',
 	PUBLICATION_CONFLICT: 'This publication id was already used for different review content.',
 	PUBLICATION_INCOMPLETE:
 		'The review note was created, but its attachment is incomplete. Retry with the same publication id.',

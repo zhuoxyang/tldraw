@@ -3,6 +3,11 @@ import {
 	type ReviewApiDataEnvelope,
 	type ReviewApiErrorCode,
 	type ReviewApiErrorEnvelope,
+	type ReviewDecisionContext,
+	type ReviewDecisionHistoryEntry,
+	type ReviewDecisionOption,
+	type ReviewDecisionRequest,
+	type ReviewDecisionResult,
 	type ReviewEntityLink,
 	type ReviewHealth,
 	type ReviewImageMedia,
@@ -28,6 +33,11 @@ const MAX_PUBLICATION_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_PUBLICATION_CONTENT_LENGTH = 10_000
 const MAX_PUBLICATION_DISPLAY_TEXT_LENGTH = 255
 const MAX_PUBLICATION_TIMESTAMP_LENGTH = 32
+const MAX_DECISION_OPTIONS = 32
+const MAX_DECISION_HISTORY_ENTRIES = 500
+const MAX_DECISION_LABEL_LENGTH = 100
+const DECISION_KEY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
+const DECISION_STATUS_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
 export function isReviewApiDataEnvelope<T>(
@@ -163,6 +173,137 @@ export function isReviewNote(value: unknown): value is ReviewNote {
 		isNonEmptyString(record.createdAt) &&
 		isReviewUser(record.createdBy)
 	)
+}
+
+export function isReviewDecisionOption(value: unknown): value is ReviewDecisionOption {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['key', 'label', 'statusCode']) &&
+		isDecisionKey(record.key) &&
+		isDecisionLabel(record.label) &&
+		isDecisionStatusCode(record.statusCode)
+	)
+}
+
+export function isReviewDecisionHistoryEntry(value: unknown): value is ReviewDecisionHistoryEntry {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, [
+			'decidedAt',
+			'decisionKey',
+			'id',
+			'previousStatusCode',
+			'resultingStatusCode',
+			'reviewer',
+		]) &&
+		isPositiveId(record.id) &&
+		(record.decisionKey === null || isDecisionKey(record.decisionKey)) &&
+		isBoundedTimestamp(record.decidedAt) &&
+		(record.reviewer === null ||
+			(isReviewUser(record.reviewer) && isBoundedPublicationUser(record.reviewer))) &&
+		isNullableDecisionStatusCode(record.previousStatusCode) &&
+		isNullableDecisionStatusCode(record.resultingStatusCode)
+	)
+}
+
+export function isReviewDecisionContext(value: unknown): value is ReviewDecisionContext {
+	const record = readRecord(value)
+	if (
+		record === null ||
+		!hasOnlyKeys(record, [
+			'currentStatusCode',
+			'decisions',
+			'history',
+			'historyTruncated',
+			'playlistId',
+			'versionId',
+		]) ||
+		!isPositiveId(record.playlistId) ||
+		!isPositiveId(record.versionId) ||
+		!isNullableDecisionStatusCode(record.currentStatusCode) ||
+		!Array.isArray(record.decisions) ||
+		record.decisions.length === 0 ||
+		record.decisions.length > MAX_DECISION_OPTIONS ||
+		!record.decisions.every(isReviewDecisionOption) ||
+		!Array.isArray(record.history) ||
+		record.history.length > MAX_DECISION_HISTORY_ENTRIES ||
+		!record.history.every(isReviewDecisionHistoryEntry) ||
+		typeof record.historyTruncated !== 'boolean'
+	) {
+		return false
+	}
+
+	const decisions = record.decisions as ReviewDecisionOption[]
+	if (
+		new Set(decisions.map(({ key }) => key)).size !== decisions.length ||
+		new Set(decisions.map(({ statusCode }) => statusCode)).size !== decisions.length
+	) {
+		return false
+	}
+	const decisionsByStatus = new Map(decisions.map((decision) => [decision.statusCode, decision]))
+	const history = record.history as ReviewDecisionHistoryEntry[]
+	if (new Set(history.map(({ id }) => id)).size !== history.length) return false
+	return history.every(({ decisionKey, resultingStatusCode }) => {
+		const expectedDecisionKey =
+			resultingStatusCode === null
+				? null
+				: (decisionsByStatus.get(resultingStatusCode)?.key ?? null)
+		return decisionKey === expectedDecisionKey
+	})
+}
+
+export function isReviewDecisionRequest(value: unknown): value is ReviewDecisionRequest {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['decisionKey', 'expectedStatusCode']) &&
+		isDecisionKey(record.decisionKey) &&
+		isNullableDecisionStatusCode(record.expectedStatusCode)
+	)
+}
+
+export function isReviewDecisionResult(value: unknown): value is ReviewDecisionResult {
+	const record = readRecord(value)
+	if (
+		record === null ||
+		!hasOnlyKeys(record, [
+			'changed',
+			'decisionKey',
+			'playlistId',
+			'previousStatusCode',
+			'reviewer',
+			'statusCode',
+			'updatedAt',
+			'versionId',
+		]) ||
+		typeof record.changed !== 'boolean'
+	) {
+		return false
+	}
+	if (
+		!isPositiveId(record.playlistId) ||
+		!isPositiveId(record.versionId) ||
+		!isDecisionKey(record.decisionKey) ||
+		!isNullableDecisionStatusCode(record.previousStatusCode) ||
+		!isDecisionStatusCode(record.statusCode) ||
+		!(record.updatedAt === null || isBoundedTimestamp(record.updatedAt)) ||
+		!(
+			record.reviewer === null ||
+			(isReviewUser(record.reviewer) && isBoundedPublicationUser(record.reviewer))
+		)
+	) {
+		return false
+	}
+	return record.changed
+		? record.previousStatusCode !== record.statusCode &&
+				record.updatedAt !== null &&
+				record.reviewer !== null &&
+				record.reviewer.kind === 'human'
+		: record.previousStatusCode === record.statusCode &&
+				record.updatedAt === null &&
+				record.reviewer === null
 }
 
 export function isReviewAttachmentResult(value: unknown): value is ReviewAttachmentResult {
@@ -314,6 +455,37 @@ function isBoundedPublicationUser(value: ReviewUser) {
 	return (
 		value.name.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
 		(value.login === null || value.login.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH)
+	)
+}
+
+function isDecisionKey(value: unknown): value is string {
+	return typeof value === 'string' && DECISION_KEY_PATTERN.test(value)
+}
+
+function isDecisionLabel(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		value.trim() === value &&
+		value.length > 0 &&
+		value.length <= MAX_DECISION_LABEL_LENGTH &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(value)
+	)
+}
+
+function isDecisionStatusCode(value: unknown): value is string {
+	return typeof value === 'string' && DECISION_STATUS_CODE_PATTERN.test(value)
+}
+
+function isNullableDecisionStatusCode(value: unknown): value is string | null {
+	return value === null || isDecisionStatusCode(value)
+}
+
+function isBoundedTimestamp(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		value.length > 0 &&
+		value.length <= MAX_PUBLICATION_TIMESTAMP_LENGTH &&
+		Number.isFinite(Date.parse(value))
 	)
 }
 

@@ -46,3 +46,18 @@ When `/api/review/me` returns a service identity, the app deliberately disables 
 does not open publication IndexedDB state, load Note options, or send publication requests. The
 service identity may still browse, annotate, save/open editable snapshots, and export PNGs. Do not
 replace this boundary with a session nonce or an in-memory publication fallback.
+
+Review decisions use the deployment's server-side decision mapping; the browser never hard-codes
+studio status meanings. A human reviewer can open the decision control to see the current ShotGrid
+status, configured actions, and recent status history. Each update includes the status observed by
+the browser. Because ShotGrid does not provide a compare-and-set status update, this is a
+best-effort conflict check rather than a database transaction. The app confirms the PUT response,
+then reloads authoritative decision context before showing success. Conflicts and indeterminate
+outcomes also reload status and history without automatically retrying the mutation.
+
+When the gateway reaches ShotGrid's activity-page limit, the panel labels the result as recent
+history and warns that older changes may exist; it must not be treated as a complete audit export.
+
+Service identities do not initialize or display decision context and never send decision GET or PUT
+requests from the browser. Configure `SHOTGRID_SUDO_AS_LOGIN` to expose decisions to a resolved
+human reviewer.

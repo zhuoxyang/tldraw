@@ -1,4 +1,7 @@
 import {
+	type ReviewDecisionContext,
+	type ReviewDecisionRequest,
+	type ReviewDecisionResult,
 	type ReviewHealth,
 	type ReviewNoteOptions,
 	type ReviewPlaylist,
@@ -9,6 +12,9 @@ import {
 	type ReviewUser,
 	type ReviewVersion,
 	isReviewApiErrorEnvelope,
+	isReviewDecisionContext,
+	isReviewDecisionRequest,
+	isReviewDecisionResult,
 	isReviewHealth,
 	isReviewNoteOptions,
 	isReviewPlaylist,
@@ -32,6 +38,11 @@ const MAX_RESPONSE_ITEMS = 10_000
 
 export interface ReviewApiClient {
 	getCurrentReviewer(signal?: AbortSignal): Promise<ReviewUser>
+	getDecisionContext(
+		playlistId: number,
+		versionId: number,
+		signal?: AbortSignal
+	): Promise<ReviewDecisionContext>
 	getHealth(signal?: AbortSignal): Promise<ReviewHealth>
 	getNoteOptions(
 		playlistId: number,
@@ -49,6 +60,12 @@ export interface ReviewApiClient {
 		request: ReviewPublicationRequest,
 		signal?: AbortSignal
 	): Promise<ReviewPublicationResult>
+	updateDecision(
+		playlistId: number,
+		versionId: number,
+		request: ReviewDecisionRequest,
+		signal?: AbortSignal
+	): Promise<ReviewDecisionResult>
 }
 
 export interface CreateReviewApiClientOptions {
@@ -154,6 +171,20 @@ export function createReviewApiClient({
 			return unwrapData(await request('/review/me', { signal }), isReviewUser)
 		},
 
+		async getDecisionContext(playlistId, versionId, signal) {
+			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
+			const validVersionId = requirePositiveId(versionId, 'versionId')
+			const response = await request(
+				`/review/playlists/${validPlaylistId}/versions/${validVersionId}/decision-context`,
+				{ signal }
+			)
+			const context = unwrapData(response, isReviewDecisionContext)
+			if (context.playlistId !== validPlaylistId || context.versionId !== validVersionId) {
+				throw invalidResponseError(response.status, response.requestId)
+			}
+			return context
+		},
+
 		async getHealth(signal) {
 			const response = await request('/health', { signal })
 			if (!isReviewHealth(response.payload)) {
@@ -256,6 +287,30 @@ export function createReviewApiClient({
 				result.attachment.contentType !== publication.attachment.contentType ||
 				decodedAttachmentSize === null ||
 				result.attachment.sizeBytes !== decodedAttachmentSize
+			) {
+				throw invalidResponseError(response.status, response.requestId)
+			}
+			return result
+		},
+
+		async updateDecision(playlistId, versionId, decision, signal) {
+			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
+			const validVersionId = requirePositiveId(versionId, 'versionId')
+			if (!isReviewDecisionRequest(decision)) {
+				throw invalidRequestError('decision request is invalid')
+			}
+			const body = JSON.stringify(decision)
+			const response = await request(
+				`/review/playlists/${validPlaylistId}/versions/${validVersionId}/decision`,
+				{ body, method: 'PUT', signal }
+			)
+			const result = unwrapData(response, isReviewDecisionResult)
+			if (
+				result.playlistId !== validPlaylistId ||
+				result.versionId !== validVersionId ||
+				result.decisionKey !== decision.decisionKey ||
+				result.previousStatusCode !== decision.expectedStatusCode ||
+				(result.changed && result.reviewer?.kind !== 'human')
 			) {
 				throw invalidResponseError(response.status, response.requestId)
 			}

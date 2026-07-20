@@ -30,6 +30,7 @@ if (config.mode === 'shotgrid') {
 
 const server = createReviewApiServer({
 	allowedOrigin: config.allowedOrigin,
+	decisions: config.decisions,
 	gateway,
 	mode: config.mode,
 	publicationStore,
