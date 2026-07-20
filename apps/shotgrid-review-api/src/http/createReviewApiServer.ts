@@ -4,16 +4,19 @@ import { promisify } from 'node:util'
 import { inflate } from 'node:zlib'
 import type {
 	ReviewApiErrorCode,
+	ReviewDecisionOption,
+	ReviewDecisionRequest,
 	ReviewHealth,
 	ReviewPublicationRequest,
-	UpdateReviewStatusRequest,
 } from '../contracts'
+import { isReviewDecisionRequest } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ReviewGateway, ReviewImageProxyPayload } from '../gateway/ReviewGateway'
+import { ReviewDecisionCoordinator } from './ReviewDecisionCoordinator'
 import { ReviewPublicationCoordinator } from './ReviewPublicationCoordinator'
 import type { ReviewPublicationStore } from './ReviewPublicationStore'
 
-const JSON_BODY_LIMIT = 1024 * 1024
+const DECISION_BODY_LIMIT = 4 * 1024
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const PUBLICATION_BODY_LIMIT = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4 + 64 * 1024
 const MAX_PNG_DIMENSION = 8_192
@@ -24,7 +27,7 @@ const PNG_CRC_TABLE = createPngCrcTable()
 const HEADERS_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 30_000
 const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
-const MUTATION_METHODS = ['PATCH', 'PUT'] as const
+const MUTATION_METHODS = ['PUT'] as const
 const inflateAsync = promisify(inflate)
 
 type GatewayMode = 'mock' | 'shotgrid'
@@ -35,6 +38,7 @@ interface SafeLogger {
 
 export interface ReviewApiServerOptions {
 	allowedOrigin: string
+	decisions?: readonly ReviewDecisionOption[]
 	gateway: ReviewGateway
 	logger?: SafeLogger
 	maxConcurrentPublications?: number
@@ -111,6 +115,17 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 		})
 	}
 	const publications = new ReviewPublicationCoordinator(options.gateway, options.publicationStore)
+	const decisions = new ReviewDecisionCoordinator(
+		options.gateway,
+		options.decisions ??
+			(options.mode === 'mock'
+				? [
+						{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+						{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+						{ key: 'pending-clarification', label: 'Pending clarification', statusCode: 'rev' },
+					]
+				: [])
+	)
 	const publicationLimiter = new InFlightLimiter(maxConcurrentPublications)
 	const publicationActorScope =
 		options.mode === 'mock'
@@ -131,6 +146,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				url.pathname,
 				options.gateway,
 				options.mode,
+				decisions,
 				publications,
 				publicationLimiter,
 				publicationActorScope,
@@ -242,6 +258,7 @@ function matchRoute(
 	pathname: string,
 	gateway: ReviewGateway,
 	mode: GatewayMode,
+	decisions: ReviewDecisionCoordinator,
 	publications: ReviewPublicationCoordinator,
 	publicationLimiter: InFlightLimiter,
 	publicationActorScope: string,
@@ -334,6 +351,36 @@ function matchRoute(
 		}, true)
 	}
 
+	const decisionContext = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/decision-context$/
+	)
+	if (decisionContext.matched) {
+		return getRoute(async () => {
+			const playlistId = requirePositiveId(decisionContext.firstId, 'playlistId')
+			const versionId = requirePositiveId(decisionContext.secondId, 'versionId')
+			sendJson(response, 200, { data: await decisions.getContext(playlistId, versionId) })
+		}, true)
+	}
+
+	const decision = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/decision$/
+	)
+	if (decision.matched) {
+		return mutationRoute(
+			'PUT',
+			async (request) => {
+				const playlistId = requirePositiveId(decision.firstId, 'playlistId')
+				const versionId = requirePositiveId(decision.secondId, 'versionId')
+				const body = await readJson(request, DECISION_BODY_LIMIT)
+				const result = await decisions.decide(playlistId, versionId, parseDecisionRequest(body))
+				sendJson(response, 200, { data: result })
+			},
+			true
+		)
+	}
+
 	const publication = matchPublicationPath(pathname)
 	if (publication.matched) {
 		return mutationRoute(
@@ -361,16 +408,6 @@ function matchRoute(
 			},
 			true
 		)
-	}
-
-	const statusUpdate = matchIdPath(pathname, /^\/api\/review\/versions\/([^/]+)\/status$/)
-	if (statusUpdate.matched) {
-		return mutationRoute('PATCH', async (request) => {
-			const versionId = requirePositiveId(statusUpdate.id, 'versionId')
-			const body = await readJson(request, JSON_BODY_LIMIT)
-			const status = await gateway.updateVersionStatus(parseStatusRequest(versionId, body))
-			sendJson(response, 200, { data: status })
-		})
 	}
 
 	return undefined
@@ -811,15 +848,9 @@ function createPngCrcTable() {
 	return table
 }
 
-function parseStatusRequest(versionId: number, value: unknown): UpdateReviewStatusRequest {
-	const body = requireRecord(value)
-	const statusCode = requireString(body.statusCode, 'statusCode', 1, 32)
-	if (!/^[a-z0-9_]+$/i.test(statusCode)) throw invalidRequest('statusCode is invalid')
-
-	return {
-		statusCode,
-		versionId,
-	}
+function parseDecisionRequest(value: unknown): ReviewDecisionRequest {
+	if (!isReviewDecisionRequest(value)) throw invalidRequest('Decision request is invalid')
+	return value
 }
 
 function requireRecord(value: unknown): Record<string, unknown> {

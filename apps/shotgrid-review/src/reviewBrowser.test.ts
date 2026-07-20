@@ -46,6 +46,7 @@ const version: ReviewVersion = {
 
 function makeApi(overrides: Partial<ReviewApiClient> = {}): ReviewApiClient {
 	return {
+		getDecisionContext: vi.fn(),
 		getCurrentReviewer: vi.fn(async () => ({
 			avatarUrl: null,
 			id: 7,
@@ -62,6 +63,7 @@ function makeApi(overrides: Partial<ReviewApiClient> = {}): ReviewApiClient {
 		listProjects: vi.fn(async () => projects.map((project) => ({ ...project }))),
 		listVersions: vi.fn(async (playlistId) => (playlistId === 201 ? [{ ...version }] : [])),
 		publishReview: vi.fn(),
+		updateDecision: vi.fn(),
 		...overrides,
 	}
 }

@@ -3,6 +3,9 @@ import {
 	isReviewApiDataEnvelope,
 	isReviewApiErrorEnvelope,
 	isReviewArrayOf,
+	isReviewDecisionContext,
+	isReviewDecisionRequest,
+	isReviewDecisionResult,
 	isReviewHealth,
 	isReviewNoteOptions,
 	isReviewPlaylist,
@@ -88,6 +91,105 @@ describe('review contract runtime guards', () => {
 		expect(isReviewVersion({ ...version, entity: undefined })).toBe(false)
 		expect(isReviewVersion({ ...version, unexpected: true })).toBe(false)
 		expect(isReviewVersion({ ...version, task: { id: 601, name: ' ' } })).toBe(false)
+	})
+
+	test('validates exact decision context, request, result, and audit relationships', () => {
+		const reviewer = {
+			avatarUrl: null,
+			id: 7,
+			kind: 'human' as const,
+			login: 'reviewer',
+			name: 'Reviewer',
+		}
+		const decisions = [
+			{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+			{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+		]
+		const entry = {
+			decidedAt: '2026-07-20T00:00:00.000Z',
+			decisionKey: 'approve',
+			id: 701,
+			previousStatusCode: 'rev',
+			resultingStatusCode: 'apr',
+			reviewer,
+		}
+		const context = {
+			currentStatusCode: 'apr',
+			decisions,
+			history: [entry, { ...entry, decisionKey: null, id: 702, resultingStatusCode: 'rev' }],
+			historyTruncated: false,
+			playlistId: 201,
+			versionId: 301,
+		}
+		expect(isReviewDecisionContext(context)).toBe(true)
+		expect(
+			isReviewDecisionContext({
+				...context,
+				history: [{ ...entry, reviewer: null }],
+			})
+		).toBe(true)
+		expect(
+			isReviewDecisionContext({
+				...context,
+				history: [{ ...entry, changed: true }],
+			})
+		).toBe(false)
+		expect(
+			isReviewDecisionContext({
+				...context,
+				history: [entry, { ...entry }],
+			})
+		).toBe(false)
+		expect(
+			isReviewDecisionContext({
+				...context,
+				history: [{ ...entry, decisionKey: null }],
+			})
+		).toBe(false)
+		expect(
+			isReviewDecisionContext({
+				...context,
+				history: [{ ...entry, decisionKey: 'needs-changes' }],
+			})
+		).toBe(false)
+		expect(isReviewDecisionContext({ ...context, historyTruncated: undefined })).toBe(false)
+
+		expect(isReviewDecisionRequest({ decisionKey: 'approve', expectedStatusCode: null })).toBe(true)
+		expect(
+			isReviewDecisionRequest({
+				decisionKey: 'approve',
+				expectedStatusCode: null,
+				statusCode: 'apr',
+			})
+		).toBe(false)
+
+		const changedResult = {
+			changed: true,
+			decisionKey: 'approve',
+			playlistId: 201,
+			previousStatusCode: 'rev',
+			reviewer,
+			statusCode: 'apr',
+			updatedAt: '2026-07-20T00:00:00.000Z',
+			versionId: 301,
+		}
+		expect(isReviewDecisionResult(changedResult)).toBe(true)
+		expect(
+			isReviewDecisionResult({
+				...changedResult,
+				reviewer: { ...reviewer, kind: 'service' },
+			})
+		).toBe(false)
+		expect(
+			isReviewDecisionResult({
+				...changedResult,
+				changed: false,
+				previousStatusCode: 'apr',
+				reviewer: null,
+				updatedAt: null,
+			})
+		).toBe(true)
+		expect(isReviewDecisionResult({ ...changedResult, changed: false })).toBe(false)
 	})
 
 	test('accepts only HTTPS or same-origin media URLs', () => {

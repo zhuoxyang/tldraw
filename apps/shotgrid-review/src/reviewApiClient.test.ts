@@ -1,4 +1,7 @@
 import type {
+	ReviewDecisionContext,
+	ReviewDecisionRequest,
+	ReviewDecisionResult,
 	ReviewHealth,
 	ReviewNoteOptions,
 	ReviewPlaylist,
@@ -95,6 +98,40 @@ const publicationResult: ReviewPublicationResult = {
 	publicationId,
 	status: 'complete',
 }
+const decisionContext: ReviewDecisionContext = {
+	currentStatusCode: 'rev',
+	decisions: [
+		{ key: 'approve', label: 'Approved for final', statusCode: 'apr' },
+		{ key: 'changes', label: 'Needs changes', statusCode: 'chg' },
+	],
+	history: [
+		{
+			decidedAt: '2026-07-20T23:00:00Z',
+			decisionKey: null,
+			id: 601,
+			previousStatusCode: null,
+			resultingStatusCode: 'rev',
+			reviewer: null,
+		},
+	],
+	historyTruncated: false,
+	playlistId: 201,
+	versionId: 301,
+}
+const decisionRequest: ReviewDecisionRequest = {
+	decisionKey: 'approve',
+	expectedStatusCode: 'rev',
+}
+const decisionResult: ReviewDecisionResult = {
+	changed: true,
+	decisionKey: 'approve',
+	playlistId: 201,
+	previousStatusCode: 'rev',
+	reviewer,
+	statusCode: 'apr',
+	updatedAt: '2026-07-21T00:00:00Z',
+	versionId: 301,
+}
 
 describe('createReviewApiClient', () => {
 	it('calls every endpoint through a relative base URL and forwards AbortSignal', async () => {
@@ -174,6 +211,74 @@ describe('createReviewApiClient', () => {
 		expect(new Headers(fetch.mock.calls[1][1]?.headers)).toEqual(
 			new Headers({ Accept: 'application/json', 'Content-Type': 'application/json' })
 		)
+	})
+
+	it('loads decision context and sends an expected-status decision request', async () => {
+		const responses = [
+			jsonResponse({ data: decisionContext }),
+			jsonResponse({ data: decisionResult }),
+		]
+		const fetch = vi.fn<typeof globalThis.fetch>(async () => responses.shift()!)
+		const client = createReviewApiClient({ baseUrl: '/api', fetch })
+		const signal = new AbortController().signal
+
+		await expect(client.getDecisionContext(201, 301, signal)).resolves.toEqual(decisionContext)
+		await expect(client.updateDecision(201, 301, decisionRequest, signal)).resolves.toEqual(
+			decisionResult
+		)
+
+		expect(fetch).toHaveBeenNthCalledWith(
+			1,
+			'/api/review/playlists/201/versions/301/decision-context',
+			expect.objectContaining({ method: 'GET', signal })
+		)
+		expect(fetch).toHaveBeenNthCalledWith(
+			2,
+			'/api/review/playlists/201/versions/301/decision',
+			expect.objectContaining({
+				body: JSON.stringify(decisionRequest),
+				method: 'PUT',
+				signal,
+			})
+		)
+	})
+
+	it('rejects decision responses not bound to the request path and expected status', async () => {
+		const client = createReviewApiClient({
+			baseUrl: '/api',
+			fetch: vi.fn(async () =>
+				jsonResponse({ data: { ...decisionResult, previousStatusCode: 'ip' } })
+			),
+		})
+
+		await expect(client.updateDecision(201, 301, decisionRequest)).rejects.toMatchObject({
+			code: 'INVALID_RESPONSE',
+			status: 200,
+		})
+
+		const fetch = vi.fn<typeof globalThis.fetch>()
+		const invalidClient = createReviewApiClient({ baseUrl: '/api', fetch })
+		await expect(
+			invalidClient.updateDecision(201, 301, { ...decisionRequest, decisionKey: 'invalid key' })
+		).rejects.toMatchObject({ code: 'INVALID_REQUEST', status: 0 })
+		expect(fetch).not.toHaveBeenCalled()
+	})
+
+	it('rejects decision context not bound to the requested Playlist and Version', async () => {
+		const client = createReviewApiClient({
+			baseUrl: '/api',
+			fetch: vi.fn(async () =>
+				jsonResponse({ data: { ...decisionContext, versionId: 302 } }, 200, {
+					'X-Request-Id': 'wrong-decision-context',
+				})
+			),
+		})
+
+		await expect(client.getDecisionContext(201, 301)).rejects.toMatchObject({
+			code: 'INVALID_RESPONSE',
+			requestId: 'wrong-decision-context',
+			status: 200,
+		})
 	})
 
 	it('rejects an invalid publication id and a mismatched publication result', async () => {

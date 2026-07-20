@@ -36,6 +36,15 @@ describe('parseGatewayConfig', () => {
 			host: '127.0.0.1',
 			port: 5431,
 			allowedOrigin: 'http://127.0.0.1:5430',
+			decisions: [
+				{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+				{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+				{
+					key: 'pending-clarification',
+					label: 'Pending clarification',
+					statusCode: 'rev',
+				},
+			],
 		})
 	})
 
@@ -55,6 +64,7 @@ describe('parseGatewayConfig', () => {
 			host: '0.0.0.0',
 			port: 6543,
 			allowedOrigin: 'https://review.example.test',
+			decisions: [],
 			publicationMaxJournalBytes: 4_194_304,
 			publicationMaxJournalCount: 10_000,
 			publicationStoreDir: PUBLICATION_STORE_DIR,
@@ -67,6 +77,45 @@ describe('parseGatewayConfig', () => {
 				timeoutMs: 25_000,
 				maxRetries: 4,
 			},
+		})
+	})
+
+	it('parses an explicit bounded decision mapping', () => {
+		const decisions = [
+			{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+			{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+		]
+		const parsed = parseGatewayConfig({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_DECISIONS_JSON: JSON.stringify(decisions),
+		})
+		expect(parsed.decisions).toEqual(decisions)
+	})
+
+	it.each([
+		['not-json'],
+		[[{}]],
+		[[{ key: 'Approve', label: 'Approve', statusCode: 'apr' }]],
+		[[{ key: 'approve', label: 'Approve\nnow', statusCode: 'apr' }]],
+		[[{ key: 'approve', label: 'Approve', statusCode: 'status code' }]],
+		[
+			[
+				{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+				{ key: 'approve', label: 'Again', statusCode: 'chg' },
+			],
+		],
+		[
+			[
+				{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+				{ key: 'approve-again', label: 'Again', statusCode: 'apr' },
+			],
+		],
+		[[{ key: 'approve', label: 'Approve', statusCode: 'apr', secret: true }]],
+	])('rejects an invalid decision mapping: %j', (decisions) => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_DECISIONS_JSON:
+				typeof decisions === 'string' ? decisions : JSON.stringify(decisions),
 		})
 	})
 

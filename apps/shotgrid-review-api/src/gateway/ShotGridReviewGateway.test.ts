@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest'
 import type { ShotGridConnectionConfig } from '../config'
+import { ReviewGatewayError } from '../errors'
 import type { ShotGridClient } from '../shotgrid/ShotGridClient'
 import { ShotGridReviewGateway } from './ShotGridReviewGateway'
 
@@ -10,6 +11,10 @@ const config: ShotGridConnectionConfig = {
 	siteUrl: 'https://studio.example.com',
 	timeoutMs: 1000,
 }
+const DECISIONS = [
+	{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+	{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+] as const
 
 describe('ShotGridReviewGateway', () => {
 	test('maps project, playlist, and version searches into review contracts', async () => {
@@ -876,7 +881,434 @@ describe('ShotGridReviewGateway', () => {
 		expect(request).toHaveBeenCalledTimes(2)
 	})
 
-	test('does not mark note or status mutations as retryable', async () => {
+	test('reads only bounded status changes from the official activity stream', async () => {
+		const request = makeDecisionRequest({
+			activityUpdates: [
+				{
+					created_at: '2026-07-20T00:00:04Z',
+					created_by: { id: 8, name: 'Review API', type: 'ApiUser' },
+					id: 704,
+					meta: {
+						attribute_name: 'sg_status_list',
+						entity_id: 301,
+						entity_type: 'Version',
+						field_data_type: 'status_list',
+						new_value: 'chg',
+						old_value: 'apr',
+						type: 'attribute_change',
+					},
+					update_type: 'update',
+				},
+				{
+					created_at: '2026-07-20T00:00:03Z',
+					created_by: { id: 501, name: 'shot_010', type: 'Shot' },
+					id: 703,
+					meta: {
+						attribute_name: 'sg_status_list',
+						entity_id: 301,
+						entity_type: 'Version',
+						field_data_type: 'status_list',
+						new_value: 'rev',
+						old_value: 'chg',
+						type: 'attribute_change',
+					},
+					update_type: 'update',
+				},
+				{
+					created_at: '2026-07-20T00:00:02Z',
+					created_by: {
+						id: 7,
+						image: null,
+						name: 'Reviewer',
+						type: 'HumanUser',
+					},
+					id: 702,
+					meta: {
+						attribute_name: 'sg_status_list',
+						entity_id: 301,
+						entity_type: 'Version',
+						field_data_type: 'status_list',
+						new_value: 'apr',
+						old_value: 'rev',
+						type: 'attribute_change',
+					},
+					update_type: 'update',
+				},
+				{
+					content: 'must not be exposed',
+					id: 999,
+					meta: { attribute_name: 'content' },
+					update_type: 'update',
+				},
+				{
+					created_at: '2026-07-19T00:00:00Z',
+					created_by: null,
+					id: 701,
+					meta: {
+						attribute_name: 'sg_status_list',
+						entity_id: 301,
+						entity_type: 'Version',
+						field_data_type: 'status_list',
+						new_value: 'unmapped',
+						old_value: null,
+						type: 'attribute_change',
+					},
+					update_type: 'update',
+				},
+			],
+		})
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).resolves.toEqual({
+			currentStatusCode: 'rev',
+			decisions: [...DECISIONS],
+			history: [
+				{
+					decidedAt: '2026-07-20T00:00:04.000Z',
+					decisionKey: 'needs-changes',
+					id: 704,
+					previousStatusCode: 'apr',
+					resultingStatusCode: 'chg',
+					reviewer: {
+						avatarUrl: null,
+						id: 8,
+						kind: 'service',
+						login: null,
+						name: 'Review API',
+					},
+				},
+				{
+					decidedAt: '2026-07-20T00:00:03.000Z',
+					decisionKey: null,
+					id: 703,
+					previousStatusCode: 'chg',
+					resultingStatusCode: 'rev',
+					reviewer: null,
+				},
+				{
+					decidedAt: '2026-07-20T00:00:02.000Z',
+					decisionKey: 'approve',
+					id: 702,
+					previousStatusCode: 'rev',
+					resultingStatusCode: 'apr',
+					reviewer: {
+						avatarUrl: null,
+						id: 7,
+						kind: 'human',
+						login: null,
+						name: 'Reviewer',
+					},
+				},
+				{
+					decidedAt: '2026-07-19T00:00:00.000Z',
+					decisionKey: null,
+					id: 701,
+					previousStatusCode: null,
+					resultingStatusCode: 'unmapped',
+					reviewer: null,
+				},
+			],
+			historyTruncated: false,
+			playlistId: 201,
+			versionId: 301,
+		})
+		expect(request).toHaveBeenCalledWith('/schema/versions/fields/sg_status_list', {
+			query: { project_id: 101 },
+		})
+		expect(request).toHaveBeenCalledWith('/entity/versions/301/activity_stream', {
+			query: { limit: 500 },
+		})
+	})
+
+	test('marks decision history as truncated when the activity endpoint reaches its limit', async () => {
+		const activityUpdates = Array.from({ length: 500 }, (_, index) => ({
+			id: index + 1,
+			meta: { attribute_name: 'content' },
+			update_type: 'update',
+		}))
+		const gateway = makeGateway(makeDecisionRequest({ activityUpdates }))
+
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).resolves.toMatchObject({
+			history: [],
+			historyTruncated: true,
+		})
+	})
+
+	test.each([
+		['not editable', makeStatusSchemaResponse({ editable: false }), 'CONFIGURATION_ERROR'],
+		['not visible', makeStatusSchemaResponse({ visible: false }), 'CONFIGURATION_ERROR'],
+		[
+			'missing a configured code',
+			makeStatusSchemaResponse({ validValues: ['rev', 'apr'] }),
+			'CONFIGURATION_ERROR',
+		],
+		[
+			'hidden configured code',
+			makeStatusSchemaResponse({ hiddenValues: ['apr'] }),
+			'CONFIGURATION_ERROR',
+		],
+		[
+			'duplicate valid code',
+			makeStatusSchemaResponse({ validValues: ['rev', 'apr', 'apr', 'chg'] }),
+			'SHOTGRID_INVALID_RESPONSE',
+		],
+		[
+			'hidden code outside valid values',
+			makeStatusSchemaResponse({ hiddenValues: ['other'] }),
+			'SHOTGRID_INVALID_RESPONSE',
+		],
+		[
+			'missing hidden values',
+			makeStatusSchemaResponse({ omitHiddenValues: true }),
+			'SHOTGRID_INVALID_RESPONSE',
+		],
+	])('fails closed when the project status schema is %s', async (_name, schema, code) => {
+		const gateway = makeGateway(makeDecisionRequest({ schema }))
+
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).rejects.toMatchObject({
+			code,
+		})
+	})
+
+	test('rejects a malformed status activity instead of silently omitting it', async () => {
+		const gateway = makeGateway(
+			makeDecisionRequest({
+				activityUpdates: [
+					{
+						created_at: 'not-a-time',
+						id: 701,
+						meta: {
+							attribute_name: 'sg_status_list',
+							entity_id: 301,
+							entity_type: 'Version',
+							field_data_type: 'status_list',
+							new_value: 'apr',
+							old_value: 'rev',
+							type: 'attribute_change',
+						},
+						update_type: 'update',
+					},
+				],
+			})
+		)
+
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+		})
+	})
+
+	test('rejects duplicate status activity ids', async () => {
+		const statusUpdate = {
+			created_at: '2026-07-20T00:00:00Z',
+			id: 701,
+			meta: {
+				attribute_name: 'sg_status_list',
+				entity_id: 301,
+				entity_type: 'Version',
+				field_data_type: 'status_list',
+				new_value: 'apr',
+				old_value: 'rev',
+				type: 'attribute_change',
+			},
+			update_type: 'update',
+		}
+		const gateway = makeGateway(
+			makeDecisionRequest({ activityUpdates: [statusUpdate, { ...statusUpdate }] })
+		)
+
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+		})
+	})
+
+	test('returns an audit-neutral no-op and rejects a stale expected status before mutation', async () => {
+		const pending = {
+			key: 'pending-clarification',
+			label: 'Pending clarification',
+			statusCode: 'rev',
+		} as const
+		const decisions = [...DECISIONS, pending]
+		const noOpRequest = makeDecisionRequest()
+		const gateway = makeGateway(noOpRequest, { ...config, sudoAsLogin: 'reviewer' })
+
+		await expect(
+			gateway.updateVersionDecision({
+				decision: pending,
+				decisions,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).resolves.toEqual({
+			changed: false,
+			decisionKey: 'pending-clarification',
+			playlistId: 201,
+			previousStatusCode: 'rev',
+			reviewer: null,
+			statusCode: 'rev',
+			updatedAt: null,
+			versionId: 301,
+		})
+		expect(noOpRequest).toHaveBeenCalledTimes(3)
+
+		const conflictRequest = makeDecisionRequest()
+		const conflictingGateway = makeGateway(conflictRequest, {
+			...config,
+			sudoAsLogin: 'reviewer',
+		})
+		await expect(
+			conflictingGateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'chg',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).rejects.toMatchObject({ code: 'DECISION_CONFLICT', status: 409 })
+		expect(conflictRequest).toHaveBeenCalledTimes(2)
+	})
+
+	test('rejects a Playlist mismatch before schema, reviewer, or update calls', async () => {
+		const request = vi.fn(async (path: string) => {
+			if (path === '/entity/playlists/201') return { data: { id: 201, type: 'Playlist' } }
+			if (path === '/entity/versions/301') return makeVersionResponse('', 202)
+			throw new Error('A later decision request must not be made')
+		})
+		const gateway = makeGateway(request, { ...config, sudoAsLogin: 'reviewer' })
+
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).rejects.toMatchObject({ code: 'NOT_FOUND', status: 404 })
+		expect(request).toHaveBeenCalledTimes(2)
+	})
+
+	test.each([
+		[
+			'a malformed success echo',
+			{
+				data: {
+					attributes: { sg_status_list: 'apr', updated_at: 'not-a-time' },
+					id: 301,
+					type: 'Version',
+				},
+			},
+			undefined,
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'a success echo for another Version',
+			{
+				data: {
+					attributes: {
+						sg_status_list: 'apr',
+						updated_at: '2026-07-20T00:00:01Z',
+					},
+					id: 999,
+					type: 'Version',
+				},
+			},
+			undefined,
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'a success echo with the wrong status',
+			{
+				data: {
+					attributes: {
+						sg_status_list: 'chg',
+						updated_at: '2026-07-20T00:00:01Z',
+					},
+					id: 301,
+					type: 'Version',
+				},
+			},
+			undefined,
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'a success echo without attributes',
+			{ data: { id: 301, type: 'Version' } },
+			undefined,
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'a timeout after dispatch',
+			undefined,
+			new ReviewGatewayError({
+				code: 'SHOTGRID_TIMEOUT',
+				retryable: false,
+				status: 504,
+			}),
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'an upstream unavailable response after dispatch',
+			undefined,
+			new ReviewGatewayError({
+				code: 'SHOTGRID_UNAVAILABLE',
+				retryable: false,
+				status: 503,
+				upstreamStatus: 503,
+			}),
+			'DECISION_INDETERMINATE',
+		],
+		[
+			'an explicit permission rejection',
+			undefined,
+			new ReviewGatewayError({
+				code: 'SHOTGRID_PERMISSION_DENIED',
+				retryable: false,
+				status: 403,
+				upstreamStatus: 403,
+			}),
+			'SHOTGRID_PERMISSION_DENIED',
+		],
+	])('classifies %s truthfully', async (_name, updateResponse, updateError, code) => {
+		const request = makeDecisionRequest({ updateError, updateResponse })
+		const gateway = makeGateway(request, { ...config, sudoAsLogin: 'reviewer' })
+
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).rejects.toMatchObject({ code })
+		const updateCalls = request.mock.calls.filter(
+			([path, options]) => path === '/entity/versions/301' && options?.method === 'PUT'
+		)
+		expect(updateCalls).toHaveLength(1)
+	})
+
+	test('refuses a mismatched sudo reviewer identity before sending the update', async () => {
+		const request = makeDecisionRequest({ userLogin: 'another-reviewer' })
+		const gateway = makeGateway(request, { ...config, sudoAsLogin: 'reviewer' })
+
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).rejects.toMatchObject({ code: 'SHOTGRID_INVALID_RESPONSE' })
+		expect(
+			request.mock.calls.some(
+				([path, options]) => path === '/entity/versions/301' && options?.method === 'PUT'
+			)
+		).toBe(false)
+	})
+
+	test('does not mark note or decision mutations as retryable and confirms the update echo', async () => {
 		const request = vi
 			.fn()
 			.mockResolvedValueOnce({
@@ -900,13 +1332,30 @@ describe('ShotGridReviewGateway', () => {
 				},
 			})
 			.mockResolvedValueOnce({
+				data: { id: 201, type: 'Playlist' },
+			})
+			.mockResolvedValueOnce(makeVersionResponse(''))
+			.mockResolvedValueOnce(makeStatusSchemaResponse())
+			.mockResolvedValueOnce({
+				data: [
+					{
+						attributes: { image: null, login: 'reviewer', name: 'Reviewer' },
+						id: 7,
+						type: 'HumanUser',
+					},
+				],
+			})
+			.mockResolvedValueOnce({
 				data: {
-					attributes: { sg_status_list: 'apr' },
+					attributes: {
+						sg_status_list: 'apr',
+						updated_at: '2026-07-20T00:00:01Z',
+					},
 					id: 301,
 					type: 'Version',
 				},
 			})
-		const gateway = makeGateway(request)
+		const gateway = makeGateway(request, { ...config, sudoAsLogin: 'reviewer' })
 
 		await gateway.createNote({
 			content: 'Reduce the rim light',
@@ -915,16 +1364,41 @@ describe('ShotGridReviewGateway', () => {
 			subject: 'Lighting note',
 			versionId: 301,
 		})
-		await gateway.updateVersionStatus({ statusCode: 'apr', versionId: 301 })
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).resolves.toEqual({
+			changed: true,
+			decisionKey: 'approve',
+			playlistId: 201,
+			previousStatusCode: 'rev',
+			reviewer: {
+				avatarUrl: null,
+				id: 7,
+				kind: 'human',
+				login: 'reviewer',
+				name: 'Reviewer',
+			},
+			statusCode: 'apr',
+			updatedAt: '2026-07-20T00:00:01.000Z',
+			versionId: 301,
+		})
 
 		expect(request.mock.calls[0][0]).toBe('/entity/versions/301')
 		expect(request.mock.calls[1][0]).toBe('/entity/notes')
 		expect(request.mock.calls[1][1]).not.toHaveProperty('idempotent')
-		expect(request.mock.calls[2][0]).toBe('/entity/versions/301')
-		expect(request.mock.calls[2][1]).toMatchObject({
-			query: { 'options[fields]': 'sg_status_list' },
+		expect(request.mock.calls[6][0]).toBe('/entity/versions/301')
+		expect(request.mock.calls[6][1]).toMatchObject({
+			body: { sg_status_list: 'apr' },
+			method: 'PUT',
+			query: { 'options[fields]': 'sg_status_list,updated_at' },
 		})
-		expect(request.mock.calls[2][1]).not.toHaveProperty('idempotent')
+		expect(request.mock.calls[6][1]).not.toHaveProperty('idempotent')
 	})
 
 	test('rejects a note whose project does not own the selected version', async () => {
@@ -1155,6 +1629,102 @@ describe('ShotGridReviewGateway', () => {
 		expect(uploadFetch).not.toHaveBeenCalled()
 	})
 })
+
+function makeDecisionRequest(
+	options: {
+		activityUpdates?: unknown[]
+		schema?: unknown
+		statusCode?: string | null
+		updateError?: unknown
+		updateResponse?: unknown
+		userLogin?: string
+	} = {}
+) {
+	return vi.fn(async (path: string, requestOptions?: { method?: string }) => {
+		if (path === '/entity/playlists/201') return { data: { id: 201, type: 'Playlist' } }
+		if (path === '/entity/versions/301' && requestOptions?.method === 'PUT') {
+			if (options.updateError !== undefined) throw options.updateError
+			return (
+				options.updateResponse ?? {
+					data: {
+						attributes: {
+							sg_status_list: 'apr',
+							updated_at: '2026-07-20T00:00:01Z',
+						},
+						id: 301,
+						type: 'Version',
+					},
+				}
+			)
+		}
+		if (path === '/entity/versions/301') {
+			const response = makeVersionResponse('')
+			;(response.data.attributes as Record<string, unknown>).sg_status_list =
+				options.statusCode === undefined ? 'rev' : options.statusCode
+			return response
+		}
+		if (path === '/schema/versions/fields/sg_status_list') {
+			return options.schema ?? makeStatusSchemaResponse()
+		}
+		if (path === '/entity/versions/301/activity_stream') {
+			return {
+				data: {
+					earliest_update_id: 1,
+					entity_id: 301,
+					entity_type: 'Version',
+					latest_update_id: 999,
+					updates: options.activityUpdates ?? [],
+				},
+			}
+		}
+		if (path === '/entity/human_users/_search') {
+			const login = options.userLogin ?? 'reviewer'
+			return {
+				data: [
+					{
+						attributes: { image: null, login, name: 'Reviewer' },
+						id: 7,
+						type: 'HumanUser',
+					},
+				],
+			}
+		}
+		throw new Error(`Unexpected request: ${path}`)
+	})
+}
+
+function makeStatusSchemaResponse(
+	options: {
+		editable?: boolean
+		hiddenValues?: string[]
+		omitHiddenValues?: boolean
+		validValues?: string[]
+		visible?: boolean
+	} = {}
+) {
+	return {
+		data: {
+			data_type: { editable: false, value: 'status_list' },
+			editable: { editable: false, value: options.editable ?? true },
+			entity_type: { editable: false, value: 'Version' },
+			properties: {
+				...(options.omitHiddenValues
+					? undefined
+					: {
+							hidden_values: {
+								editable: false,
+								value: options.hiddenValues ?? [],
+							},
+						}),
+				valid_values: {
+					editable: false,
+					value: options.validValues ?? ['rev', 'apr', 'chg'],
+				},
+			},
+			visible: { editable: false, value: options.visible ?? true },
+		},
+	}
+}
 
 function makeVersionResponse(
 	movieUrl: string,

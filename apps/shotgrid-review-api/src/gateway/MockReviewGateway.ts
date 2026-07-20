@@ -1,15 +1,17 @@
 import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
+	ReviewDecisionContext,
+	ReviewDecisionHistoryEntry,
+	ReviewDecisionOption,
+	ReviewDecisionResult,
 	ReviewNote,
 	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
 	ReviewPublicationLinks,
-	ReviewStatusResult,
 	ReviewUser,
 	ReviewVersion,
-	UpdateReviewStatusRequest,
 	UploadReviewAttachmentRequest,
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
@@ -18,6 +20,7 @@ import type {
 	ReviewGateway,
 	ReviewImageProxyPayload,
 	ReviewPublicationNoteResult,
+	UpdateReviewDecisionGatewayRequest,
 } from './ReviewGateway'
 
 const reviewer: ReviewUser = {
@@ -164,7 +167,9 @@ const initialVersions: ReviewVersion[] = [
 
 export class MockReviewGateway implements ReviewGateway {
 	private nextAttachmentId = 501
+	private nextDecisionHistoryId = 701
 	private nextNoteId = 401
+	private readonly decisionHistory = new Map<number, ReviewDecisionHistoryEntry[]>()
 	private readonly retainedNoteIds = new Set<number>()
 	private readonly versions = initialVersions.map((version) => ({ ...version }))
 
@@ -221,6 +226,25 @@ export class MockReviewGateway implements ReviewGateway {
 		return reviewer
 	}
 
+	async getDecisionContext(
+		playlistId: number,
+		versionId: number,
+		decisions: readonly ReviewDecisionOption[]
+	): Promise<ReviewDecisionContext> {
+		const version = await this.getVersion(playlistId, versionId)
+		return {
+			currentStatusCode: version.statusCode,
+			decisions: decisions.map((decision) => ({ ...decision })),
+			history: (this.decisionHistory.get(versionId) ?? []).map((entry) => ({
+				...entry,
+				reviewer: entry.reviewer ? { ...entry.reviewer } : null,
+			})),
+			historyTruncated: false,
+			playlistId,
+			versionId,
+		}
+	}
+
 	async getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions> {
 		const version = await this.getVersion(playlistId, versionId)
 		return {
@@ -258,12 +282,45 @@ export class MockReviewGateway implements ReviewGateway {
 		return this.versions.filter((version) => version.playlistId === playlistId)
 	}
 
-	async updateVersionStatus(request: UpdateReviewStatusRequest): Promise<ReviewStatusResult> {
-		const version = this.requireVersion(request.versionId)
-		version.statusCode = request.statusCode
+	async updateVersionDecision(
+		request: UpdateReviewDecisionGatewayRequest
+	): Promise<ReviewDecisionResult> {
+		const version = await this.getVersion(request.playlistId, request.versionId)
+		const configuredDecision = request.decisions.find(({ key }) => key === request.decision.key)
+		if (!configuredDecision || configuredDecision.statusCode !== request.decision.statusCode) {
+			throw new ReviewGatewayError({
+				code: 'INVALID_REQUEST',
+				retryable: false,
+				status: 400,
+			})
+		}
+		if (version.statusCode !== request.expectedStatusCode) throw decisionConflict()
+
+		const previousStatusCode = version.statusCode
+		const updatedAt = new Date(0).toISOString()
+		if (previousStatusCode !== request.decision.statusCode) {
+			version.statusCode = request.decision.statusCode
+			const entry: ReviewDecisionHistoryEntry = {
+				decidedAt: updatedAt,
+				decisionKey: request.decision.key,
+				id: this.nextDecisionHistoryId++,
+				previousStatusCode,
+				resultingStatusCode: version.statusCode,
+				reviewer,
+			}
+			this.decisionHistory.set(request.versionId, [
+				entry,
+				...(this.decisionHistory.get(request.versionId) ?? []),
+			])
+		}
 		return {
-			statusCode: version.statusCode,
-			updatedAt: new Date(0).toISOString(),
+			changed: previousStatusCode !== request.decision.statusCode,
+			decisionKey: request.decision.key,
+			playlistId: request.playlistId,
+			previousStatusCode,
+			reviewer: previousStatusCode === request.decision.statusCode ? null : reviewer,
+			statusCode: request.decision.statusCode,
+			updatedAt: previousStatusCode === request.decision.statusCode ? null : updatedAt,
 			versionId: request.versionId,
 		}
 	}
@@ -346,4 +403,12 @@ export class MockReviewGateway implements ReviewGateway {
 			status: 404,
 		})
 	}
+}
+
+function decisionConflict() {
+	return new ReviewGatewayError({
+		code: 'DECISION_CONFLICT',
+		retryable: false,
+		status: 409,
+	})
 }

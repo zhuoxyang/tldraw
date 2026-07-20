@@ -172,15 +172,44 @@ export interface ReviewAttachmentResult {
 	sizeBytes: number
 }
 
-export interface UpdateReviewStatusRequest {
-	versionId: ReviewEntityId
+export interface ReviewDecisionOption {
+	key: string
+	label: string
 	statusCode: string
 }
 
-export interface ReviewStatusResult {
+export interface ReviewDecisionHistoryEntry {
+	id: ReviewEntityId
+	decisionKey: string | null
+	decidedAt: string
+	reviewer: ReviewUser | null
+	previousStatusCode: string | null
+	resultingStatusCode: string | null
+}
+
+export interface ReviewDecisionContext {
+	playlistId: ReviewEntityId
 	versionId: ReviewEntityId
+	currentStatusCode: string | null
+	decisions: ReviewDecisionOption[]
+	history: ReviewDecisionHistoryEntry[]
+	historyTruncated: boolean
+}
+
+export interface ReviewDecisionRequest {
+	decisionKey: string
+	expectedStatusCode: string | null
+}
+
+export interface ReviewDecisionResult {
+	changed: boolean
+	playlistId: ReviewEntityId
+	versionId: ReviewEntityId
+	decisionKey: string
+	previousStatusCode: string | null
 	statusCode: string
-	updatedAt: string
+	updatedAt: string | null
+	reviewer: ReviewUser | null
 }
 
 export const REVIEW_API_ERROR_CODES = [
@@ -188,6 +217,8 @@ export const REVIEW_API_ERROR_CODES = [
 	'AUTHENTICATION_REQUIRED',
 	'PERMISSION_DENIED',
 	'NOT_FOUND',
+	'DECISION_CONFLICT',
+	'DECISION_INDETERMINATE',
 	'PUBLICATION_CONFLICT',
 	'PUBLICATION_INCOMPLETE',
 	'PUBLICATION_INDETERMINATE',

@@ -20,6 +20,7 @@ SHOTGRID_REVIEW_PUBLICATION_STORE_DIR=/var/lib/shotgrid-review-publications
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS=10000 # optional
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES=4194304 # optional; minimum 1048576
 SHOTGRID_SUDO_AS_LOGIN=reviewer@example.com # optional
+SHOTGRID_REVIEW_DECISIONS_JSON=[{"key":"approve","label":"Approve","statusCode":"apr"},{"key":"needs-changes","label":"Needs changes","statusCode":"chg"}]
 ```
 
 Optional service settings are `REVIEW_API_HOST`, `REVIEW_API_PORT`, `REVIEW_APP_ORIGIN`, `SHOTGRID_TIMEOUT_MS`, and `SHOTGRID_MAX_RETRIES`. The timeout applies to each upstream attempt. Only idempotent reads retry transient failures; review mutations do not retry automatically.
@@ -28,9 +29,17 @@ Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browse
 
 In ShotGrid mode, deploy this service behind a trusted reverse proxy. The proxy must authenticate and authorize every user and action, strip any browser-supplied `X-Review-Proxy-Token` and `X-Review-Authenticated-Login` headers, then inject the server-only proxy token. When `SHOTGRID_SUDO_AS_LOGIN` is configured, the proxy must also inject that exact login so the authenticated identity is bound to ShotGrid impersonation. The proxy token must never be sent to browser code or exposed through CORS.
 
-Live note-option lookup and publication require `SHOTGRID_SUDO_AS_LOGIN`. A ShotGrid script
-identity may browse review data, but the API rejects these human-review actions with `403
-PERMISSION_DENIED` even when the request presents a valid trusted-proxy token.
+Live note-option lookup, publication, decision context, and decision updates require
+`SHOTGRID_SUDO_AS_LOGIN`. A ShotGrid script identity may browse review data, but the API rejects
+these human-review actions with `403 PERMISSION_DENIED` even when the request presents a valid
+trusted-proxy token.
+
+Decision mappings are deployment configuration, not browser input. The JSON value must contain at
+most 32 exact `key`, `label`, and unique ShotGrid `statusCode` mappings. Live mode may start
+without mappings so a script identity can remain browse-only; decision routes then fail closed with
+`CONFIGURATION_ERROR`. For every selected Version's Project, the API reads the project-specific
+`Version.sg_status_list` schema and requires the field to be a visible, editable status list. Every
+configured code must be valid and not hidden for that Project.
 
 Project and entity authorization remains the reverse proxy's responsibility until the permission hardening work in issue #12 is complete.
 
@@ -68,7 +77,28 @@ per-IP request-rate, concurrent-request, and body-size limits before traffic rea
 - `GET /api/review/playlists/:playlistId/versions`
 - `GET /api/review/playlists/:playlistId/versions/:versionId`
 - `GET /api/review/playlists/:playlistId/versions/:versionId/note-options`
+- `GET /api/review/playlists/:playlistId/versions/:versionId/decision-context`
+- `PUT /api/review/playlists/:playlistId/versions/:versionId/decision`
 - `PUT /api/review/playlists/:playlistId/versions/:versionId/publications/:publicationId`
 
 The single-Version route verifies Playlist membership and rereads the standard ShotGrid media fields.
 Clients use it when a Version opens or refreshes so expiring ShotGrid media references are renewed.
+
+The decision request body is
+`{"decisionKey":"approve","expectedStatusCode":"rev"}`; `expectedStatusCode` may be
+`null`. The API verifies Playlist membership, compares the current status, and serializes updates
+to the same Version within one process. The old unscoped
+`PATCH /api/review/versions/:versionId/status` route is not available.
+
+ShotGrid does not expose a conditional update primitive for this field, so the expected-value check
+cannot prevent a concurrent update from the ShotGrid UI or another API instance between the read
+and write. Keep one decision-writer process until distributed serialization is deployed. A
+successful response is returned only when ShotGrid echoes the exact Version id, resulting status,
+and upstream update time. A timeout, disconnect, 5xx, or malformed success after dispatch returns
+`DECISION_INDETERMINATE`; clients must refresh and must not automatically replay the mutation.
+
+Decision history comes from the Version activity stream and exposes only validated
+`sg_status_list` attribute changes. The API requests the official maximum of 500 recent activity
+items; unrelated activity also consumes that window. `historyTruncated: true` therefore means the
+response is recent history, not a complete audit export. Missing activity authors remain `null`
+instead of being attributed to the current reviewer.

@@ -1,15 +1,16 @@
 import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
+	ReviewDecisionContext,
+	ReviewDecisionOption,
+	ReviewDecisionResult,
 	ReviewNote,
 	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
 	ReviewPublicationLinks,
-	ReviewStatusResult,
 	ReviewUser,
 	ReviewVersion,
-	UpdateReviewStatusRequest,
 	UploadReviewAttachmentRequest,
 } from '../contracts'
 
@@ -29,6 +30,14 @@ export interface ReviewPublicationNoteResult {
 	note: ReviewNote
 }
 
+export interface UpdateReviewDecisionGatewayRequest {
+	decision: ReviewDecisionOption
+	decisions: readonly ReviewDecisionOption[]
+	expectedStatusCode: string | null
+	playlistId: number
+	versionId: number
+}
+
 export interface ReviewGateway {
 	createNote(request: CreateReviewNoteRequest): Promise<ReviewNote>
 	createPublicationNote(
@@ -37,6 +46,11 @@ export interface ReviewGateway {
 		request: CreateReviewPublicationNoteRequest
 	): Promise<ReviewPublicationNoteResult>
 	getCurrentReviewer(): Promise<ReviewUser>
+	getDecisionContext(
+		playlistId: number,
+		versionId: number,
+		decisions: readonly ReviewDecisionOption[]
+	): Promise<ReviewDecisionContext>
 	getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions>
 	getVersion(playlistId: number, versionId: number): Promise<ReviewVersion>
 	getVersionImage(
@@ -47,6 +61,6 @@ export interface ReviewGateway {
 	listPlaylists(projectId: number): Promise<ReviewPlaylist[]>
 	listProjects(): Promise<ReviewProject[]>
 	listVersions(playlistId: number): Promise<ReviewVersion[]>
-	updateVersionStatus(request: UpdateReviewStatusRequest): Promise<ReviewStatusResult>
+	updateVersionDecision(request: UpdateReviewDecisionGatewayRequest): Promise<ReviewDecisionResult>
 	uploadAttachment(request: UploadReviewAttachmentRequest): Promise<ReviewAttachmentResult>
 }

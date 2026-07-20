@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path'
+import { isReviewDecisionOption, type ReviewDecisionOption } from './contracts'
 import { ReviewGatewayError } from './errors'
 import {
 	DEFAULT_REVIEW_PUBLICATION_MAX_RECORD_BYTES,
@@ -10,6 +11,13 @@ const DEFAULT_PORT = 5431
 const DEFAULT_ALLOWED_ORIGIN = 'http://127.0.0.1:5430'
 const DEFAULT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RETRIES = 2
+const MAX_DECISION_CONFIG_BYTES = 16 * 1024
+const MAX_DECISION_OPTIONS = 32
+const DEFAULT_MOCK_DECISIONS: ReviewDecisionOption[] = [
+	{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+	{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+	{ key: 'pending-clarification', label: 'Pending clarification', statusCode: 'rev' },
+]
 const DEFAULT_PUBLICATION_MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 const DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT = 10_000
 const MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES = Math.max(
@@ -30,6 +38,7 @@ interface GatewayConfigBase {
 	host: string
 	port: number
 	allowedOrigin: string
+	decisions: ReviewDecisionOption[]
 }
 
 export type GatewayConfig = GatewayConfigBase &
@@ -141,6 +150,48 @@ function parsePublicationStoreDirectory(rawValue: string) {
 	return resolve(value)
 }
 
+function parseDecisionOptions(
+	environment: GatewayEnvironment,
+	options: { defaultDecisions: readonly ReviewDecisionOption[] }
+): ReviewDecisionOption[] {
+	const rawValue = environment.SHOTGRID_REVIEW_DECISIONS_JSON
+	if (rawValue === undefined || rawValue.trim() === '') {
+		return options.defaultDecisions.map((decision) => ({ ...decision }))
+	}
+	if (Buffer.byteLength(rawValue, 'utf8') > MAX_DECISION_CONFIG_BYTES) {
+		throw configurationError('SHOTGRID_REVIEW_DECISIONS_JSON', 'is too large')
+	}
+
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(rawValue)
+	} catch {
+		throw configurationError('SHOTGRID_REVIEW_DECISIONS_JSON', 'must be valid JSON')
+	}
+	if (
+		!Array.isArray(parsed) ||
+		parsed.length > MAX_DECISION_OPTIONS ||
+		!parsed.every(isReviewDecisionOption)
+	) {
+		throw configurationError(
+			'SHOTGRID_REVIEW_DECISIONS_JSON',
+			'must be an array of up to 32 valid decision mappings'
+		)
+	}
+
+	const decisions = parsed.map((decision) => ({ ...decision }))
+	if (
+		new Set(decisions.map(({ key }) => key)).size !== decisions.length ||
+		new Set(decisions.map(({ statusCode }) => statusCode)).size !== decisions.length
+	) {
+		throw configurationError(
+			'SHOTGRID_REVIEW_DECISIONS_JSON',
+			'must use unique decision keys and status codes'
+		)
+	}
+	return decisions
+}
+
 export function parseGatewayConfig(environment: GatewayEnvironment = process.env): GatewayConfig {
 	const rawMode = environment.SHOTGRID_GATEWAY_MODE?.trim() || 'mock'
 	if (rawMode !== 'mock' && rawMode !== 'shotgrid') {
@@ -154,7 +205,15 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const maxRetries = parseInteger(environment, 'SHOTGRID_MAX_RETRIES', DEFAULT_MAX_RETRIES, 0, 10)
 
 	if (rawMode === 'mock') {
-		return { mode: rawMode, host, port, allowedOrigin }
+		return {
+			mode: rawMode,
+			host,
+			port,
+			allowedOrigin,
+			decisions: parseDecisionOptions(environment, {
+				defaultDecisions: DEFAULT_MOCK_DECISIONS,
+			}),
+		}
 	}
 
 	const scriptName = readRequired(environment, 'SHOTGRID_SCRIPT_NAME').trim()
@@ -184,12 +243,14 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		)
 	}
 	const sudoAsLogin = environment.SHOTGRID_SUDO_AS_LOGIN?.trim() || undefined
+	const decisions = parseDecisionOptions(environment, { defaultDecisions: [] })
 
 	return {
 		mode: rawMode,
 		host,
 		port,
 		allowedOrigin,
+		decisions,
 		publicationMaxJournalBytes,
 		publicationMaxJournalCount,
 		publicationStoreDir,

@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'vitest'
 import { MockReviewGateway } from './MockReviewGateway'
 
+const DECISIONS = [
+	{ key: 'approve', label: 'Approve', statusCode: 'apr' },
+	{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
+] as const
+
 describe('MockReviewGateway', () => {
 	test('preserves project and version integrity for review notes', async () => {
 		const gateway = new MockReviewGateway()
@@ -26,16 +31,62 @@ describe('MockReviewGateway', () => {
 		).rejects.toMatchObject({ code: 'INVALID_REQUEST', status: 400 })
 	})
 
-	test('returns only truthful status update fields', async () => {
+	test('applies contextual decisions with conditional status and truthful history', async () => {
 		const gateway = new MockReviewGateway()
 
 		await expect(
-			gateway.updateVersionStatus({ statusCode: 'apr', versionId: 301 })
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
 		).resolves.toEqual({
+			changed: true,
+			decisionKey: 'approve',
+			playlistId: 201,
+			previousStatusCode: 'rev',
+			reviewer: {
+				avatarUrl: null,
+				id: 7,
+				kind: 'human',
+				login: 'local.reviewer',
+				name: 'Local Reviewer',
+			},
 			statusCode: 'apr',
 			updatedAt: '1970-01-01T00:00:00.000Z',
 			versionId: 301,
 		})
+		await expect(gateway.getDecisionContext(201, 301, DECISIONS)).resolves.toMatchObject({
+			currentStatusCode: 'apr',
+			history: [
+				{
+					decisionKey: 'approve',
+					previousStatusCode: 'rev',
+					resultingStatusCode: 'apr',
+				},
+			],
+			historyTruncated: false,
+		})
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[1],
+				decisions: DECISIONS,
+				expectedStatusCode: 'rev',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).rejects.toMatchObject({ code: 'DECISION_CONFLICT', status: 409 })
+		await expect(
+			gateway.updateVersionDecision({
+				decision: DECISIONS[0],
+				decisions: DECISIONS,
+				expectedStatusCode: 'apr',
+				playlistId: 201,
+				versionId: 301,
+			})
+		).resolves.toMatchObject({ changed: false, reviewer: null, updatedAt: null })
 	})
 
 	test('gets a contextual version only from its owning playlist', async () => {
