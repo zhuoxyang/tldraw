@@ -8,6 +8,14 @@ describe('public environment policy', () => {
 		).toThrow("uses Vite's public environment prefix")
 	})
 
+	it('rejects a trusted proxy token using the Vite public prefix', () => {
+		expect(() =>
+			assertNoPublicShotGridEnvironment({
+				VITE_REVIEW_API_TRUSTED_PROXY_TOKEN: 'server-only-token',
+			})
+		).toThrow("uses Vite's public environment prefix")
+	})
+
 	it('allows an explicitly public tldraw license key', () => {
 		expect(() =>
 			validateViteEnvironment(

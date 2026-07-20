@@ -1,0 +1,20 @@
+{
+	"name": "shotgrid-review-api",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "yarn run -T tsx watch src/server.ts",
+		"build": "yarn run -T tsgo --build tsconfig.json && yarn run -T esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js",
+		"lint": "yarn run -T tsx ../../internal/scripts/lint.ts",
+		"start": "node dist/server.js",
+		"test": "yarn run -T vitest run"
+	},
+	"devDependencies": {
+		"@types/node": "^22.15.31",
+		"esbuild": "^0.28.0",
+		"tsx": "^4.19.2",
+		"typescript": "^5.8.3",
+		"vitest": "^4.1.7"
+	}
+}

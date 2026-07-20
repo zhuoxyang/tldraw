@@ -30043,6 +30043,18 @@ __metadata:
   languageName: node
   linkType: hard
 
+"shotgrid-review-api@workspace:apps/shotgrid-review-api":
+  version: 0.0.0-use.local
+  resolution: "shotgrid-review-api@workspace:apps/shotgrid-review-api"
+  dependencies:
+    "@types/node": "npm:^22.15.31"
+    esbuild: "npm:^0.28.0"
+    tsx: "npm:^4.19.2"
+    typescript: "npm:^5.8.3"
+    vitest: "npm:^4.1.7"
+  languageName: unknown
+  linkType: soft
+
 "shotgrid-review@workspace:apps/shotgrid-review":
   version: 0.0.0-use.local
   resolution: "shotgrid-review@workspace:apps/shotgrid-review"
