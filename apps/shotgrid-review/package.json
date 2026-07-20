@@ -1,0 +1,25 @@
+{
+	"name": "shotgrid-review",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite --host 0.0.0.0 --port 5430",
+		"build": "yarn run -T tsgo --build tsconfig.json && vite build",
+		"lint": "yarn run -T tsx ../../internal/scripts/lint.ts",
+		"test": "yarn run -T vitest run"
+	},
+	"dependencies": {
+		"react": "^19.2.1",
+		"react-dom": "^19.2.1",
+		"tldraw": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/react": "^19.2.7",
+		"@types/react-dom": "^19.2.3",
+		"@vitejs/plugin-react": "^6.0.1",
+		"typescript": "^5.8.3",
+		"vite": "^8.0.16",
+		"vitest": "^4.1.7"
+	}
+}
