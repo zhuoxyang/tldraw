@@ -6,6 +6,7 @@ describe('parseReviewConfig', () => {
 		expect(parseReviewConfig({})).toEqual({
 			apiBaseUrl: '/api',
 			dataMode: 'mock',
+			storageNamespace: 'local-dev',
 			tldrawLicenseKey: undefined,
 		})
 	})
@@ -22,15 +23,21 @@ describe('parseReviewConfig', () => {
 		})
 	})
 
-	it('rejects ShotGrid secrets in browser configuration', () => {
-		expect(() => parseReviewConfig({ VITE_SHOTGRID_SCRIPT_KEY: 'secret' })).toThrow(
-			'must never be exposed through browser configuration'
+	it('rejects ShotGrid values in browser configuration', () => {
+		expect(() => parseReviewConfig({ VITE_SHOTGRID_SESSION_TOKEN: 'secret' })).toThrow(
+			"uses Vite's public environment prefix"
 		)
 	})
 
 	it('rejects unsupported data modes', () => {
 		expect(() => parseReviewConfig({ VITE_REVIEW_DATA_MODE: 'live' })).toThrow(
 			'Unsupported VITE_REVIEW_DATA_MODE'
+		)
+	})
+
+	it('validates the persistence namespace', () => {
+		expect(() => parseReviewConfig({ VITE_REVIEW_STORAGE_NAMESPACE: 'unsafe namespace' })).toThrow(
+			'VITE_REVIEW_STORAGE_NAMESPACE contains unsupported characters'
 		)
 	})
 })

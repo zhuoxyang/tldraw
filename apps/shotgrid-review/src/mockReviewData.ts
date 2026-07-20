@@ -10,6 +10,7 @@ export const mockReviewPlaylist = {
 	code: 'Lighting dailies',
 	id: 'playlist-101',
 	project: 'Project Northstar',
+	projectId: 'project-001',
 	versions: [
 		{
 			artist: 'Mei Chen',
