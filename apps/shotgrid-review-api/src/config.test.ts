@@ -70,6 +70,7 @@ describe('parseGatewayConfig', () => {
 			publicationStoreDir: PUBLICATION_STORE_DIR,
 			trustedProxyToken: 'trusted-proxy-token-with-32-characters',
 			shotgrid: {
+				frameRateMode: 'unknown',
 				siteUrl: 'https://studio.shotgrid.autodesk.com',
 				scriptName: 'review-gateway',
 				scriptKey: 'private-test-key',
@@ -77,6 +78,25 @@ describe('parseGatewayConfig', () => {
 				timeoutMs: 25_000,
 				maxRetries: 4,
 			},
+		})
+	})
+
+	it.each(['constant', 'unknown', 'variable'] as const)(
+		'accepts the %s review-video frame-rate policy',
+		(frameRateMode) => {
+			const parsed = parseGatewayConfig({
+				...LIVE_ENVIRONMENT,
+				SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE: frameRateMode,
+			})
+			if (parsed.mode !== 'shotgrid') throw new Error('Expected live ShotGrid configuration')
+			expect(parsed.shotgrid.frameRateMode).toBe(frameRateMode)
+		}
+	)
+
+	it('rejects an invalid review-video frame-rate policy', () => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE: 'auto',
 		})
 	})
 

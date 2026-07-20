@@ -5,6 +5,7 @@ import type { ShotGridClient } from '../shotgrid/ShotGridClient'
 import { ShotGridReviewGateway } from './ShotGridReviewGateway'
 
 const config: ShotGridConnectionConfig = {
+	frameRateMode: 'unknown',
 	maxRetries: 2,
 	scriptKey: 'server-only-key',
 	scriptName: 'review-gateway',
@@ -70,9 +71,14 @@ describe('ShotGridReviewGateway', () => {
 							image: 'https://media.example.com/thumb.jpg',
 							sg_status_list: 'rev',
 							sg_uploaded_movie: {
+								id: 901,
+								name: 'shot_010_lgt_v014.mp4',
 								content_type: 'video/mp4',
+								type: 'Attachment',
 								url: 'https://media.example.com/review.mp4',
 							},
+							sg_first_frame: 1001,
+							sg_last_frame: 1120,
 						},
 						id: 301,
 						relationships: {
@@ -120,16 +126,19 @@ describe('ShotGridReviewGateway', () => {
 				entity: { id: 501, name: 'shot_010', type: 'Shot' },
 				id: 301,
 				media: {
+					attachmentId: 901,
 					contentType: 'video/mp4',
-					durationSeconds: 5,
-					firstFrame: null,
+					durationSeconds: null,
+					fileName: 'shot_010_lgt_v014.mp4',
+					firstFrame: 1001,
 					frameCount: 120,
 					frameRate: 24,
+					frameRateMode: 'unknown',
 					height: null,
 					kind: 'video',
-					lastFrame: null,
-					thumbnailUrl: 'https://media.example.com/thumb.jpg',
-					url: 'https://media.example.com/review.mp4',
+					lastFrame: 1120,
+					thumbnailUrl: '/review/playlists/201/versions/301/media/image',
+					url: '/review/playlists/201/versions/301/media/video/901',
 					width: null,
 				},
 				name: 'shot_010_lgt_v014',
@@ -162,27 +171,39 @@ describe('ShotGridReviewGateway', () => {
 		expect(request.mock.calls[3][0]).toBe('/entity/playlists/201')
 		expect(request.mock.calls[4][1]?.query?.fields).toContain('entity')
 		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_task')
+		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_first_frame')
+		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_last_frame')
 	})
 
-	test('re-reads a selected version to refresh media and map standard context', async () => {
+	test('re-reads a selected version to refresh Attachment identity and map standard context', async () => {
 		const playlistResponse = { data: { id: 201, type: 'Playlist' } }
 		const request = vi
 			.fn()
 			.mockResolvedValueOnce(playlistResponse)
-			.mockResolvedValueOnce(makeVersionResponse('https://media.example.com/review-old.mp4'))
+			.mockResolvedValueOnce(
+				makeVersionResponse('https://media.example.com/review-old.mp4', 201, 'Playlist', 301, 901)
+			)
 			.mockResolvedValueOnce(playlistResponse)
-			.mockResolvedValueOnce(makeVersionResponse('https://media.example.com/review-fresh.mp4'))
+			.mockResolvedValueOnce(
+				makeVersionResponse('https://media.example.com/review-fresh.mp4', 201, 'Playlist', 301, 902)
+			)
 		const gateway = makeGateway(request)
 
 		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
 			entity: { id: 501, name: 'shot_010', type: 'Shot' },
 			id: 301,
-			media: { url: 'https://media.example.com/review-old.mp4' },
+			media: {
+				attachmentId: 901,
+				url: '/review/playlists/201/versions/301/media/video/901',
+			},
 			playlistId: 201,
 			task: { id: 601, name: 'Lighting' },
 		})
 		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
-			media: { url: 'https://media.example.com/review-fresh.mp4' },
+			media: {
+				attachmentId: 902,
+				url: '/review/playlists/201/versions/301/media/video/902',
+			},
 		})
 
 		expect(request.mock.calls.map((call) => call[0])).toEqual([
@@ -195,6 +216,96 @@ describe('ShotGridReviewGateway', () => {
 		expect(request.mock.calls[1][1]?.query?.fields).toContain('sg_task')
 		expect(request.mock.calls[1][1]?.query?.fields).toContain('sg_uploaded_movie')
 	})
+
+	test('fails closed on malformed movie identity and numeric metadata', async () => {
+		const corruptions: Array<(attributes: Record<string, unknown>) => void> = [
+			(attributes) => {
+				delete (attributes.sg_uploaded_movie as Record<string, unknown>).id
+			},
+			(attributes) => {
+				;(attributes.sg_uploaded_movie as Record<string, unknown>).name = '../review.mp4'
+			},
+			(attributes) => {
+				;(attributes.sg_uploaded_movie as Record<string, unknown>).type = 'LocalStorage'
+			},
+			(attributes) => {
+				attributes.frame_count = 0
+			},
+			(attributes) => {
+				attributes.frame_rate = '24'
+			},
+			(attributes) => {
+				attributes.sg_first_frame = 1001.5
+			},
+			(attributes) => {
+				attributes.sg_last_frame = 1000
+			},
+		]
+
+		for (const corrupt of corruptions) {
+			const response = makeVersionResponse('https://studio.example.com/media/review.mp4')
+			corrupt(response.data.attributes as Record<string, unknown>)
+			const request = vi
+				.fn()
+				.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+				.mockResolvedValueOnce(response)
+			const gateway = makeGateway(request)
+			await expect(gateway.getVersion(201, 301)).rejects.toMatchObject({
+				code: 'SHOTGRID_INVALID_RESPONSE',
+				status: 502,
+			})
+		}
+	})
+
+	test('preserves explicitly missing frame metadata for the time-only fallback', async () => {
+		const response = makeVersionResponse('https://studio.example.com/media/review.mp4')
+		delete (response.data.attributes as Record<string, unknown>).frame_count
+		delete (response.data.attributes as Record<string, unknown>).frame_rate
+		delete (response.data.attributes as Record<string, unknown>).sg_first_frame
+		delete (response.data.attributes as Record<string, unknown>).sg_last_frame
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(response)
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
+			media: {
+				firstFrame: null,
+				frameCount: null,
+				frameRate: null,
+				lastFrame: null,
+			},
+		})
+	})
+
+	test.each(['unsupported MOV', 'transcode without URL'] as const)(
+		'keeps browsing available for an %s movie attachment',
+		async (scenario) => {
+			const response = makeVersionResponse('https://studio.example.com/media/review.mp4')
+			const movie = (response.data.attributes as Record<string, unknown>)
+				.sg_uploaded_movie as Record<string, unknown>
+			if (scenario === 'unsupported MOV') {
+				movie.content_type = 'video/quicktime'
+				movie.name = 'review.mov'
+			} else {
+				delete movie.url
+			}
+			const request = vi
+				.fn()
+				.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+				.mockResolvedValueOnce(response)
+			const gateway = makeGateway(request)
+
+			await expect(gateway.getVersion(201, 301)).resolves.toMatchObject({
+				media: {
+					contentType: 'image/jpeg',
+					kind: 'image',
+					url: '/review/playlists/201/versions/301/media/image',
+				},
+			})
+		}
+	)
 
 	test('replaces live still-image URLs with the same-origin proxy contract', async () => {
 		const playlistResponse = { data: { id: 201, type: 'Playlist' } }
@@ -263,6 +374,390 @@ describe('ShotGridReviewGateway', () => {
 		expect(headers.get('Accept-Encoding')).toBe('identity')
 		expect(headers.has('Authorization')).toBe(false)
 		expect(headers.has('Cookie')).toBe(false)
+	})
+
+	test('revalidates and streams an exact Version Attachment without forwarding credentials', async () => {
+		const videoBytes = Buffer.from('browser-playable-mp4')
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(videoBytes, {
+					headers: {
+						'Accept-Ranges': 'bytes',
+						'Content-Length': String(videoBytes.byteLength),
+						'Content-Type': 'video/mp4',
+					},
+				})
+		)
+		const request = makeVideoRequest()
+		const gateway = makeGateway(request, config, videoFetch)
+
+		const video = await gateway.getVersionVideo(201, 301, 901, null)
+		expect(video).toMatchObject({
+			contentLength: videoBytes.byteLength,
+			contentRange: null,
+			contentType: 'video/mp4',
+			status: 200,
+		})
+		await expect(readStream(video.body)).resolves.toEqual(videoBytes)
+		await video.dispose()
+
+		expect(request.mock.calls.map((call) => call[0])).toEqual([
+			'/entity/playlists/201',
+			'/entity/versions/301',
+		])
+		expect(videoFetch).toHaveBeenCalledOnce()
+		expect(videoFetch.mock.calls[0][0].toString()).toBe(
+			'https://studio.example.com/media/review.mp4'
+		)
+		const fetchOptions = videoFetch.mock.calls[0][1]
+		const headers = new Headers(fetchOptions?.headers)
+		expect(fetchOptions).toMatchObject({
+			cache: 'no-store',
+			credentials: 'omit',
+			method: 'GET',
+			redirect: 'manual',
+			referrerPolicy: 'no-referrer',
+		})
+		expect(headers.get('Accept')).toBe('video/mp4')
+		expect(headers.get('Accept-Encoding')).toBe('identity')
+		expect(headers.has('Authorization')).toBe(false)
+		expect(headers.has('Cookie')).toBe(false)
+		expect(headers.has('Range')).toBe(false)
+	})
+
+	test('serves a video thumbnail through the existing same-origin image proxy', async () => {
+		const imageBytes = makeJpeg()
+		const imageFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(imageBytes, {
+					headers: {
+						'Content-Length': String(imageBytes.byteLength),
+						'Content-Type': 'image/jpeg',
+					},
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).resolves.toMatchObject({
+			contentType: 'image/jpeg',
+		})
+		expect(imageFetch.mock.calls[0][0].toString()).toBe(
+			'https://studio.example.com/media/thumb.jpg'
+		)
+	})
+
+	test.each([
+		[{ end: 5, kind: 'closed', start: 2 }, 'bytes=2-5', 'bytes 2-5/10', 4],
+		[{ kind: 'open', start: 6 }, 'bytes=6-', 'bytes 6-9/10', 4],
+		[{ kind: 'suffix', length: 3 }, 'bytes=-3', 'bytes 7-9/10', 3],
+	] as const)(
+		'forwards and validates one byte range %#',
+		async (range, requestRange, responseRange, length) => {
+			const videoFetch = vi.fn<typeof fetch>(
+				async () =>
+					new Response(Buffer.alloc(length, 7), {
+						headers: {
+							'Accept-Ranges': 'bytes',
+							'Content-Length': String(length),
+							'Content-Range': responseRange,
+							'Content-Type': 'video/mp4; charset=binary',
+						},
+						status: 206,
+					})
+			)
+			const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+			const video = await gateway.getVersionVideo(201, 301, 901, range)
+			expect(video).toMatchObject({
+				contentLength: length,
+				contentRange: responseRange,
+				status: 206,
+			})
+			await video.dispose()
+			expect(new Headers(videoFetch.mock.calls[0][1]?.headers).get('Range')).toBe(requestRange)
+		}
+	)
+
+	test('rejects an Attachment race before starting a video download', async () => {
+		const request = makeVideoRequest({ attachmentId: 902 })
+		const videoFetch = vi.fn<typeof fetch>()
+		const gateway = makeGateway(request, config, videoFetch)
+
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+		expect(videoFetch).not.toHaveBeenCalled()
+	})
+
+	test('hands off the upstream video stream without buffering and cancels it on disposal', async () => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						cancel,
+						start(controller) {
+							controller.enqueue(Uint8Array.from([1]))
+						},
+					}),
+					{
+						headers: {
+							'Accept-Ranges': 'bytes',
+							'Content-Length': '10',
+							'Content-Type': 'video/mp4',
+						},
+					}
+				)
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+		const video = await gateway.getVersionVideo(201, 301, 901, null)
+		expect(cancel).not.toHaveBeenCalled()
+		await video.dispose()
+		expect(cancel).toHaveBeenCalledOnce()
+		expect(videoFetch.mock.calls[0][1]?.signal?.aborted).toBe(true)
+	})
+
+	test('times out a stalled upstream video read and releases the stream', async () => {
+		const videoFetch = vi.fn<typeof fetch>(async (_url, init) => {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					init?.signal?.addEventListener('abort', () => controller.error(new Error('aborted')), {
+						once: true,
+					})
+				},
+			})
+			return new Response(body, {
+				headers: {
+					'Accept-Ranges': 'bytes',
+					'Content-Length': '10',
+					'Content-Type': 'video/mp4',
+				},
+			})
+		})
+		const gateway = makeGateway(makeVideoRequest(), { ...config, timeoutMs: 1 }, videoFetch)
+		const video = await gateway.getVersionVideo(201, 301, 901, null)
+		const reader = video.body.getReader()
+
+		await expect(reader.read()).rejects.toMatchObject({
+			code: 'SHOTGRID_TIMEOUT',
+			status: 504,
+		})
+		reader.releaseLock()
+		await video.dispose()
+	})
+
+	test('bounds concurrent video streams and releases capacity on disposal', async () => {
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(new ReadableStream(), {
+					headers: {
+						'Accept-Ranges': 'bytes',
+						'Content-Length': '10',
+						'Content-Type': 'video/mp4',
+					},
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+		const videos = await Promise.all(
+			Array.from({ length: 8 }, () => gateway.getVersionVideo(201, 301, 901, null))
+		)
+
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'SHOTGRID_RATE_LIMITED',
+			retryable: true,
+			status: 429,
+		})
+		await Promise.all(videos.map((video) => video.dispose()))
+		const afterRelease = await gateway.getVersionVideo(201, 301, 901, null)
+		await afterRelease.dispose()
+	})
+
+	test('holds video capacity until asynchronous upstream cancellation finishes', async () => {
+		let releaseCancel!: () => void
+		const cancelGate = new Promise<void>((resolve) => {
+			releaseCancel = resolve
+		})
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(new ReadableStream({ cancel: () => cancelGate }), {
+					headers: {
+						'Accept-Ranges': 'bytes',
+						'Content-Length': '10',
+						'Content-Type': 'video/mp4',
+					},
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+		const videos = await Promise.all(
+			Array.from({ length: 8 }, () => gateway.getVersionVideo(201, 301, 901, null))
+		)
+		const disposing = videos[0].dispose()
+
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'SHOTGRID_RATE_LIMITED',
+			status: 429,
+		})
+		releaseCancel()
+		await disposing
+		const replacement = await gateway.getVersionVideo(201, 301, 901, null)
+		await Promise.all([...videos.slice(1).map((video) => video.dispose()), replacement.dispose()])
+	})
+
+	test.each([
+		['missing Accept-Ranges', { 'Content-Length': '10', 'Content-Type': 'video/mp4' }],
+		[
+			'wrong content type',
+			{ 'Accept-Ranges': 'bytes', 'Content-Length': '10', 'Content-Type': 'text/html' },
+		],
+		[
+			'encoded body',
+			{
+				'Accept-Ranges': 'bytes',
+				'Content-Encoding': 'gzip',
+				'Content-Length': '10',
+				'Content-Type': 'video/mp4',
+			},
+		],
+		[
+			'oversized body',
+			{
+				'Accept-Ranges': 'bytes',
+				'Content-Length': String(2 * 1024 * 1024 * 1024 + 1),
+				'Content-Type': 'video/mp4',
+			},
+		],
+	] as const)('rejects and cancels a video with %s', async (_name, headers) => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () => new Response(new ReadableStream({ cancel }), { headers })
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		expect(cancel).toHaveBeenCalledOnce()
+	})
+
+	test('applies an overall video-transfer deadline in addition to per-read timeouts', async () => {
+		const videoFetch = vi.fn<typeof fetch>(async (_url, init) => {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					init?.signal?.addEventListener('abort', () => controller.error(new Error('aborted')), {
+						once: true,
+					})
+				},
+			})
+			return new Response(body, {
+				headers: {
+					'Accept-Ranges': 'bytes',
+					'Content-Length': '10',
+					'Content-Type': 'video/mp4',
+				},
+			})
+		})
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch, {
+			videoTransferTimeoutMs: 1,
+		})
+		const video = await gateway.getVersionVideo(201, 301, 901, null)
+		const reader = video.body.getReader()
+
+		await expect(reader.read()).rejects.toMatchObject({
+			code: 'SHOTGRID_TIMEOUT',
+			status: 504,
+		})
+		reader.releaseLock()
+		await video.dispose()
+	})
+
+	test('rejects and cancels a mismatched partial-video response', async () => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(new ReadableStream({ cancel }), {
+					headers: {
+						'Accept-Ranges': 'bytes',
+						'Content-Length': '5',
+						'Content-Range': 'bytes 3-7/10',
+						'Content-Type': 'video/mp4',
+					},
+					status: 206,
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+		await expect(
+			gateway.getVersionVideo(201, 301, 901, { end: 5, kind: 'closed', start: 2 })
+		).rejects.toMatchObject({ code: 'SHOTGRID_INVALID_RESPONSE', status: 502 })
+		expect(cancel).toHaveBeenCalledOnce()
+	})
+
+	test('maps an unsatisfiable upstream byte range without exposing its body', async () => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(new ReadableStream({ cancel }), {
+					headers: { 'Content-Range': 'bytes */10' },
+					status: 416,
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+		await expect(
+			gateway.getVersionVideo(201, 301, 901, { kind: 'open', start: 10 })
+		).rejects.toMatchObject({
+			code: 'INVALID_REQUEST',
+			rangeResourceLength: 10,
+			status: 416,
+			upstreamStatus: 416,
+		})
+		expect(cancel).toHaveBeenCalledOnce()
+	})
+
+	test('rejects and cancels an unsatisfied range without a valid resource length', async () => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () => new Response(new ReadableStream({ cancel }), { status: 416 })
+		)
+		const gateway = makeGateway(makeVideoRequest(), config, videoFetch)
+
+		await expect(
+			gateway.getVersionVideo(201, 301, 901, { kind: 'open', start: 10 })
+		).rejects.toMatchObject({ code: 'SHOTGRID_INVALID_RESPONSE', status: 502 })
+		expect(cancel).toHaveBeenCalledOnce()
+	})
+
+	test.each([
+		['untrusted source', 'https://evil.example/review.mp4', null],
+		[
+			'untrusted redirect',
+			'https://studio.example.com/media/review.mp4',
+			'https://evil.example/review.mp4',
+		],
+	] as const)('rejects an %s video URL', async (_name, source, redirect) => {
+		const cancel = vi.fn()
+		const videoFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(new ReadableStream({ cancel }), {
+					headers: redirect ? { Location: redirect } : undefined,
+					status: redirect ? 302 : 200,
+				})
+		)
+		const gateway = makeGateway(makeVideoRequest({ url: source }), config, videoFetch)
+
+		await expect(gateway.getVersionVideo(201, 301, 901, null)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		if (redirect) {
+			expect(videoFetch).toHaveBeenCalledOnce()
+			expect(cancel).toHaveBeenCalledOnce()
+		} else {
+			expect(videoFetch).not.toHaveBeenCalled()
+		}
 	})
 
 	test('allows a bounded redirect to a validated regional S3 image', async () => {
@@ -1730,7 +2225,8 @@ function makeVersionResponse(
 	movieUrl: string,
 	playlistId = 201,
 	playlistType = 'Playlist',
-	versionId = 301
+	versionId = 301,
+	attachmentId = 901
 ) {
 	return {
 		data: {
@@ -1741,8 +2237,16 @@ function makeVersionResponse(
 				frame_count: 120,
 				frame_rate: 24,
 				image: 'https://media.example.com/thumb.jpg',
+				sg_first_frame: 1001,
+				sg_last_frame: 1120,
 				sg_status_list: 'rev',
-				sg_uploaded_movie: { content_type: 'video/mp4', url: movieUrl },
+				sg_uploaded_movie: {
+					content_type: 'video/mp4',
+					id: attachmentId,
+					name: 'shot_010_lgt_v014.mp4',
+					type: 'Attachment',
+					url: movieUrl,
+				},
 			},
 			id: versionId,
 			relationships: {
@@ -1775,6 +2279,42 @@ function makeStillImageRequest(imageUrl = 'https://studio.example.com/media/imag
 		if (path === '/entity/versions/301') return makeStillVersionResponse(imageUrl)
 		throw new Error(`Unexpected request: ${path}`)
 	})
+}
+
+function makeVideoRequest(options: { attachmentId?: number; url?: string } = {}) {
+	return vi.fn(async (path: string) => {
+		if (path === '/entity/playlists/201') return { data: { id: 201, type: 'Playlist' } }
+		if (path === '/entity/versions/301') {
+			const response = makeVersionResponse(
+				options.url ?? 'https://studio.example.com/media/review.mp4',
+				201,
+				'Playlist',
+				301,
+				options.attachmentId ?? 901
+			)
+			response.data.attributes.image = 'https://studio.example.com/media/thumb.jpg'
+			return response
+		}
+		throw new Error(`Unexpected request: ${path}`)
+	})
+}
+
+async function readStream(stream: ReadableStream<Uint8Array>) {
+	const reader = stream.getReader()
+	const chunks: Buffer[] = []
+	let length = 0
+	try {
+		for (;;) {
+			const { done, value } = await reader.read()
+			if (done) break
+			const chunk = Buffer.from(value)
+			chunks.push(chunk)
+			length += chunk.byteLength
+		}
+	} finally {
+		reader.releaseLock()
+	}
+	return Buffer.concat(chunks, length)
 }
 
 function makeJpeg(width = 1, height = 1) {
@@ -1850,11 +2390,13 @@ function makeWebpChunk(type: string, data: Buffer) {
 function makeGateway(
 	request: ReturnType<typeof vi.fn>,
 	connectionConfig = config,
-	uploadFetch?: typeof fetch
+	uploadFetch?: typeof fetch,
+	options: { maxVideoResponseBytes?: number; videoTransferTimeoutMs?: number } = {}
 ) {
 	const client = { request } as unknown as Pick<ShotGridClient, 'request'>
 	return new ShotGridReviewGateway(client, connectionConfig, {
 		fetch: uploadFetch,
 		now: () => Date.parse('2026-07-20T00:00:00Z'),
+		...options,
 	})
 }

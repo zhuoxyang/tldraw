@@ -11,7 +11,12 @@ import type {
 } from '../contracts'
 import { isReviewDecisionRequest } from '../contracts'
 import { ReviewGatewayError } from '../errors'
-import type { ReviewGateway, ReviewImageProxyPayload } from '../gateway/ReviewGateway'
+import type {
+	ReviewGateway,
+	ReviewImageProxyPayload,
+	ReviewVideoByteRange,
+	ReviewVideoProxyPayload,
+} from '../gateway/ReviewGateway'
 import { ReviewDecisionCoordinator } from './ReviewDecisionCoordinator'
 import { ReviewPublicationCoordinator } from './ReviewPublicationCoordinator'
 import type { ReviewPublicationStore } from './ReviewPublicationStore'
@@ -26,6 +31,7 @@ const MAX_RECIPIENTS = 50
 const PNG_CRC_TABLE = createPngCrcTable()
 const HEADERS_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_VIDEO_DOWNSTREAM_IDLE_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
 const MUTATION_METHODS = ['PUT'] as const
 const inflateAsync = promisify(inflate)
@@ -49,6 +55,7 @@ export interface ReviewApiServerOptions {
 	serviceActorName?: string
 	sudoAsLogin?: string
 	trustedProxyToken?: string
+	videoDownstreamIdleTimeoutMs?: number
 }
 
 interface RouteMatch {
@@ -114,6 +121,19 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			status: 500,
 		})
 	}
+	const videoDownstreamIdleTimeoutMs =
+		options.videoDownstreamIdleTimeoutMs ?? DEFAULT_VIDEO_DOWNSTREAM_IDLE_TIMEOUT_MS
+	if (
+		!Number.isSafeInteger(videoDownstreamIdleTimeoutMs) ||
+		videoDownstreamIdleTimeoutMs <= 0 ||
+		videoDownstreamIdleTimeoutMs > 120_000
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
 	const publications = new ReviewPublicationCoordinator(options.gateway, options.publicationStore)
 	const decisions = new ReviewDecisionCoordinator(
 		options.gateway,
@@ -150,6 +170,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				publications,
 				publicationLimiter,
 				publicationActorScope,
+				videoDownstreamIdleTimeoutMs,
 				response
 			)
 			if (!route) {
@@ -193,6 +214,13 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				requestId,
 				status: normalized.status,
 			})
+			if (response.headersSent) {
+				response.destroy()
+				return
+			}
+			if (normalized.status === 416 && normalized.rangeResourceLength !== undefined) {
+				response.setHeader('Content-Range', `bytes */${normalized.rangeResourceLength}`)
+			}
 			sendJson(response, normalized.status, normalized.toApiErrorEnvelope(requestId))
 		}
 	})
@@ -262,6 +290,7 @@ function matchRoute(
 	publications: ReviewPublicationCoordinator,
 	publicationLimiter: InFlightLimiter,
 	publicationActorScope: string,
+	videoDownstreamIdleTimeoutMs: number,
 	response: ServerResponse
 ): RouteMatch | undefined {
 	if (pathname === '/api/health') {
@@ -323,6 +352,46 @@ function matchRoute(
 			} finally {
 				request.off('aborted', abort)
 				response.off('close', abortOnPrematureClose)
+			}
+		})
+	}
+
+	const playlistVersionVideo = matchThreeIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/media\/video\/([^/]+)$/
+	)
+	if (playlistVersionVideo.matched) {
+		return getRoute(async (request) => {
+			const playlistId = requirePositiveId(playlistVersionVideo.firstId, 'playlistId')
+			const versionId = requirePositiveId(playlistVersionVideo.secondId, 'versionId')
+			const attachmentId = requirePositiveId(playlistVersionVideo.thirdId, 'attachmentId')
+			const range = parseReviewVideoRange(request.headers.range)
+			const controller = new AbortController()
+			const abort = () => controller.abort()
+			const abortOnPrematureClose = () => {
+				if (!response.writableEnded) abort()
+			}
+			let video: ReviewVideoProxyPayload | undefined
+			request.once('aborted', abort)
+			response.once('close', abortOnPrematureClose)
+			try {
+				video = await gateway.getVersionVideo(
+					playlistId,
+					versionId,
+					attachmentId,
+					range,
+					controller.signal
+				)
+				if (!controller.signal.aborted && !response.destroyed) {
+					await sendVideo(response, video, videoDownstreamIdleTimeoutMs)
+				}
+			} catch (error) {
+				if (controller.signal.aborted && (request.destroyed || response.destroyed)) return
+				throw error
+			} finally {
+				request.off('aborted', abort)
+				response.off('close', abortOnPrematureClose)
+				await video?.dispose()
 			}
 		})
 	}
@@ -501,6 +570,30 @@ function matchTwoIdPath(pathname: string, pattern: RegExp) {
 	return match
 		? { firstId: match[1], matched: true as const, secondId: match[2] }
 		: { matched: false as const }
+}
+
+function matchThreeIdPath(pathname: string, pattern: RegExp) {
+	const match = pattern.exec(pathname)
+	return match
+		? { firstId: match[1], matched: true as const, secondId: match[2], thirdId: match[3] }
+		: { matched: false as const }
+}
+
+function parseReviewVideoRange(value: string | undefined): ReviewVideoByteRange | null {
+	if (value === undefined) return null
+	const match = /^bytes=((?:0|[1-9]\d*)?)-((?:0|[1-9]\d*)?)$/.exec(value)
+	if (!match || (match[1] === '' && match[2] === '')) throw invalidReviewVideoRange()
+	if (match[1] === '') {
+		const length = Number(match[2])
+		if (!Number.isSafeInteger(length) || length <= 0) throw invalidReviewVideoRange()
+		return { kind: 'suffix', length }
+	}
+	const start = Number(match[1])
+	if (!Number.isSafeInteger(start)) throw invalidReviewVideoRange()
+	if (match[2] === '') return { kind: 'open', start }
+	const end = Number(match[2])
+	if (!Number.isSafeInteger(end) || end < start) throw invalidReviewVideoRange()
+	return { end, kind: 'closed', start }
 }
 
 function matchPublicationPath(pathname: string) {
@@ -945,6 +1038,15 @@ function invalidRequest(message: string) {
 	})
 }
 
+function invalidReviewVideoRange() {
+	return new ReviewGatewayError({
+		code: 'INVALID_REQUEST',
+		message: 'Range must contain one valid bytes range.',
+		retryable: false,
+		status: 416,
+	})
+}
+
 function normalizeError(error: unknown) {
 	if (error instanceof ReviewGatewayError) return error
 	return new ReviewGatewayError({
@@ -987,4 +1089,82 @@ function sendImage(response: ServerResponse, image: ReviewImageProxyPayload) {
 	response.setHeader('Content-Length', String(body.byteLength))
 	response.setHeader('Content-Type', image.contentType)
 	response.end(body)
+}
+
+async function sendVideo(
+	response: ServerResponse,
+	video: ReviewVideoProxyPayload,
+	downstreamIdleTimeoutMs: number
+) {
+	if (response.writableEnded || response.destroyed) return
+	response.statusCode = video.status
+	response.setHeader('Accept-Ranges', 'bytes')
+	response.setHeader('Content-Length', String(video.contentLength))
+	response.setHeader('Content-Type', video.contentType)
+	if (video.contentRange !== null) response.setHeader('Content-Range', video.contentRange)
+	response.flushHeaders()
+
+	const reader = video.body.getReader()
+	let bytesWritten = 0
+	try {
+		for (;;) {
+			const { done, value } = await reader.read()
+			if (done) break
+			if (isVideoResponseClosed(response)) throw new Error('Video response closed')
+			bytesWritten += value.byteLength
+			if (bytesWritten > video.contentLength) throw invalidUpstreamVideoStream()
+			const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+			if (!response.write(chunk)) await waitForDrain(response, downstreamIdleTimeoutMs)
+		}
+		if (bytesWritten !== video.contentLength) throw invalidUpstreamVideoStream()
+		response.end()
+	} finally {
+		reader.releaseLock()
+	}
+}
+
+function waitForDrain(response: ServerResponse, timeoutMs: number) {
+	return new Promise<void>((resolve, reject) => {
+		if (isVideoResponseClosed(response)) {
+			reject(new Error('Video response closed before draining'))
+			return
+		}
+		const cleanup = () => {
+			clearTimeout(timeout)
+			response.off('close', onClose)
+			response.off('drain', onDrain)
+			response.off('error', onError)
+		}
+		const onClose = () => {
+			cleanup()
+			reject(new Error('Video response closed before draining'))
+		}
+		const onDrain = () => {
+			cleanup()
+			resolve()
+		}
+		const onError = (error: Error) => {
+			cleanup()
+			reject(error)
+		}
+		const timeout = setTimeout(() => {
+			cleanup()
+			reject(new Error('Video response timed out while waiting for the client'))
+		}, timeoutMs)
+		response.once('close', onClose)
+		response.once('drain', onDrain)
+		response.once('error', onError)
+	})
+}
+
+function isVideoResponseClosed(response: ServerResponse) {
+	return response.destroyed || response.writableEnded || response.socket?.destroyed === true
+}
+
+function invalidUpstreamVideoStream() {
+	return new ReviewGatewayError({
+		code: 'SHOTGRID_INVALID_RESPONSE',
+		retryable: false,
+		status: 502,
+	})
 }

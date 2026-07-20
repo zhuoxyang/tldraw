@@ -19,6 +19,20 @@ export interface ReviewImageProxyPayload {
 	contentType: 'image/jpeg' | 'image/png' | 'image/webp'
 }
 
+export type ReviewVideoByteRange =
+	| { end: number; kind: 'closed'; start: number }
+	| { kind: 'open'; start: number }
+	| { kind: 'suffix'; length: number }
+
+export interface ReviewVideoProxyPayload {
+	body: ReadableStream<Uint8Array>
+	contentLength: number
+	contentRange: string | null
+	contentType: 'video/mp4'
+	dispose(): Promise<void>
+	status: 200 | 206
+}
+
 export interface CreateReviewPublicationNoteRequest {
 	content: string
 	recipientIds: number[]
@@ -58,6 +72,13 @@ export interface ReviewGateway {
 		versionId: number,
 		signal?: AbortSignal
 	): Promise<ReviewImageProxyPayload>
+	getVersionVideo(
+		playlistId: number,
+		versionId: number,
+		attachmentId: number,
+		range: ReviewVideoByteRange | null,
+		signal?: AbortSignal
+	): Promise<ReviewVideoProxyPayload>
 	listPlaylists(projectId: number): Promise<ReviewPlaylist[]>
 	listProjects(): Promise<ReviewProject[]>
 	listVersions(playlistId: number): Promise<ReviewVersion[]>

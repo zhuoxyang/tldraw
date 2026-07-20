@@ -21,9 +21,18 @@ SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS=10000 # optional
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES=4194304 # optional; minimum 1048576
 SHOTGRID_SUDO_AS_LOGIN=reviewer@example.com # optional
 SHOTGRID_REVIEW_DECISIONS_JSON=[{"key":"approve","label":"Approve","statusCode":"apr"},{"key":"needs-changes","label":"Needs changes","statusCode":"chg"}]
+SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE=unknown # constant, variable, or unknown
 ```
 
 Optional service settings are `REVIEW_API_HOST`, `REVIEW_API_PORT`, `REVIEW_APP_ORIGIN`, `SHOTGRID_TIMEOUT_MS`, and `SHOTGRID_MAX_RETRIES`. The timeout applies to each upstream attempt. Only idempotent reads retry transient failures; review mutations do not retry automatically.
+
+Video frame numbers are enabled only when `SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE=constant`. Set
+that value only when the deployment's upload or transcode pipeline guarantees constant-frame-rate
+MP4 media. The default `unknown`, and explicit `variable`, force the browser onto its decoded
+millisecond timeline even when ShotGrid's frame count and nominal rate happen to agree; browsers do
+not expose enough container timing information to prove that a movie is CFR. This is a deployment
+assertion for all review movies, so mixed CFR/VFR sources must remain `unknown` until the pipeline
+can provide a trustworthy per-Version classification.
 
 Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browser configuration and the review application rejects `VITE_SHOTGRID_*` values at build time.
 
@@ -76,6 +85,8 @@ per-IP request-rate, concurrent-request, and body-size limits before traffic rea
 - `GET /api/review/projects/:projectId/playlists`
 - `GET /api/review/playlists/:playlistId/versions`
 - `GET /api/review/playlists/:playlistId/versions/:versionId`
+- `GET /api/review/playlists/:playlistId/versions/:versionId/media/image`
+- `GET /api/review/playlists/:playlistId/versions/:versionId/media/video/:attachmentId`
 - `GET /api/review/playlists/:playlistId/versions/:versionId/note-options`
 - `GET /api/review/playlists/:playlistId/versions/:versionId/decision-context`
 - `PUT /api/review/playlists/:playlistId/versions/:versionId/decision`
@@ -83,6 +94,17 @@ per-IP request-rate, concurrent-request, and body-size limits before traffic rea
 
 The single-Version route verifies Playlist membership and rereads the standard ShotGrid media fields.
 Clients use it when a Version opens or refreshes so expiring ShotGrid media references are renewed.
+
+Live Version JSON never exposes the ShotGrid movie download URL. It contains a same-origin URL bound
+to the selected Playlist, Version, and Attachment. The video route rereads those relationships for
+every request, accepts at most one canonical `bytes` range, and streams only a strictly validated
+MP4 `200` or `206` response. It forwards no browser, ShotGrid, cookie, or authorization credentials
+to media storage, follows only bounded validated redirects, and cancels upstream work when the
+client disconnects. A response is capped at 2 GiB, an upstream transfer at 30 minutes, and a
+downstream backpressure stall at 10 seconds; timed-out resources are cancelled before their
+concurrency slot is released. Unsatisfied upstream ranges preserve a validated `bytes */length`
+response for standards-compliant media recovery. Video thumbnails use the same validated image
+proxy route.
 
 The decision request body is
 `{"decisionKey":"approve","expectedStatusCode":"rev"}`; `expectedStatusCode` may be

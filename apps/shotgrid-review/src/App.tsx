@@ -6,6 +6,7 @@ import { createReviewApiClient } from './reviewApiClient'
 import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowser'
 import { ReviewDecisionPanel, reviewDecisionAccessForReviewerKind } from './ReviewDecisionPanel'
 import { ReviewImageCanvas, reviewPublicationAccessForReviewerKind } from './ReviewImageCanvas'
+import { ReviewVideoCanvas } from './ReviewVideoCanvas'
 import { useReviewBrowser } from './useReviewBrowser'
 
 const reviewApi = createReviewApiClient({ baseUrl: reviewConfig.apiBaseUrl })
@@ -259,8 +260,20 @@ function ActiveReview({
 							versionId={version.id}
 							versionName={version.name}
 						/>
+					) : version.media?.kind === 'video' ? (
+						<ReviewVideoCanvas
+							documentKey={`${canvasKey}:playlist-${playlist.id}`}
+							key={`${canvasKey}:playlist-${playlist.id}:attachment-${version.media.attachmentId}`}
+							licenseKey={reviewConfig.tldrawLicenseKey}
+							media={version.media}
+							persistenceKey={persistenceKey}
+							projectId={project.id}
+							reviewScope={reviewScope}
+							versionId={version.id}
+							versionName={version.name}
+						/>
 					) : (
-						<UnavailableAnnotationCanvas media={version.media} />
+						<UnavailableAnnotationCanvas />
 					)}
 				</section>
 			</div>
@@ -268,17 +281,11 @@ function ActiveReview({
 	)
 }
 
-function UnavailableAnnotationCanvas({ media }: { media: ReviewMedia | null }) {
+function UnavailableAnnotationCanvas() {
 	return (
 		<div className="review-canvas-message" role="status">
-			<strong>
-				{media?.kind === 'video' ? 'Video review comes next' : 'No image to annotate'}
-			</strong>
-			<span>
-				{media?.kind === 'video'
-					? 'This MVP supports source-resolution image annotation. Frame-accurate video review is tracked separately.'
-					: 'Attach accessible image media to this ShotGrid Version to start an annotation review.'}
-			</span>
+			<strong>No supported media to annotate</strong>
+			<span>Attach an accessible image or browser-playable MP4 to this ShotGrid Version.</span>
 		</div>
 	)
 }
@@ -332,7 +339,7 @@ function MediaPreview({ media, name }: { media: ReviewMedia | null; name: string
 						Open source
 					</a>
 				) : (
-					<span>Playback arrives with video review</span>
+					<span>Frame-aware playback</span>
 				)}
 			</div>
 		</div>

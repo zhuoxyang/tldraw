@@ -226,8 +226,11 @@ export class ReviewMarkerTool extends StateNode {
 	override onPointerUp() {
 		const source = this.editor
 			.getCurrentPageShapes()
-			.find((shape) => shape.meta.role === REVIEW_IMAGE_ROLE)
-		if (!source || source.type !== 'image') {
+			.find(
+				(shape) =>
+					shape.meta.role === REVIEW_IMAGE_ROLE || (shape.type === 'review-video' && shape.isLocked)
+			)
+		if (!source || (source.type !== 'image' && source.type !== 'review-video')) {
 			this.editor.setCurrentTool('select')
 			return
 		}
