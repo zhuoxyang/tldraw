@@ -991,6 +991,7 @@ export const DEFAULT_EMBED_DEFINITIONS: readonly [{
         readonly 'allow-popups-to-escape-sandbox': true;
         readonly 'allow-presentation': true;
     };
+    readonly sizeToContentAspectRatio: true;
     readonly title: "YouTube";
     readonly toEmbedUrl: (url: string) => string | undefined;
     readonly type: "youtube";
@@ -1072,10 +1073,10 @@ export const DEFAULT_EMBED_DEFINITIONS: readonly [{
     readonly doesResize: true;
     readonly embedOnPaste: true;
     readonly fromEmbedUrl: (url: string) => string | undefined;
-    readonly getAspectRatio: (url: string) => Promise<number | undefined>;
     readonly height: 360;
     readonly hostnames: readonly ["vimeo.com", "player.vimeo.com"];
     readonly isAspectRatioLocked: true;
+    readonly sizeToContentAspectRatio: true;
     readonly title: "Vimeo";
     readonly toEmbedUrl: (url: string) => string | undefined;
     readonly type: "vimeo";
@@ -1320,7 +1321,7 @@ export function defaultHandleExternalTldrawContent(editor: Editor, { point, cont
 }): Promise<void>;
 
 // @public (undocumented)
-export function defaultHandleExternalUrlAsset(editor: Editor, { url }: TLUrlExternalAsset, { toasts, msg }: TLDefaultExternalContentHandlerOpts): Promise<TLBookmarkAsset>;
+export function defaultHandleExternalUrlAsset(editor: Editor, { url }: TLUrlExternalAsset, _options: TLDefaultExternalContentHandlerOpts): Promise<TLBookmarkAsset>;
 
 // @public (undocumented)
 export function defaultHandleExternalUrlContent(editor: Editor, { point, url }: {
@@ -1770,7 +1771,6 @@ export interface EmbedDefinition<Config = never> {
     readonly embedOnPaste?: boolean;
     // (undocumented)
     readonly fromEmbedUrl: (url: string) => string | undefined;
-    readonly getAspectRatio?: (url: string) => Promise<number | undefined>;
     // (undocumented)
     readonly height: number;
     // (undocumented)
@@ -1787,6 +1787,7 @@ export interface EmbedDefinition<Config = never> {
     readonly overrideOutlineRadius?: number;
     // (undocumented)
     readonly overridePermissions?: TLEmbedShapePermissions;
+    readonly sizeToContentAspectRatio?: boolean;
     // (undocumented)
     readonly title: string;
     // (undocumented)
@@ -2949,9 +2950,6 @@ export function NoteToolbarItem(): JSX.Element;
 
 // @public
 export function notifyIfFileNotAllowed(editor: Editor, file: File, options: TLDefaultExternalContentHandlerOpts): boolean;
-
-// @public
-export function oEmbedAspectRatio(endpoint: string): (url: string) => Promise<number | undefined>;
 
 // @public (undocumented)
 export function OfflineIndicator(): JSX.Element;

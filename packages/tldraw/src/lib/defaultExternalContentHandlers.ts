@@ -256,9 +256,16 @@ export async function defaultHandleExternalFileReplaceContent(
 export async function defaultHandleExternalUrlAsset(
 	editor: Editor,
 	{ url }: TLUrlExternalAsset,
-	{ toasts, msg }: TLDefaultExternalContentHandlerOpts
+	_options: TLDefaultExternalContentHandlerOpts
 ): Promise<TLBookmarkAsset> {
-	let meta: { image: string; favicon: string; title: string; description: string }
+	let meta: {
+		image: string
+		favicon: string
+		title: string
+		description: string
+		imageWidth?: number
+		imageHeight?: number
+	}
 
 	try {
 		const resp = await fetch(url, {
@@ -267,6 +274,11 @@ export async function defaultHandleExternalUrlAsset(
 		})
 		const html = await resp.text()
 		const doc = new DOMParser().parseFromString(html, 'text/html')
+		const parseOgDimension = (property: string) => {
+			const value = doc.head.querySelector(`meta[property="${property}"]`)?.getAttribute('content')
+			const parsed = value ? Number.parseInt(value, 10) : NaN
+			return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+		}
 		meta = {
 			image: doc.head.querySelector('meta[property="og:image"]')?.getAttribute('content') ?? '',
 			favicon:
@@ -276,6 +288,8 @@ export async function defaultHandleExternalUrlAsset(
 			title: doc.head.querySelector('meta[property="og:title"]')?.getAttribute('content') ?? url,
 			description:
 				doc.head.querySelector('meta[property="og:description"]')?.getAttribute('content') ?? '',
+			imageWidth: parseOgDimension('og:image:width'),
+			imageHeight: parseOgDimension('og:image:height'),
 		}
 		if (!meta.image.startsWith('http')) {
 			meta.image = new URL(meta.image, url).href
@@ -285,12 +299,14 @@ export async function defaultHandleExternalUrlAsset(
 		}
 	} catch (error) {
 		console.error(error)
-		toasts.addToast({
-			title: msg('assets.url.failed'),
-			severity: 'error',
-		})
 		meta = { image: '', favicon: '', title: '', description: '' }
 	}
+
+	// OpenGraph image dimensions ride along on `meta` so consumers (e.g. embeds) can size content by
+	// its real aspect ratio, without a bookmark asset schema change.
+	const assetMeta: { imageWidth?: number; imageHeight?: number } = {}
+	if (typeof meta.imageWidth === 'number') assetMeta.imageWidth = meta.imageWidth
+	if (typeof meta.imageHeight === 'number') assetMeta.imageHeight = meta.imageHeight
 
 	// Create the bookmark asset from the meta
 	return {
@@ -304,7 +320,7 @@ export async function defaultHandleExternalUrlAsset(
 			favicon: meta.favicon,
 			title: meta.title,
 		},
-		meta: {},
+		meta: assetMeta,
 	} as TLBookmarkAsset
 }
 

@@ -18,22 +18,12 @@ afterEach(() => {
 	editor?.dispose()
 })
 
-// Mirrors the real Vimeo definition, which is aspect-ratio-locked — important because the editor
-// treats aspect-ratio-locked shapes specially when resizing.
+// Mirrors the real Vimeo definition: aspect-ratio-locked (which the editor treats specially when
+// resizing) and opted in to content-aspect-ratio sizing. Dimensions are resolved from url metadata
+// (the unfurl path), so we also stub `getAssetForExternalContent` to return a bookmark asset whose
+// `meta` carries the image dimensions for the given ratio.
 function stubVimeoDefinition(url: string, aspectRatio: number | undefined) {
-	const util = editor.getShapeUtil('embed') as EmbedShapeUtil
-	vi.spyOn(util, 'getEmbedDefinition').mockReturnValue({
-		definition: {
-			type: 'vimeo',
-			width: 640,
-			height: 360,
-			isAspectRatioLocked: true,
-			getAspectRatio: async () => aspectRatio,
-		} as any,
-		url,
-		embedUrl: url,
-	})
-	return util
+	return stubVimeoDefinitionByUrl(aspectRatio === undefined ? {} : { [url]: aspectRatio })
 }
 
 function stubVimeoDefinitionByUrl(ratios: Record<string, number>) {
@@ -44,11 +34,17 @@ function stubVimeoDefinitionByUrl(ratios: Record<string, number>) {
 			width: 640,
 			height: 360,
 			isAspectRatioLocked: true,
-			getAspectRatio: async () => ratios[url],
+			sizeToContentAspectRatio: true,
 		} as any,
 		url,
 		embedUrl: url,
 	}))
+	vi.spyOn(editor, 'getAssetForExternalContent').mockImplementation(async (info: any) => {
+		const ratio = ratios[info.url]
+		const meta =
+			typeof ratio === 'number' ? { imageWidth: Math.round(ratio * 1000), imageHeight: 1000 } : {}
+		return { type: 'bookmark', meta } as any
+	})
 	return util
 }
 

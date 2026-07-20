@@ -818,7 +818,6 @@ export { TldrawUi, TldrawUiInFrontOfTheCanvas, type TldrawUiProps } from './lib/
 export { containBoxSize, downsizeImage, type BoxWidthHeight } from './lib/utils/assets/assets'
 export { preloadFont, type TLTypeFace } from './lib/utils/assets/preload-font'
 export { getEmbedInfo, type TLEmbedResult } from './lib/utils/embeds/embeds'
-export { oEmbedAspectRatio } from './lib/utils/embeds/oEmbed'
 export { putExcalidrawContent } from './lib/utils/excalidraw/putExcalidrawContent'
 export { copyAs, type CopyAsOptions, type TLCopyType } from './lib/utils/export/copyAs'
 export { downloadFile, exportAs, type ExportAsOptions } from './lib/utils/export/exportAs'

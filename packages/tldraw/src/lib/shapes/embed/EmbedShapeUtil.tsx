@@ -107,22 +107,26 @@ export class EmbedShapeUtil extends BaseBoxShapeUtil<TLEmbedShape> {
 	private static resolvedAspectRatios = new Map<string, number | undefined>()
 
 	/**
-	 * Resolve the embed's true aspect ratio (if its definition supports it) and correct the shape's
-	 * size to match. Fetches at most once per url. The correction is applied without adding to the
-	 * undo history.
+	 * Resolve the embed's true aspect ratio (for definitions with `sizeToContentAspectRatio`) and
+	 * correct the shape's size to match. The dimensions come from the URL's OpenGraph metadata via
+	 * the editor's url asset handler (the same "unfurl" path bookmarks use), resolved at most once
+	 * per url. The correction is applied without adding to the undo history.
 	 */
 	async resolveAspectRatio(shape: TLEmbedShape) {
 		const { url } = shape.props
 		const definition = this.getEmbedDefinition(url)?.definition
-		if (!definition?.getAspectRatio || !url) return
+		if (!definition?.sizeToContentAspectRatio || !url) return
 
 		let resolvedRatio: number | undefined
 		if (EmbedShapeUtil.resolvedAspectRatios.has(url)) {
 			resolvedRatio = EmbedShapeUtil.resolvedAspectRatios.get(url)
 		} else {
-			resolvedRatio = await definition.getAspectRatio(url)
+			resolvedRatio = await this.getContentAspectRatio(url)
 			EmbedShapeUtil.resolvedAspectRatios.set(url, resolvedRatio)
 		}
+
+		// The editor may have been torn down while the metadata was in flight.
+		if (this.editor.isDisposed) return
 
 		const latest = this.editor.getShape<TLEmbedShape>(shape.id)
 		// Bail if the shape is gone or its url changed while we were awaiting: a later run for the
@@ -156,6 +160,26 @@ export class EmbedShapeUtil extends BaseBoxShapeUtil<TLEmbedShape> {
 			},
 			{ history: 'ignore' }
 		)
+	}
+
+	/**
+	 * Resolve the content's aspect ratio from the URL's OpenGraph metadata, fetched through the
+	 * editor's url asset handler (the "unfurl" service). Returns `undefined` if no usable dimensions
+	 * are available (e.g. no unfurl service is configured, or the page reports no image size).
+	 */
+	private async getContentAspectRatio(url: string): Promise<number | undefined> {
+		try {
+			const asset = await this.editor.getAssetForExternalContent({ type: 'url', url })
+			if (!asset || asset.type !== 'bookmark') return undefined
+			const width = asset.meta.imageWidth
+			const height = asset.meta.imageHeight
+			if (typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0) {
+				return width / height
+			}
+		} catch {
+			// Resolving the aspect ratio is best-effort: never let a metadata fetch failure surface.
+		}
+		return undefined
 	}
 
 	override getText(shape: TLEmbedShape) {
