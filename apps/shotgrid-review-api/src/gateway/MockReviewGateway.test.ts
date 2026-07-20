@@ -67,6 +67,42 @@ describe('MockReviewGateway', () => {
 		})
 	})
 
+	test('derives publication links and project-scoped recipients from the selected version', async () => {
+		const gateway = new MockReviewGateway()
+
+		await expect(gateway.getNoteOptions(201, 301)).resolves.toMatchObject({
+			links: {
+				entity: { id: 501, name: 'shot_010', type: 'Shot' },
+				project: { id: 101, name: 'Project Northstar', type: 'Project' },
+				task: { id: 601, name: 'Lighting' },
+				version: { id: 301, name: 'shot_010_lgt_v014', type: 'Version' },
+			},
+			recipients: expect.arrayContaining([expect.objectContaining({ id: 11, kind: 'human' })]),
+		})
+		await expect(gateway.getNoteOptions(203, 304)).resolves.toMatchObject({
+			recipients: expect.not.arrayContaining([expect.objectContaining({ id: 11 })]),
+		})
+	})
+
+	test('creates a publication note only for a valid project recipient', async () => {
+		const gateway = new MockReviewGateway()
+
+		await expect(
+			gateway.createPublicationNote(201, 301, {
+				content: 'Valid note',
+				recipientIds: [11],
+				subject: 'Review',
+			})
+		).resolves.toMatchObject({ note: { projectId: 101, versionId: 301 } })
+		await expect(
+			gateway.createPublicationNote(203, 304, {
+				content: 'Cross-project recipient',
+				recipientIds: [11],
+				subject: 'Review',
+			})
+		).rejects.toMatchObject({ code: 'INVALID_REQUEST', status: 400 })
+	})
+
 	test('only accepts attachments for notes created by this gateway', async () => {
 		const gateway = new MockReviewGateway()
 		const attachment = {

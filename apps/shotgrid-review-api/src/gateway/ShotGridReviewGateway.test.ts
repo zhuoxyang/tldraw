@@ -670,6 +670,212 @@ describe('ShotGridReviewGateway', () => {
 		})
 	})
 
+	test('derives project-scoped note options from the selected playlist version', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeVersionResponse(''))
+			.mockResolvedValueOnce({
+				data: [
+					{
+						attributes: { image: null, login: 'reviewer', name: 'Review Lead' },
+						id: 7,
+						type: 'HumanUser',
+					},
+				],
+			})
+		const gateway = makeGateway(request)
+
+		await expect(gateway.getNoteOptions(201, 301)).resolves.toEqual({
+			links: {
+				entity: { id: 501, name: 'shot_010', type: 'Shot' },
+				project: { id: 101, name: 'Northstar', type: 'Project' },
+				task: { id: 601, name: 'Lighting' },
+				version: { id: 301, name: 'shot_010_lgt_v014', type: 'Version' },
+			},
+			recipients: [
+				{
+					avatarUrl: null,
+					id: 7,
+					kind: 'human',
+					login: 'reviewer',
+					name: 'Review Lead',
+				},
+			],
+		})
+		expect(request.mock.calls[2][0]).toBe('/entity/human_users/_search')
+		expect(request.mock.calls[2][1]?.body).toEqual({
+			filters: [
+				['projects', 'in', [{ id: 101, type: 'Project' }]],
+				['sg_status_list', 'is', 'act'],
+			],
+		})
+	})
+
+	test('publishes only server-derived links, tasks, and active project recipients', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeVersionResponse(''))
+			.mockResolvedValueOnce({ data: [{ id: 7, type: 'HumanUser' }] })
+			.mockResolvedValueOnce({
+				data: {
+					attributes: {
+						content: 'Move the highlight left',
+						created_at: '2026-07-20T00:00:00Z',
+						subject: 'Lighting note',
+					},
+					id: 401,
+					type: 'Note',
+				},
+			})
+		const gateway = makeGateway(request)
+
+		await expect(
+			gateway.createPublicationNote(201, 301, {
+				content: 'Move the highlight left',
+				recipientIds: [7],
+				subject: 'Lighting note',
+			})
+		).resolves.toMatchObject({
+			note: { id: 401, projectId: 101, versionId: 301 },
+		})
+		expect(request.mock.calls[2][1]?.body).toEqual({
+			filters: [
+				['id', 'in', [7]],
+				['projects', 'in', [{ id: 101, type: 'Project' }]],
+				['sg_status_list', 'is', 'act'],
+			],
+		})
+		expect(request.mock.calls[3]).toEqual([
+			'/entity/notes',
+			{
+				body: {
+					addressings_to: [{ id: 7, type: 'HumanUser' }],
+					content: 'Move the highlight left',
+					note_links: [
+						{ id: 301, type: 'Version' },
+						{ id: 501, type: 'Shot' },
+					],
+					project: { id: 101, type: 'Project' },
+					subject: 'Lighting note',
+					tasks: [{ id: 601, type: 'Task' }],
+				},
+				method: 'POST',
+			},
+		])
+	})
+
+	test('does not create a note for an unavailable publication recipient', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeVersionResponse(''))
+			.mockResolvedValueOnce({ data: [] })
+		const gateway = makeGateway(request)
+
+		await expect(
+			gateway.createPublicationNote(201, 301, {
+				content: 'Move the highlight left',
+				recipientIds: [999],
+				subject: 'Lighting note',
+			})
+		).rejects.toMatchObject({ code: 'INVALID_REQUEST', status: 400 })
+		expect(request).toHaveBeenCalledTimes(3)
+	})
+
+	test('bounds publication links and binds the durable Note to canonical request values', async () => {
+		const versionResponse = makeVersionResponse('')
+		versionResponse.data.attributes.code = 'v'.repeat(1_000)
+		versionResponse.data.relationships.project.data.name = 'p'.repeat(1_000)
+		versionResponse.data.relationships.entity.data.name = 'e'.repeat(1_000)
+		versionResponse.data.relationships.sg_task.data.name = 't'.repeat(1_000)
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(versionResponse)
+			.mockResolvedValueOnce({ data: [{ id: 7, type: 'HumanUser' }] })
+			.mockResolvedValueOnce({
+				data: {
+					attributes: {
+						content: 'x'.repeat(20_000),
+						created_at: 'not-a-date',
+						subject: 'x'.repeat(1_000),
+					},
+					id: 401,
+					relationships: {
+						created_by: { data: { id: 20, name: 'Unexpected', type: 'Group' } },
+					},
+					type: 'Note',
+				},
+			})
+		const gateway = makeGateway(request, { ...config, scriptName: 's'.repeat(255) })
+
+		const result = await gateway.createPublicationNote(201, 301, {
+			content: 'Move the highlight left',
+			recipientIds: [7],
+			subject: 'Lighting note',
+		})
+
+		expect(result.links).toEqual({
+			entity: { id: 501, name: 'Shot 501', type: 'Shot' },
+			project: { id: 101, name: 'Project 101', type: 'Project' },
+			task: { id: 601, name: 'Task 601' },
+			version: { id: 301, name: 'Version 301', type: 'Version' },
+		})
+		expect(result.note).toMatchObject({
+			content: 'Move the highlight left',
+			createdAt: '2026-07-20T00:00:00.000Z',
+			createdBy: { kind: 'service', login: 's'.repeat(255), name: 'ShotGrid service' },
+			subject: 'Lighting note',
+		})
+		expect(result.note.createdBy.login).toHaveLength(255)
+		expect(result.note.createdBy.name).toHaveLength(16)
+	})
+
+	test('bounds a maximum-length configured sudo actor in a publication result', async () => {
+		const sudoAsLogin = 'u'.repeat(255)
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeVersionResponse(''))
+			.mockResolvedValueOnce({ data: { id: 401, type: 'Note' } })
+		const gateway = makeGateway(request, { ...config, sudoAsLogin })
+
+		const result = await gateway.createPublicationNote(201, 301, {
+			content: 'Move the highlight left',
+			recipientIds: [],
+			subject: 'Lighting note',
+		})
+
+		expect(result.note.createdBy).toMatchObject({
+			kind: 'human',
+			login: sudoAsLogin,
+			name: sudoAsLogin,
+		})
+		expect(result.note.createdBy.login).toHaveLength(255)
+		expect(result.note.createdBy.name).toHaveLength(255)
+	})
+
+	test('rejects an invalid publication entity type before creating a Note', async () => {
+		const versionResponse = makeVersionResponse('')
+		versionResponse.data.relationships.entity.data.type = 'Shot-Type!'
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(versionResponse)
+		const gateway = makeGateway(request)
+
+		await expect(
+			gateway.createPublicationNote(201, 301, {
+				content: 'Move the highlight left',
+				recipientIds: [7],
+				subject: 'Lighting note',
+			})
+		).rejects.toMatchObject({ code: 'SHOTGRID_INVALID_RESPONSE', status: 502 })
+		expect(request).toHaveBeenCalledTimes(2)
+	})
+
 	test('does not mark note or status mutations as retryable', async () => {
 		const request = vi
 			.fn()
@@ -789,6 +995,41 @@ describe('ShotGridReviewGateway', () => {
 		expect(uploadInit?.redirect).toBe('error')
 		expect(request.mock.calls[1][0]).toBe('/entity/notes/401/_upload')
 		expect(request.mock.calls[1][1]).not.toHaveProperty('idempotent')
+	})
+
+	test('classifies a malformed attachment completion as indeterminate', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({
+				data: {
+					multipart_upload: false,
+					original_filename: 'annotation.png',
+					storage_service: 'sg',
+					timestamp: '2026-07-20T00:00:00Z',
+					upload_id: null,
+					upload_type: 'Attachment',
+				},
+				links: {
+					complete_upload: '/api/v1.1/entity/notes/401/_upload',
+					upload: 'https://studio.example.com/api/v1.1/entity/notes/401/_upload?signature=safe',
+				},
+			})
+			.mockResolvedValueOnce({ data: { id: 'not-an-id' } })
+		const uploadFetch = vi.fn<typeof fetch>(async () => new Response(undefined, { status: 204 }))
+		const gateway = makeGateway(request, config, uploadFetch)
+
+		await expect(
+			gateway.uploadAttachment({
+				contentBase64: Buffer.from('png').toString('base64'),
+				contentType: 'image/png',
+				fileName: 'annotation.png',
+				noteId: 401,
+			})
+		).rejects.toMatchObject({
+			code: 'PUBLICATION_INDETERMINATE',
+			retryable: false,
+			status: 502,
+		})
 	})
 
 	test('rejects and cancels an oversized upload response body', async () => {

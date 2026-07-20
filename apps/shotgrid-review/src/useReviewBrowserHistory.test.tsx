@@ -54,10 +54,12 @@ function createApi(overrides: Partial<ReviewApiClient> = {}): ReviewApiClient {
 	return {
 		getCurrentReviewer: vi.fn(async () => reviewer),
 		getHealth: vi.fn(async () => health),
+		getNoteOptions: vi.fn(),
 		getVersion: vi.fn(async () => version),
 		listPlaylists: vi.fn(async () => [playlist]),
 		listProjects: vi.fn(async () => [project]),
 		listVersions: vi.fn(async () => [version]),
+		publishReview: vi.fn(),
 		...overrides,
 	}
 }

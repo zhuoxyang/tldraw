@@ -1,10 +1,19 @@
-import type { ReviewApiErrorCode, ReviewApiErrorEnvelope } from './contracts'
+import type {
+	ReviewApiErrorCode,
+	ReviewApiErrorEnvelope,
+	ReviewPublicationErrorContext,
+} from './contracts'
 
 const CLIENT_MESSAGES: Record<ReviewApiErrorCode, string> = {
 	INVALID_REQUEST: 'The review request is invalid.',
 	AUTHENTICATION_REQUIRED: 'Authentication is required.',
 	PERMISSION_DENIED: 'You do not have permission to perform this review action.',
 	NOT_FOUND: 'The requested review item was not found.',
+	PUBLICATION_CONFLICT: 'This publication id was already used for different review content.',
+	PUBLICATION_INCOMPLETE:
+		'The review note was created, but its attachment is incomplete. Retry with the same publication id.',
+	PUBLICATION_INDETERMINATE:
+		'The publication outcome is uncertain. Do not publish it again; verify it in ShotGrid.',
 	INVALID_SHOTGRID_PATH: 'The requested ShotGrid operation is invalid.',
 	SHOTGRID_AUTH_FAILED: 'The review service could not authenticate with ShotGrid.',
 	SHOTGRID_PERMISSION_DENIED: 'ShotGrid did not allow this review action.',
@@ -23,6 +32,7 @@ export interface ReviewGatewayErrorOptions {
 	message?: string
 	status: number
 	retryable: boolean
+	publication?: ReviewPublicationErrorContext
 	upstreamStatus?: number
 	cause?: unknown
 }
@@ -31,6 +41,7 @@ export class ReviewGatewayError extends Error {
 	readonly code: ReviewApiErrorCode
 	readonly status: number
 	readonly retryable: boolean
+	readonly publication?: ReviewPublicationErrorContext
 	readonly upstreamStatus?: number
 
 	constructor(options: ReviewGatewayErrorOptions) {
@@ -39,6 +50,7 @@ export class ReviewGatewayError extends Error {
 		this.code = options.code
 		this.status = options.status
 		this.retryable = options.retryable
+		this.publication = options.publication
 		this.upstreamStatus = options.upstreamStatus
 	}
 
@@ -47,6 +59,7 @@ export class ReviewGatewayError extends Error {
 			error: {
 				code: this.code,
 				message: this.message,
+				...(this.publication === undefined ? undefined : { publication: this.publication }),
 				retryable: this.retryable,
 				...(this.upstreamStatus === undefined
 					? undefined

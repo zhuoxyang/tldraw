@@ -2,8 +2,10 @@ import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
 	ReviewNote,
+	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
+	ReviewPublicationLinks,
 	ReviewStatusResult,
 	ReviewUser,
 	ReviewVersion,
@@ -16,9 +18,26 @@ export interface ReviewImageProxyPayload {
 	contentType: 'image/jpeg' | 'image/png' | 'image/webp'
 }
 
+export interface CreateReviewPublicationNoteRequest {
+	content: string
+	recipientIds: number[]
+	subject: string
+}
+
+export interface ReviewPublicationNoteResult {
+	links: ReviewPublicationLinks
+	note: ReviewNote
+}
+
 export interface ReviewGateway {
 	createNote(request: CreateReviewNoteRequest): Promise<ReviewNote>
+	createPublicationNote(
+		playlistId: number,
+		versionId: number,
+		request: CreateReviewPublicationNoteRequest
+	): Promise<ReviewPublicationNoteResult>
 	getCurrentReviewer(): Promise<ReviewUser>
+	getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions>
 	getVersion(playlistId: number, versionId: number): Promise<ReviewVersion>
 	getVersionImage(
 		playlistId: number,

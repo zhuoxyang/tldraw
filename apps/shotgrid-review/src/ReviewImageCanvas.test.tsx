@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import type { ReviewImageMedia } from '@tldraw/shotgrid-review-contracts'
+import type { ReviewImageMedia, ReviewNoteOptions } from '@tldraw/shotgrid-review-contracts'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -33,7 +33,9 @@ vi.mock('tldraw', async (importOriginal) => {
 	}
 })
 
+import type { ReviewApiClient } from './reviewApiClient'
 import { ReviewImageCanvas, type ReviewAnnotationEditorProps } from './ReviewImageCanvas'
+import type { ReviewPublicationStore } from './reviewPublicationStore'
 
 const media: ReviewImageMedia = {
 	contentType: 'image/png',
@@ -43,6 +45,27 @@ const media: ReviewImageMedia = {
 	url: '/mock-media/source.png',
 	width: 1920,
 }
+const noteOptions: ReviewNoteOptions = {
+	links: {
+		entity: { id: 401, name: 'shot_010', type: 'Shot' },
+		project: { id: 101, name: 'Northstar', type: 'Project' },
+		task: { id: 501, name: 'Compositing' },
+		version: { id: 301, name: 'shot_010_v001', type: 'Version' },
+	},
+	recipients: [],
+}
+const api = {
+	getNoteOptions: vi.fn(async () => noteOptions),
+} as unknown as ReviewApiClient
+const publicationStore = {
+	addIfAbsent: vi.fn(),
+	claimForSend: vi.fn(),
+	finishSafeFailure: vi.fn(),
+	get: vi.fn(async () => null),
+	markCompleted: vi.fn(),
+	markIndeterminate: vi.fn(),
+	startNextAttempt: vi.fn(),
+} satisfies ReviewPublicationStore
 
 let cleanup: (() => void) | undefined
 
@@ -53,6 +76,14 @@ afterEach(() => {
 	imageMocks.decode.mockClear()
 	imageMocks.digest.mockClear()
 	imageMocks.renderedPersistenceKeys.length = 0
+	vi.mocked(api.getNoteOptions).mockClear()
+	publicationStore.addIfAbsent.mockClear()
+	publicationStore.claimForSend.mockClear()
+	publicationStore.finishSafeFailure.mockClear()
+	publicationStore.get.mockClear()
+	publicationStore.markCompleted.mockClear()
+	publicationStore.markIndeterminate.mockClear()
+	publicationStore.startNextAttempt.mockClear()
 })
 
 describe('ReviewImageCanvas media isolation', () => {
@@ -115,10 +146,14 @@ describe('ReviewImageCanvas media isolation', () => {
 
 function baseProps(): ReviewAnnotationEditorProps {
 	return {
+		api,
 		documentKey: 'document-301',
 		media,
 		persistenceKey: 'persistence-301',
+		playlistId: 201,
 		projectId: 101,
+		publicationAccess: { status: 'enabled' },
+		publicationStore,
 		reviewScope: 'local-dev:mock:mock',
 		versionId: 301,
 		versionName: 'shot_010_v001',

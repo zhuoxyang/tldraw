@@ -30,12 +30,16 @@ body {
 
 button,
 select,
+input,
+textarea,
 a {
 	font: inherit;
 }
 
 button,
-select {
+select,
+input,
+textarea {
 	color: inherit;
 }
 
@@ -405,6 +409,19 @@ select {
 	position: relative;
 }
 
+.review-image-editor {
+	height: 100%;
+	position: relative;
+	width: 100%;
+}
+
+.review-image-editor > .review-editor-actions {
+	position: absolute;
+	right: 0;
+	top: 0;
+	z-index: 500;
+}
+
 .review-canvas-message {
 	align-items: center;
 	background: radial-gradient(circle at 50% 35%, rgb(27 98 130 / 18%), transparent 42%), #0b121d;
@@ -476,6 +493,194 @@ select {
 
 .review-editor-actions > .review-editor-actions__error {
 	color: #fca5a5;
+}
+
+.review-publication {
+	align-items: flex-end;
+	display: flex;
+	flex-direction: column;
+	gap: 7px;
+	max-width: 100%;
+}
+
+.review-publication__form {
+	background: #111b29;
+	border: 1px solid #40516b;
+	border-radius: 9px;
+	display: grid;
+	gap: 10px;
+	max-height: min(650px, calc(100vh - 150px));
+	overflow-y: auto;
+	padding: 12px;
+	width: min(390px, calc(100vw - 70px));
+}
+
+.review-publication__heading {
+	display: grid;
+	gap: 3px;
+}
+
+.review-publication__heading strong {
+	font-size: 13px;
+}
+
+.review-publication__heading span,
+.review-publication__form > p,
+.review-publication__recipients > span {
+	color: #94a3b8;
+	font-size: 10px;
+	margin: 0;
+}
+
+.review-publication__links {
+	background: #0c1420;
+	border-radius: 7px;
+	display: grid;
+	gap: 1px;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	margin: 0;
+	overflow: hidden;
+}
+
+.review-publication__links > div {
+	background: #172233;
+	display: grid;
+	gap: 2px;
+	min-width: 0;
+	padding: 7px 8px;
+}
+
+.review-publication__links dt,
+.review-publication__form label > span,
+.review-publication__recipients legend {
+	color: #94a3b8;
+	font-size: 9px;
+	font-weight: 650;
+}
+
+.review-publication__links dd {
+	font-size: 10px;
+	margin: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.review-publication__form > label {
+	display: grid;
+	gap: 5px;
+}
+
+.review-publication__form input:not([type='checkbox']),
+.review-publication__form textarea {
+	background: #0c1420;
+	border: 1px solid #40516b;
+	border-radius: 6px;
+	font-size: 11px;
+	outline: none;
+	padding: 7px 8px;
+	resize: vertical;
+	width: 100%;
+}
+
+.review-publication__form input:focus-visible,
+.review-publication__form textarea:focus-visible {
+	border-color: #38bdf8;
+	box-shadow: 0 0 0 2px #38bdf833;
+}
+
+.review-publication__form input:disabled,
+.review-publication__form textarea:disabled {
+	color: #94a3b8;
+	opacity: 0.8;
+}
+
+.review-publication__recipients {
+	border: 1px solid #344258;
+	border-radius: 7px;
+	display: grid;
+	gap: 6px;
+	margin: 0;
+	max-height: 112px;
+	overflow-y: auto;
+	padding: 8px;
+}
+
+.review-publication__recipients label {
+	align-items: center;
+	display: flex;
+	font-size: 10px;
+	gap: 6px;
+}
+
+.review-publication__notice,
+.review-publication__success {
+	align-items: flex-start;
+	background: #17263a;
+	border: 1px solid #36516d;
+	border-radius: 7px;
+	display: flex;
+	flex-wrap: wrap;
+	font-size: 10px;
+	gap: 7px;
+	justify-content: space-between;
+	padding: 8px;
+}
+
+.review-publication__disabled {
+	background: #17263a;
+	border: 1px solid #36516d;
+	border-radius: 7px;
+	display: grid;
+	font-size: 10px;
+	gap: 4px;
+	padding: 8px;
+}
+
+.review-publication__disabled span {
+	color: #a3b1c4;
+	line-height: 1.45;
+}
+
+.review-publication__notice--error {
+	background: #351a22;
+	border-color: #713344;
+	color: #fecaca;
+}
+
+.review-publication__notice code {
+	font-size: 9px;
+	overflow-wrap: anywhere;
+}
+
+.review-publication__success {
+	background: #102c23;
+	border-color: #226044;
+	color: #bbf7d0;
+	display: grid;
+	grid-template-columns: 1fr auto;
+}
+
+.review-publication__success strong {
+	grid-column: 1 / -1;
+}
+
+.review-publication__success code,
+.review-publication__success button {
+	grid-column: 1 / -1;
+}
+
+.review-publication__success button {
+	justify-self: end;
+}
+
+.review-publication__success > .review-publication__cleanup-warning {
+	color: #fde68a;
+	grid-column: 1 / -1;
+}
+
+.review-publication__submit {
+	justify-self: end;
 }
 
 .review-image-bounds-overlay {

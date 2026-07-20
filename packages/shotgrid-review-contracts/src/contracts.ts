@@ -104,6 +104,59 @@ export interface ReviewNote {
 	createdBy: ReviewUser
 }
 
+export interface ReviewPublicationLinks {
+	project: ReviewEntityLink
+	version: ReviewEntityLink
+	entity: ReviewEntityLink | null
+	task: ReviewTaskLink | null
+}
+
+export interface ReviewNoteOptions {
+	recipients: ReviewUser[]
+	links: ReviewPublicationLinks
+}
+
+export interface ReviewPublicationAttachmentRequest {
+	fileName: string
+	contentType: 'image/png'
+	contentBase64: string
+	sha256: string
+}
+
+export interface ReviewPublicationRequest {
+	subject: string
+	content: string
+	recipientIds: ReviewEntityId[]
+	attachment: ReviewPublicationAttachmentRequest
+}
+
+export interface ReviewPublicationResult {
+	publicationId: string
+	status: 'complete'
+	note: ReviewNote
+	attachment: ReviewAttachmentResult
+	links: ReviewPublicationLinks
+}
+
+export type ReviewPublicationErrorContext =
+	| {
+			publicationId: string
+			stage: 'note-creation'
+	  }
+	| {
+			links: ReviewPublicationLinks
+			noteId: ReviewEntityId
+			publicationId: string
+			stage: 'note-created'
+	  }
+	| {
+			attachmentId?: ReviewEntityId
+			links: ReviewPublicationLinks
+			noteId: ReviewEntityId
+			publicationId: string
+			stage: 'attachment-completion'
+	  }
+
 export interface UploadReviewAttachmentRequest {
 	noteId: ReviewEntityId
 	fileName: string
@@ -135,6 +188,9 @@ export const REVIEW_API_ERROR_CODES = [
 	'AUTHENTICATION_REQUIRED',
 	'PERMISSION_DENIED',
 	'NOT_FOUND',
+	'PUBLICATION_CONFLICT',
+	'PUBLICATION_INCOMPLETE',
+	'PUBLICATION_INDETERMINATE',
 	'INVALID_SHOTGRID_PATH',
 	'SHOTGRID_AUTH_FAILED',
 	'SHOTGRID_PERMISSION_DENIED',
@@ -153,6 +209,7 @@ export interface ReviewApiErrorEnvelope {
 	error: {
 		code: ReviewApiErrorCode
 		message: string
+		publication?: ReviewPublicationErrorContext
 		retryable: boolean
 		upstreamStatus?: number
 		requestId?: string

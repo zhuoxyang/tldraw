@@ -4,7 +4,7 @@ import 'tldraw/tldraw.css'
 import { reviewConfig } from './config'
 import { createReviewApiClient } from './reviewApiClient'
 import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowser'
-import { ReviewImageCanvas } from './ReviewImageCanvas'
+import { ReviewImageCanvas, reviewPublicationAccessForReviewerKind } from './ReviewImageCanvas'
 import { useReviewBrowser } from './useReviewBrowser'
 
 const reviewApi = createReviewApiClient({ baseUrl: reviewConfig.apiBaseUrl })
@@ -201,7 +201,7 @@ function ActiveReview({
 	refreshing: boolean
 	state: ReadyReviewBrowser
 }) {
-	const { health, project, reviewer, version } = state
+	const { health, playlist, project, reviewer, version } = state
 	const reviewerIdentity =
 		reviewer.id === null ? reviewer.login || reviewer.name : String(reviewer.id)
 	const reviewerScope = `${reviewer.kind}-${encodeURIComponent(reviewerIdentity)}`
@@ -230,9 +230,6 @@ function ActiveReview({
 					<button disabled={busy || refreshing} onClick={onRefresh} type="button">
 						{refreshing ? 'Refreshing…' : 'Refresh media'}
 					</button>
-					<button disabled type="button">
-						Publish review
-					</button>
 				</div>
 			</section>
 
@@ -241,11 +238,14 @@ function ActiveReview({
 				<section className="review-canvas" aria-label={`Annotation canvas for ${version.name}`}>
 					{version.media?.kind === 'image' ? (
 						<ReviewImageCanvas
-							documentKey={canvasKey}
+							api={reviewApi}
+							documentKey={`${canvasKey}:playlist-${playlist.id}`}
 							licenseKey={reviewConfig.tldrawLicenseKey}
 							media={version.media}
 							persistenceKey={persistenceKey}
+							playlistId={playlist.id}
 							projectId={project.id}
+							publicationAccess={reviewPublicationAccessForReviewerKind(reviewer.kind)}
 							reviewScope={reviewScope}
 							versionId={version.id}
 							versionName={version.name}

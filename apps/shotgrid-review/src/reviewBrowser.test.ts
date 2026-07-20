@@ -54,12 +54,14 @@ function makeApi(overrides: Partial<ReviewApiClient> = {}): ReviewApiClient {
 			name: 'Reviewer',
 		})),
 		getHealth: vi.fn(async () => ({ mode: 'mock' as const, status: 'ok' as const })),
+		getNoteOptions: vi.fn(),
 		getVersion: vi.fn(async () => ({ ...version, media: { ...imageMedia } })),
 		listPlaylists: vi.fn(async (projectId) =>
 			projectId === 101 ? playlists.map((playlist) => ({ ...playlist })) : []
 		),
 		listProjects: vi.fn(async () => projects.map((project) => ({ ...project }))),
 		listVersions: vi.fn(async (playlistId) => (playlistId === 201 ? [{ ...version }] : [])),
+		publishReview: vi.fn(),
 		...overrides,
 	}
 }

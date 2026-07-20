@@ -6,8 +6,10 @@ import type {
 	ReviewEntityLink,
 	ReviewMedia,
 	ReviewNote,
+	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
+	ReviewPublicationLinks,
 	ReviewStatusResult,
 	ReviewTaskLink,
 	ReviewUser,
@@ -17,7 +19,12 @@ import type {
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ShotGridClient } from '../shotgrid/ShotGridClient'
-import type { ReviewGateway, ReviewImageProxyPayload } from './ReviewGateway'
+import type {
+	CreateReviewPublicationNoteRequest,
+	ReviewGateway,
+	ReviewImageProxyPayload,
+	ReviewPublicationNoteResult,
+} from './ReviewGateway'
 
 type FetchImplementation = typeof fetch
 
@@ -83,6 +90,10 @@ const MAX_REVIEW_IMAGE_DIMENSION = 8_192
 const MAX_REVIEW_IMAGE_PIXELS = 16_777_216
 const MAX_REVIEW_IMAGE_REDIRECTS = 3
 const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
+const MAX_NOTE_RECIPIENT_OPTIONS = 500
+const MAX_PUBLICATION_DISPLAY_TEXT_LENGTH = 255
+const MAX_PUBLICATION_CREATED_AT_SKEW_MS = 24 * 60 * 60 * 1000
+const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 const REVIEW_IMAGE_CONTENT_TYPES = new Set<ReviewImageProxyPayload['contentType']>([
 	'image/jpeg',
 	'image/png',
@@ -157,6 +168,55 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		}
 	}
 
+	async createPublicationNote(
+		playlistId: number,
+		versionId: number,
+		request: CreateReviewPublicationNoteRequest
+	): Promise<ReviewPublicationNoteResult> {
+		const version = await this.readVersionForPlaylist(playlistId, versionId)
+		const links = buildPublicationLinks(version)
+		const recipients = await this.requirePublicationRecipients(
+			links.project.id,
+			request.recipientIds
+		)
+		const noteLinks: ShotGridRelationship[] = [
+			{ id: versionId, type: 'Version' },
+			...(links.entity ? [{ id: links.entity.id, type: links.entity.type }] : []),
+		]
+		let note: ReviewNote
+		try {
+			const response = await this.client.request<ShotGridRecordResponse>('/entity/notes', {
+				body: {
+					addressings_to: recipients.map(({ id }) => ({ id, type: 'HumanUser' })),
+					content: request.content,
+					note_links: noteLinks,
+					project: { id: links.project.id, type: 'Project' },
+					subject: request.subject,
+					tasks: links.task ? [{ id: links.task.id, type: 'Task' }] : [],
+				},
+				method: 'POST',
+			})
+			const entity = requireResponseEntity(response, 'Note')
+			note = {
+				content: request.content,
+				createdAt: publicationCreatedAt(entity.attributes?.created_at, this.now()),
+				createdBy: this.getConfiguredActor(),
+				frame: null,
+				id: entity.id,
+				projectId: links.project.id,
+				subject: request.subject,
+				versionId,
+			}
+		} catch (error) {
+			throw publicationIndeterminate(error)
+		}
+
+		return {
+			links,
+			note,
+		}
+	}
+
 	async getCurrentReviewer(): Promise<ReviewUser> {
 		if (!this.config.sudoAsLogin) {
 			return this.getConfiguredActor()
@@ -176,6 +236,31 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			})
 		}
 		return mapUser(user)
+	}
+
+	async getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions> {
+		const version = await this.readVersionForPlaylist(playlistId, versionId)
+		const links = buildPublicationLinks(version)
+		const users = await this.search(
+			'human_users',
+			[
+				['projects', 'in', [{ id: links.project.id, type: 'Project' }]],
+				['sg_status_list', 'is', 'act'],
+			],
+			['image', 'login', 'name', 'sg_status_list'],
+			'name',
+			MAX_NOTE_RECIPIENT_OPTIONS
+		)
+		if (
+			users.some((user) => user.type !== 'HumanUser') ||
+			new Set(users.map((user) => user.id)).size !== users.length
+		) {
+			throw invalidShotGridResponse()
+		}
+		return {
+			links,
+			recipients: users.map(mapUser),
+		}
 	}
 
 	async getVersion(playlistId: number, versionId: number): Promise<ReviewVersion> {
@@ -297,28 +382,61 @@ export class ShotGridReviewGateway implements ReviewGateway {
 				? { upload_id: uploadResponse.data.upload_id }
 				: undefined),
 		}
-		const completion = await this.client.request<UploadResponse | undefined>(uploadPath, {
-			body: {
-				upload_data: { display_name: request.fileName, tags: [] },
-				upload_info: uploadInfo,
-			},
-			method: 'POST',
-		})
+		let attachmentId: number | null
+		try {
+			const completion = await this.client.request<UploadResponse | undefined>(uploadPath, {
+				body: {
+					upload_data: { display_name: request.fileName, tags: [] },
+					upload_info: uploadInfo,
+				},
+				method: 'POST',
+			})
+			attachmentId = readCompletedAttachmentId(completion)
+		} catch (error) {
+			throw publicationIndeterminate(error)
+		}
 
 		return {
 			contentType: request.contentType,
 			fileName: request.fileName,
-			id: completion?.data?.id ?? null,
+			id: attachmentId,
 			noteId: request.noteId,
 			sizeBytes: bytes.byteLength,
 		}
+	}
+
+	private async requirePublicationRecipients(projectId: number, ids: number[]) {
+		if (ids.length === 0) return []
+		const uniqueIds = [...new Set(ids)]
+		if (uniqueIds.length !== ids.length) throw invalidPublicationRecipient()
+		const users = await this.search(
+			'human_users',
+			[
+				['id', 'in', uniqueIds],
+				['projects', 'in', [{ id: projectId, type: 'Project' }]],
+				['sg_status_list', 'is', 'act'],
+			],
+			['sg_status_list'],
+			undefined,
+			50
+		)
+		const returnedIds = new Set(users.map((user) => user.id))
+		if (
+			users.length !== uniqueIds.length ||
+			returnedIds.size !== uniqueIds.length ||
+			users.some((user) => user.type !== 'HumanUser' || !uniqueIds.includes(user.id))
+		) {
+			throw invalidPublicationRecipient()
+		}
+		return users
 	}
 
 	private async search(
 		entity: string,
 		filters: unknown[],
 		fields: string[],
-		sort?: string
+		sort?: string,
+		maxEntities = MAX_SEARCH_ENTITIES
 	): Promise<ShotGridEntity[]> {
 		const entities: ShotGridEntity[] = []
 		let aggregateBytes = 0
@@ -344,14 +462,14 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			for (const item of response.data) {
 				const entity = requireEntity(item)
 				aggregateBytes += estimateEntityJsonBytes(entity)
-				if (entities.length >= MAX_SEARCH_ENTITIES || aggregateBytes > MAX_SEARCH_AGGREGATE_BYTES) {
+				if (entities.length >= maxEntities || aggregateBytes > MAX_SEARCH_AGGREGATE_BYTES) {
 					throw invalidShotGridResponse()
 				}
 				entities.push(entity)
 			}
 
 			if (!readNextLink(response)) return entities
-			if (entities.length >= MAX_SEARCH_ENTITIES) throw invalidShotGridResponse()
+			if (entities.length >= maxEntities) throw invalidShotGridResponse()
 		}
 		throw invalidShotGridResponse()
 	}
@@ -454,20 +572,22 @@ export class ShotGridReviewGateway implements ReviewGateway {
 
 	private getConfiguredActor(): ReviewUser {
 		if (this.config.sudoAsLogin) {
+			const login = publicationDisplayText(this.config.sudoAsLogin, 'ShotGrid reviewer')
 			return {
 				avatarUrl: null,
 				id: null,
 				kind: 'human',
-				login: this.config.sudoAsLogin,
-				name: this.config.sudoAsLogin,
+				login,
+				name: login,
 			}
 		}
+		const login = publicationDisplayText(this.config.scriptName, 'shotgrid-review-service')
 		return {
 			avatarUrl: null,
 			id: null,
 			kind: 'service',
-			login: this.config.scriptName,
-			name: `ShotGrid script · ${this.config.scriptName}`,
+			login,
+			name: publicationDisplayText(`ShotGrid script · ${login}`, 'ShotGrid service'),
 		}
 	}
 
@@ -646,11 +766,43 @@ function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
 	}
 }
 
+function readCompletedAttachmentId(value: unknown) {
+	if (value === undefined) return null
+	const response = readRecord(value)
+	if (!response) throw invalidShotGridResponse()
+	if (!Object.prototype.hasOwnProperty.call(response, 'data')) return null
+	const data = readRecord(response.data)
+	if (!data) throw invalidShotGridResponse()
+	if (!Object.prototype.hasOwnProperty.call(data, 'id')) return null
+	if (!Number.isSafeInteger(data.id) || Number(data.id) <= 0) throw invalidShotGridResponse()
+	return Number(data.id)
+}
+
+function buildPublicationLinks(entity: ShotGridEntity): ReviewPublicationLinks {
+	const project = readRelationship(entity.relationships, 'project')
+	if (!project || project.type !== 'Project') throw invalidShotGridResponse()
+	return {
+		entity: mapVersionEntity(readRelationship(entity.relationships, 'entity')),
+		project: {
+			id: project.id,
+			name: publicationDisplayText(project.name, `Project ${project.id}`),
+			type: 'Project',
+		},
+		task: mapVersionTask(readRelationship(entity.relationships, 'sg_task')),
+		version: {
+			id: entity.id,
+			name: publicationDisplayText(entity.attributes?.code, `Version ${entity.id}`),
+			type: 'Version',
+		},
+	}
+}
+
 function mapVersionEntity(relationship: ShotGridRelationship | null): ReviewEntityLink | null {
 	if (!relationship) return null
+	if (!SHOTGRID_ENTITY_TYPE_PATTERN.test(relationship.type)) throw invalidShotGridResponse()
 	return {
 		id: relationship.id,
-		name: relationship.name || `${relationship.type} ${relationship.id}`,
+		name: publicationDisplayText(relationship.name, `${relationship.type} ${relationship.id}`),
 		type: relationship.type,
 	}
 }
@@ -660,8 +812,28 @@ function mapVersionTask(relationship: ShotGridRelationship | null): ReviewTaskLi
 	if (relationship.type !== 'Task') throw invalidShotGridResponse()
 	return {
 		id: relationship.id,
-		name: relationship.name || `Task ${relationship.id}`,
+		name: publicationDisplayText(relationship.name, `Task ${relationship.id}`),
 	}
+}
+
+function publicationDisplayText(value: unknown, fallback: string) {
+	if (typeof value !== 'string') return fallback
+	const normalized = value.trim()
+	return normalized.length > 0 &&
+		normalized.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(normalized)
+		? normalized
+		: fallback
+}
+
+function publicationCreatedAt(value: unknown, nowMs: number) {
+	const fallback = new Date(nowMs).toISOString()
+	if (typeof value !== 'string' || value.length > 32) return fallback
+	const parsed = Date.parse(value)
+	if (!Number.isFinite(parsed) || Math.abs(parsed - nowMs) > MAX_PUBLICATION_CREATED_AT_SKEW_MS) {
+		return fallback
+	}
+	return new Date(parsed).toISOString()
 }
 
 function mapRelationshipUser(relationship: ShotGridRelationship): ReviewUser {
@@ -1140,5 +1312,23 @@ function reviewItemNotFound() {
 		code: 'NOT_FOUND',
 		retryable: false,
 		status: 404,
+	})
+}
+
+function invalidPublicationRecipient() {
+	return new ReviewGatewayError({
+		code: 'INVALID_REQUEST',
+		message: 'A selected recipient is unavailable',
+		retryable: false,
+		status: 400,
+	})
+}
+
+function publicationIndeterminate(cause: unknown) {
+	return new ReviewGatewayError({
+		cause,
+		code: 'PUBLICATION_INDETERMINATE',
+		retryable: false,
+		status: 502,
 	})
 }
