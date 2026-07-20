@@ -3,6 +3,8 @@ import {
 	type ReviewApiDataEnvelope,
 	type ReviewApiErrorCode,
 	type ReviewApiErrorEnvelope,
+	type ReviewCollaborationPresence,
+	type ReviewCollaborationSession,
 	type ReviewDecisionContext,
 	type ReviewDecisionHistoryEntry,
 	type ReviewDecisionOption,
@@ -40,6 +42,21 @@ const MAX_MEDIA_FILE_NAME_LENGTH = 255
 const DECISION_KEY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
 const DECISION_STATUS_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+const COLLABORATION_ROOM_ID_PATTERN = /^r1_[A-Za-z0-9_-]{43}$/
+const COLLABORATION_SOCKET_URL_PATTERN =
+	/^\/api\/review\/sync\/(r1_[A-Za-z0-9_-]{43})\?ticket=([A-Za-z0-9_-]{43})$/
+const COLLABORATION_HUMAN_USER_ID_PATTERN = /^user:shotgrid-human-([1-9][0-9]*)$/
+const COLLABORATION_SERVICE_USER_ID_PATTERN = /^user:shotgrid-service-[0-9a-f]{8}$/
+const REVIEW_COLLABORATION_COLORS = new Set([
+	'#FF6B6B',
+	'#4ECDC4',
+	'#45B7D1',
+	'#96CEB4',
+	'#FFEAA7',
+	'#DDA0DD',
+	'#FF9F43',
+	'#6C5CE7',
+])
 
 export function isReviewApiDataEnvelope<T>(
 	value: unknown,
@@ -66,6 +83,45 @@ export function isReviewHealth(value: unknown): value is ReviewHealth {
 		(record.mode === 'mock' || record.mode === 'shotgrid') &&
 		record.status === 'ok'
 	)
+}
+
+export function isReviewCollaborationSession(value: unknown): value is ReviewCollaborationSession {
+	const record = readRecord(value)
+	if (
+		record === null ||
+		!hasOnlyKeys(record, ['permission', 'roomId', 'socketUrl', 'ticketExpiresAt']) ||
+		typeof record.roomId !== 'string' ||
+		!COLLABORATION_ROOM_ID_PATTERN.test(record.roomId) ||
+		(record.permission !== 'editor' && record.permission !== 'viewer') ||
+		typeof record.socketUrl !== 'string' ||
+		!isCanonicalIsoTimestamp(record.ticketExpiresAt)
+	) {
+		return false
+	}
+
+	const socketUrlMatch = COLLABORATION_SOCKET_URL_PATTERN.exec(record.socketUrl)
+	return socketUrlMatch !== null && socketUrlMatch[1] === record.roomId
+}
+
+export function isReviewCollaborationPresence(
+	value: unknown
+): value is ReviewCollaborationPresence {
+	const record = readRecord(value)
+	if (
+		record === null ||
+		!hasOnlyKeys(record, ['color', 'userId', 'userName']) ||
+		typeof record.userId !== 'string' ||
+		!isNonEmptyString(record.userName) ||
+		typeof record.color !== 'string' ||
+		!REVIEW_COLLABORATION_COLORS.has(record.color)
+	) {
+		return false
+	}
+
+	const humanMatch = COLLABORATION_HUMAN_USER_ID_PATTERN.exec(record.userId)
+	return humanMatch !== null
+		? isPositiveId(Number(humanMatch[1]))
+		: COLLABORATION_SERVICE_USER_ID_PATTERN.test(record.userId)
 }
 
 export function isReviewUser(value: unknown): value is ReviewUser {
@@ -490,6 +546,12 @@ function isBoundedTimestamp(value: unknown): value is string {
 		value.length <= MAX_PUBLICATION_TIMESTAMP_LENGTH &&
 		Number.isFinite(Date.parse(value))
 	)
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+	if (typeof value !== 'string' || value.length !== 24) return false
+	const parsed = new Date(value)
+	return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
 }
 
 function isBoundedPublicationLinks(value: unknown): value is ReviewPublicationLinks {

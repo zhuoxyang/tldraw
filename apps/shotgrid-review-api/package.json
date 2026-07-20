@@ -4,7 +4,13 @@
 	"private": true,
 	"type": "module",
 	"dependencies": {
-		"@tldraw/shotgrid-review-contracts": "workspace:*"
+		"@tldraw/shotgrid-review-contracts": "workspace:*",
+		"@tldraw/sync-core": "workspace:*",
+		"@tldraw/tlschema": "workspace:*",
+		"@tldraw/validate": "workspace:*",
+		"react": "^19.2.1",
+		"react-dom": "^19.2.1",
+		"ws": "^8.18.0"
 	},
 	"scripts": {
 		"dev": "yarn run -T tsx watch src/server.ts",
@@ -15,6 +21,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^22.15.31",
+		"@types/ws": "^8.18.1",
 		"esbuild": "^0.28.0",
 		"tsx": "^4.19.2",
 		"typescript": "^5.8.3",

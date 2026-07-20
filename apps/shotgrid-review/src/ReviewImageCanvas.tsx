@@ -24,6 +24,7 @@ import {
 	useEditor,
 	type Editor,
 	type TLComponents,
+	type TLStore,
 	type TLShapeId,
 	type TLUiOverrides,
 } from 'tldraw'
@@ -71,6 +72,7 @@ import {
 	reviewPublicationStore as defaultReviewPublicationStore,
 	type ReviewPublicationStore,
 } from './reviewPublicationStore'
+import { reviewVideoShapeUtils } from './reviewVideoShape'
 
 const REVIEW_EDITOR_OPTIONS = { maxPages: 1, selectLockedShapes: false } as const
 const REVIEW_TOOLS = new Set(['arrow', 'draw', 'rectangle', 'review-marker', 'select', 'text'])
@@ -117,7 +119,9 @@ const reviewUiOverrides: TLUiOverrides = {
 }
 
 export interface ReviewAnnotationEditorProps {
+	allowSnapshotImport?: boolean
 	api: ReviewApiClient
+	collaborationReadOnly?: boolean
 	documentKey: string
 	licenseKey?: string
 	media: ReviewImageMedia
@@ -127,6 +131,7 @@ export interface ReviewAnnotationEditorProps {
 	publicationAccess: ReviewPublicationAccess
 	publicationStore?: ReviewPublicationStore
 	reviewScope: string
+	store?: TLStore
 	versionId: number
 	versionName: string
 }
@@ -231,7 +236,9 @@ export function ReviewImageCanvas(props: ReviewAnnotationEditorProps) {
 }
 
 function ReadyReviewAnnotationEditor({
+	allowSnapshotImport = true,
 	api,
+	collaborationReadOnly = false,
 	documentKey,
 	image,
 	licenseKey,
@@ -242,6 +249,7 @@ function ReadyReviewAnnotationEditor({
 	publicationStore = defaultReviewPublicationStore,
 	refreshWarning,
 	reviewScope,
+	store,
 	versionName,
 }: ReviewAnnotationEditorProps & { image: LoadedReviewImage; refreshWarning?: string }) {
 	const [editor, setEditor] = useState<Editor | null>(null)
@@ -262,6 +270,8 @@ function ReadyReviewAnnotationEditor({
 	const publicationStorageKey = `${documentKey}:publication:playlist-${playlistId}:version-${image.versionId}`
 	const publicationContextRef = useRef<PublicationContext | null>(null)
 	const readonlyRestoreRef = useRef<null | (() => void)>(null)
+	const collaborationReadOnlyRef = useRef(collaborationReadOnly)
+	collaborationReadOnlyRef.current = collaborationReadOnly
 	const noteOptionsRef = useRef(noteOptions)
 	noteOptionsRef.current = noteOptions
 	const review = useMemo<ReviewAnnotationContext>(
@@ -281,6 +291,11 @@ function ReadyReviewAnnotationEditor({
 		disableReviewExternalContent(mountedEditor)
 		setEditor(mountedEditor)
 	}, [])
+
+	useEffect(() => {
+		if (!editor) return
+		editor.updateInstanceState({ isReadonly: collaborationReadOnly })
+	}, [collaborationReadOnly, editor])
 
 	useLayoutEffect(() => {
 		const context: PublicationContext = {
@@ -382,24 +397,46 @@ function ReadyReviewAnnotationEditor({
 	useEffect(() => {
 		if (!editor) return
 		const controller = new AbortController()
-		setInstallation({ label: 'Installing protected source image', status: 'working' })
-		void installReviewImage(editor, image, controller.signal)
-			.then(() => {
+		let installing = false
+		const localOnly = store !== undefined
+		const install = async (announce: boolean) => {
+			if (installing || controller.signal.aborted) return
+			installing = true
+			if (announce) {
+				setInstallation({ label: 'Installing protected source image', status: 'working' })
+			}
+			try {
+				await installReviewImage(editor, image, controller.signal, { localOnly })
 				if (controller.signal.aborted) return
 				protectionRef.current?.()
-				protectionRef.current = protectReviewImage(editor, image)
+				protectionRef.current = protectReviewImage(editor, image, { localOnly })
 				setInstallation({ status: 'idle' })
-			})
-			.catch((error) => {
-				if (controller.signal.aborted) return
-				setInstallation({ message: editorErrorMessage(error), status: 'error' })
-			})
+			} catch (error) {
+				if (!controller.signal.aborted) {
+					setInstallation({ message: editorErrorMessage(error), status: 'error' })
+				}
+			} finally {
+				installing = false
+			}
+		}
+		setInstallation({ label: 'Installing protected source image', status: 'working' })
+		void install(true)
+		const stopWatching = localOnly
+			? editor.store.listen(
+					() => {
+						const { assetId, shapeId } = getReviewImageIds(image.versionId)
+						if (!editor.getAsset(assetId) || !editor.getShape(shapeId)) void install(false)
+					},
+					{ scope: 'document', source: 'remote' }
+				)
+			: undefined
 		return () => {
 			controller.abort()
+			stopWatching?.()
 			protectionRef.current?.()
 			protectionRef.current = null
 		}
-	}, [editor, image])
+	}, [editor, image, store])
 
 	const saveEditable = useCallback(() => {
 		if (!editor || installation.status !== 'idle' || operationInFlightRef.current) return
@@ -497,7 +534,9 @@ function ReadyReviewAnnotationEditor({
 						restoreEditing = () => {
 							if (restored) return
 							restored = true
-							editor.updateInstanceState({ isReadonly: wasReadonly })
+							editor.updateInstanceState({
+								isReadonly: wasReadonly || collaborationReadOnlyRef.current,
+							})
 							if (readonlyRestoreRef.current === restoreEditing) {
 								readonlyRestoreRef.current = null
 							}
@@ -897,7 +936,8 @@ function ReadyReviewAnnotationEditor({
 				onMount={handleMount}
 				options={REVIEW_EDITOR_OPTIONS}
 				overrides={reviewUiOverrides}
-				{...(persistenceKey ? { persistenceKey } : {})}
+				{...(store ? { store } : persistenceKey ? { persistenceKey } : {})}
+				shapeUtils={reviewVideoShapeUtils}
 				tools={[ReviewMarkerTool]}
 			/>
 			<ReviewEditorActions
@@ -905,7 +945,7 @@ function ReadyReviewAnnotationEditor({
 				disabled={editorActionsDisabled}
 				noteOptions={noteOptions}
 				onExport={() => void exportPng()}
-				onOpen={(file) => void openEditable(file)}
+				onOpen={allowSnapshotImport ? (file) => void openEditable(file) : undefined}
 				onPublish={(draft) => void publishReview(draft)}
 				onRetryNoteOptions={() => setNoteOptionsAttempt((value) => value + 1)}
 				onSave={saveEditable}
@@ -949,7 +989,7 @@ function ReviewEditorActions({
 	disabled: boolean
 	noteOptions: ReviewNoteOptionsState
 	onExport(): void
-	onOpen(file: File): void
+	onOpen?(file: File): void
 	onPublish(value: ReviewPublicationFormValue): void
 	onRetryNoteOptions(): void
 	onSave(): void
@@ -965,24 +1005,28 @@ function ReviewEditorActions({
 				<button disabled={disabled} onClick={onSave} type="button">
 					Save editable
 				</button>
-				<button disabled={disabled} onClick={() => inputRef.current?.click()} type="button">
-					Open editable
-				</button>
+				{onOpen ? (
+					<button disabled={disabled} onClick={() => inputRef.current?.click()} type="button">
+						Open editable
+					</button>
+				) : null}
 				<button disabled={disabled} onClick={onExport} type="button">
 					Export PNG
 				</button>
-				<input
-					accept="application/json,.json"
-					aria-label="Open editable review snapshot"
-					hidden
-					onChange={(event) => {
-						const file = event.currentTarget.files?.[0]
-						event.currentTarget.value = ''
-						if (file) onOpen(file)
-					}}
-					ref={inputRef}
-					type="file"
-				/>
+				{onOpen ? (
+					<input
+						accept="application/json,.json"
+						aria-label="Open editable review snapshot"
+						hidden
+						onChange={(event) => {
+							const file = event.currentTarget.files?.[0]
+							event.currentTarget.value = ''
+							if (file) onOpen(file)
+						}}
+						ref={inputRef}
+						type="file"
+					/>
+				) : null}
 			</div>
 			{publicationAccess.status === 'disabled' ? (
 				<div className="review-publication__disabled" role="note">

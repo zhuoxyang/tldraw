@@ -4,6 +4,7 @@ import 'tldraw/tldraw.css'
 import { reviewConfig } from './config'
 import { createReviewApiClient } from './reviewApiClient'
 import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowser'
+import { ReviewCollaborationCanvas } from './ReviewCollaborationCanvas'
 import { ReviewDecisionPanel, reviewDecisionAccessForReviewerKind } from './ReviewDecisionPanel'
 import { ReviewImageCanvas, reviewPublicationAccessForReviewerKind } from './ReviewImageCanvas'
 import { ReviewVideoCanvas } from './ReviewVideoCanvas'
@@ -209,7 +210,6 @@ function ActiveReview({
 	const reviewerScope = `${reviewer.kind}-${encodeURIComponent(reviewerIdentity)}`
 	const gatewayScope = `${reviewConfig.dataMode}-${health.mode}-${encodeURIComponent(reviewConfig.apiBaseUrl)}`
 	const canvasKey = `shotgrid-review:v4:${reviewConfig.storageNamespace}:${gatewayScope}:project-${project.id}:version-${version.id}:user-${reviewerScope}`
-	const persistenceKey = reviewer.kind === 'service' ? undefined : canvasKey
 	const reviewApiOrigin = new URL(reviewConfig.apiBaseUrl, globalThis.location.href).origin
 	const reviewScope = `${reviewConfig.storageNamespace}:${reviewConfig.dataMode}:${health.mode}:${encodeURIComponent(reviewApiOrigin)}:${encodeURIComponent(reviewConfig.apiBaseUrl)}`
 
@@ -246,32 +246,49 @@ function ActiveReview({
 			<div className="review-stage">
 				<VersionInspector version={version} />
 				<section className="review-canvas" aria-label={`Annotation canvas for ${version.name}`}>
-					{version.media?.kind === 'image' ? (
-						<ReviewImageCanvas
+					{version.media ? (
+						<ReviewCollaborationCanvas
 							api={reviewApi}
-							documentKey={`${canvasKey}:playlist-${playlist.id}`}
-							licenseKey={reviewConfig.tldrawLicenseKey}
+							apiBaseUrl={reviewConfig.apiBaseUrl}
 							media={version.media}
-							persistenceKey={persistenceKey}
 							playlistId={playlist.id}
-							projectId={project.id}
-							publicationAccess={reviewPublicationAccessForReviewerKind(reviewer.kind)}
-							reviewScope={reviewScope}
+							reviewer={reviewer}
 							versionId={version.id}
-							versionName={version.name}
-						/>
-					) : version.media?.kind === 'video' ? (
-						<ReviewVideoCanvas
-							documentKey={`${canvasKey}:playlist-${playlist.id}`}
-							key={`${canvasKey}:playlist-${playlist.id}:attachment-${version.media.attachmentId}`}
-							licenseKey={reviewConfig.tldrawLicenseKey}
-							media={version.media}
-							persistenceKey={persistenceKey}
-							projectId={project.id}
-							reviewScope={reviewScope}
-							versionId={version.id}
-							versionName={version.name}
-						/>
+						>
+							{(store, collaboration) =>
+								version.media?.kind === 'image' ? (
+									<ReviewImageCanvas
+										allowSnapshotImport={false}
+										api={reviewApi}
+										collaborationReadOnly={collaboration.isViewer || collaboration.isOffline}
+										documentKey={`${canvasKey}:playlist-${playlist.id}`}
+										licenseKey={reviewConfig.tldrawLicenseKey}
+										media={version.media}
+										playlistId={playlist.id}
+										projectId={project.id}
+										publicationAccess={reviewPublicationAccessForReviewerKind(reviewer.kind)}
+										reviewScope={reviewScope}
+										store={store}
+										versionId={version.id}
+										versionName={version.name}
+									/>
+								) : version.media?.kind === 'video' ? (
+									<ReviewVideoCanvas
+										allowSnapshotImport={false}
+										collaborationReadOnly={collaboration.isViewer || collaboration.isOffline}
+										documentKey={`${canvasKey}:playlist-${playlist.id}`}
+										key={`${canvasKey}:playlist-${playlist.id}:attachment-${version.media.attachmentId}`}
+										licenseKey={reviewConfig.tldrawLicenseKey}
+										media={version.media}
+										projectId={project.id}
+										reviewScope={reviewScope}
+										store={store}
+										versionId={version.id}
+										versionName={version.name}
+									/>
+								) : null
+							}
+						</ReviewCollaborationCanvas>
 					) : (
 						<UnavailableAnnotationCanvas />
 					)}

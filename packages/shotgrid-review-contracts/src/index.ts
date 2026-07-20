@@ -1,10 +1,13 @@
-export { REVIEW_API_ERROR_CODES } from './contracts'
+export { createReviewCollaborationPresence, REVIEW_API_ERROR_CODES } from './contracts'
 export type {
 	CreateReviewNoteRequest,
 	ReviewApiDataEnvelope,
 	ReviewApiErrorCode,
 	ReviewApiErrorEnvelope,
 	ReviewAttachmentResult,
+	ReviewCollaborationPermission,
+	ReviewCollaborationPresence,
+	ReviewCollaborationSession,
 	ReviewDecisionContext,
 	ReviewDecisionHistoryEntry,
 	ReviewDecisionOption,
@@ -37,6 +40,8 @@ export {
 	isReviewArrayOf,
 	isReviewEntityLink,
 	isReviewAttachmentResult,
+	isReviewCollaborationPresence,
+	isReviewCollaborationSession,
 	isReviewDecisionContext,
 	isReviewDecisionHistoryEntry,
 	isReviewDecisionOption,

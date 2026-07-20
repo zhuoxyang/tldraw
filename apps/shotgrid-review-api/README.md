@@ -19,6 +19,10 @@ REVIEW_API_TRUSTED_PROXY_TOKEN=... # at least 32 random characters
 SHOTGRID_REVIEW_PUBLICATION_STORE_DIR=/var/lib/shotgrid-review-publications
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS=10000 # optional
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES=4194304 # optional; minimum 1048576
+REVIEW_SYNC_SECRET=... # at least 32 random characters; back up separately and do not rotate casually
+SHOTGRID_REVIEW_SYNC_STORE_DIR=/var/lib/shotgrid-review-sync
+SHOTGRID_REVIEW_SYNC_MAX_ROOMS=100 # optional; active rooms in this process, maximum 1000
+SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM=16 # optional; maximum 100
 SHOTGRID_SUDO_AS_LOGIN=reviewer@example.com # optional
 SHOTGRID_REVIEW_DECISIONS_JSON=[{"key":"approve","label":"Approve","statusCode":"apr"},{"key":"needs-changes","label":"Needs changes","statusCode":"chg"}]
 SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE=unknown # constant, variable, or unknown
@@ -38,6 +42,12 @@ Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browse
 
 In ShotGrid mode, deploy this service behind a trusted reverse proxy. The proxy must authenticate and authorize every user and action, strip any browser-supplied `X-Review-Proxy-Token` and `X-Review-Authenticated-Login` headers, then inject the server-only proxy token. When `SHOTGRID_SUDO_AS_LOGIN` is configured, the proxy must also inject that exact login so the authenticated identity is bound to ShotGrid impersonation. The proxy token must never be sent to browser code or exposed through CORS.
 
+The same proxy must serve the browser application and `/api` under one origin and forward WebSocket
+Upgrade requests for `/api/review/sync/*` to this Node process without rewriting the path or query.
+The API rejects a WebSocket whose `Origin` does not exactly match `REVIEW_APP_ORIGIN`. Do not expose
+the Node port as a second browser origin, terminate a sync connection as ordinary HTTP, or log its
+short-lived one-use ticket query value.
+
 Live note-option lookup, publication, decision context, and decision updates require
 `SHOTGRID_SUDO_AS_LOGIN`. A ShotGrid script identity may browse review data, but the API rejects
 these human-review actions with `403 PERMISSION_DENIED` even when the request presents a valid
@@ -51,6 +61,72 @@ without mappings so a script identity can remain browse-only; decision routes th
 configured code must be valid and not hidden for that Project.
 
 Project and entity authorization remains the reverse proxy's responsibility until the permission hardening work in issue #12 is complete.
+
+Production mapping from the proxy-authenticated person to a distinct ShotGrid human reviewer is
+still tracked by issue #2. Until that trusted-proxy identity mapping is deployed, configuring one
+`SHOTGRID_SUDO_AS_LOGIN` does not prove true per-person identity for a multi-user rollout. The sync
+service binds each connection to the reviewer returned by the gateway: a human reviewer receives
+editor access, while a shared ShotGrid service identity receives viewer access and cannot create,
+change, or delete shared annotations.
+
+## Collaborative review storage and deployment
+
+`POST /api/review/playlists/:playlistId/versions/:versionId/collaboration-session` verifies the
+Playlist/Version relationship and returns a short-lived, one-use WebSocket ticket. The browser then
+connects to the returned `/api/review/sync/*` path. Never cache, replay, persist, or place these
+tickets in application logs.
+
+Each review room is stored as SQLite state below `SHOTGRID_REVIEW_SYNC_STORE_DIR`. The synchronized
+records contain tldraw document state and annotations only. ShotGrid media bytes, source asset bytes,
+and media URLs remain local to each browser and are not written to the sync database. Apply the same
+access control, backup, retention, disk-space, and inode monitoring used for other review metadata.
+
+The current SQLite room owner is deliberately a single Node process. Run exactly one API process or
+replica for a deployment, mount the sync store on a durable persistent volume with exclusive
+read/write access, and route every collaboration request and upgraded socket to that process. Do not
+share the directory between replicas or use pod-local ephemeral storage. Horizontal scaling,
+distributed room ownership, and multi-writer SQLite are not supported by this version.
+
+`REVIEW_SYNC_SECRET` derives stable opaque room identities as well as authorizing temporary tickets.
+Store it in the deployment's secret manager and include it in the recovery plan. Restoring the
+SQLite directory with a different secret or a different deployment/site scope makes existing rooms
+unreachable through their original identities. The mock-mode defaults are for local development
+only; live mode requires an absolute store path and a secret containing at least 32 characters.
+
+The default process limits are 100 active rooms and 16 concurrent sessions per room. Lower
+`SHOTGRID_REVIEW_SYNC_MAX_ROOMS` or `SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM` to fit measured CPU,
+memory, file-descriptor, and proxy connection budgets. Capacity rejection is fail-closed and is
+reported to the browser as collaboration unavailable; raising a limit does not make a multi-replica
+deployment safe.
+
+Each client sync message is limited to 1 MiB in total, including messages split across WebSocket
+frames, and to at most 1,024 chunks. The WebSocket transport also rejects any individual frame over
+1 MiB. Keep reverse-proxy limits compatible with these bounds; malformed, oversized, or unbounded
+chunk sequences are disconnected instead of being buffered by the room process.
+
+### Operational verification
+
+Perform these checks in a staging deployment before enabling reviewers:
+
+1. Start the single API replica with the production-style origin, durable directory, and secret.
+   Confirm `GET /api/health` returns `{"mode":"shotgrid","status":"ok"}` (or `mock` in a local
+   smoke test). This endpoint proves only that the process is serving requests; it does not probe
+   SQLite durability or an upgraded WebSocket.
+2. Through the public same-origin proxy, open the same canonical review URL in two separately
+   authenticated browser sessions. Confirm the WebSocket upgrades successfully and a human
+   reviewer's annotation appears in the second session without a refresh. Confirm a service
+   reviewer is visibly read-only and cannot create, change, or delete that annotation.
+3. Exercise the configured session and active-room ceilings in staging. Confirm excess connections
+   fail closed as collaboration unavailable, existing rooms remain usable, and proxy/API metrics
+   expose the rejection without recording ticket query values.
+4. Create and sync a distinctive annotation, close every client, stop the API cleanly, and back up
+   `SHOTGRID_REVIEW_SYNC_STORE_DIR` plus the separately managed `REVIEW_SYNC_SECRET`. Restart with
+   the same volume, secret, deployment scope, and one replica; reopen the same Version and confirm
+   the annotation is restored while the media is fetched again through the normal media route.
+5. Test disaster recovery with the API stopped: restore the directory to an exclusively mounted
+   durable volume, restore the same secret from the secret manager, start one replica, repeat the
+   two-browser check, and inspect logs for SQLite or schema errors. Never copy or restore a live
+   database underneath a running room owner.
 
 The publication store directory is required in ShotGrid mode. It contains no annotation image
 bytes or credentials; it persists publication fingerprints, Note subjects and content, derived
@@ -89,8 +165,12 @@ per-IP request-rate, concurrent-request, and body-size limits before traffic rea
 - `GET /api/review/playlists/:playlistId/versions/:versionId/media/video/:attachmentId`
 - `GET /api/review/playlists/:playlistId/versions/:versionId/note-options`
 - `GET /api/review/playlists/:playlistId/versions/:versionId/decision-context`
+- `POST /api/review/playlists/:playlistId/versions/:versionId/collaboration-session`
 - `PUT /api/review/playlists/:playlistId/versions/:versionId/decision`
 - `PUT /api/review/playlists/:playlistId/versions/:versionId/publications/:publicationId`
+
+The collaboration session route returns the authorization descriptor for the WebSocket connection;
+`/api/review/sync/:roomId` is an Upgrade endpoint rather than a JSON browsing route.
 
 The single-Version route verifies Playlist membership and rereads the standard ShotGrid media fields.
 Clients use it when a Version opens or refreshes so expiring ShotGrid media references are renewed.

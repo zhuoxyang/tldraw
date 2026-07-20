@@ -10,6 +10,7 @@ import {
 	type TLImageShape,
 	type TLShape,
 } from 'tldraw'
+import { runReviewSystemMutation } from './reviewSystemMutation'
 
 const REVIEW_IMAGE_ROLE = 'shotgrid-review-source'
 const REVIEW_MARKER_ROLE = 'shotgrid-review-numbered-marker'
@@ -47,7 +48,8 @@ export function disableReviewExternalContent(editor: Editor) {
 export async function installReviewImage(
 	editor: Editor,
 	image: LoadedReviewImage,
-	signal?: AbortSignal
+	signal?: AbortSignal,
+	options: { localOnly?: boolean } = {}
 ) {
 	const { assetId, shapeId } = getReviewImageIds(image.versionId)
 	const file = new File(
@@ -86,71 +88,102 @@ export async function installReviewImage(
 	const existingAsset = editor.getAsset(assetId)
 	const existingShape = editor.getShape(shapeId)
 	const createdBackground = !existingShape
-	editor.run(
-		() => {
-			if (existingShape && existingShape.type !== 'image') editor.deleteShape(existingShape)
-			if (existingAsset && existingAsset.type !== 'image') editor.deleteAssets([existingAsset])
+	const install = () =>
+		runReviewSystemMutation(editor, () =>
+			editor.run(
+				() => {
+					if (existingShape && existingShape.type !== 'image') editor.deleteShape(existingShape)
+					if (existingAsset && existingAsset.type !== 'image') editor.deleteAssets([existingAsset])
 
-			if (editor.getAsset(assetId)) editor.updateAssets([asset])
-			else editor.createAssets([asset])
+					if (editor.getAsset(assetId)) editor.updateAssets([asset])
+					else editor.createAssets([asset])
 
-			const currentShape = editor.getShape(shapeId)
-			if (currentShape?.type === 'image') {
-				editor.updateShape<TLImageShape>({
-					id: shapeId,
-					isLocked: true,
-					meta: imageMeta(image),
-					opacity: 1,
-					props: getReviewImageShapeProps(image, assetId),
-					rotation: 0,
-					type: 'image',
-					x: 0,
-					y: 0,
-				})
-			} else {
-				editor.createShape<TLImageShape>({
-					id: shapeId,
-					isLocked: true,
-					meta: imageMeta(image),
-					opacity: 1,
-					props: getReviewImageShapeProps(image, assetId),
-					rotation: 0,
-					type: 'image',
-					x: 0,
-					y: 0,
-				})
-			}
+					const currentShape = editor.getShape(shapeId)
+					if (currentShape?.type === 'image') {
+						editor.updateShape<TLImageShape>({
+							id: shapeId,
+							isLocked: true,
+							meta: imageMeta(image),
+							opacity: 1,
+							props: getReviewImageShapeProps(image, assetId),
+							rotation: 0,
+							type: 'image',
+							x: 0,
+							y: 0,
+						})
+					} else {
+						editor.createShape<TLImageShape>({
+							id: shapeId,
+							isLocked: true,
+							meta: imageMeta(image),
+							opacity: 1,
+							props: getReviewImageShapeProps(image, assetId),
+							rotation: 0,
+							type: 'image',
+							x: 0,
+							y: 0,
+						})
+					}
 
-			const background = editor.getShape(shapeId)
-			if (background && background.parentId !== editor.getCurrentPageId()) {
-				editor.moveShapesToPage([background], editor.getCurrentPageId())
-			}
-			editor.sendToBack([shapeId])
-		},
-		{ history: 'ignore', ignoreShapeLock: true }
-	)
+					const background = editor.getShape(shapeId)
+					if (background && background.parentId !== editor.getCurrentPageId()) {
+						editor.moveShapesToPage([background], editor.getCurrentPageId())
+					}
+					editor.sendToBack([shapeId])
+				},
+				{ history: 'ignore', ignoreShapeLock: true }
+			)
+		)
+	if (options.localOnly) editor.store.mergeRemoteChanges(install)
+	else install()
 
 	configureReviewCamera(editor, image, createdBackground)
 	return { assetId, createdBackground, shapeId }
 }
 
-export function protectReviewImage(editor: Editor, image: LoadedReviewImage) {
+export function protectReviewImage(
+	editor: Editor,
+	image: LoadedReviewImage,
+	options: { localOnly?: boolean } = {}
+) {
 	const { assetId, shapeId } = getReviewImageIds(image.versionId)
+	let disposed = false
+	let repairScheduled = false
 	const ensureBackgroundIsBottom = () => {
 		const shape = editor.getShape(shapeId)
 		if (!shape) return
 		const siblings = editor.getSortedChildIdsForParent(shape.parentId)
-		if (siblings[0] !== shapeId) {
-			editor.run(() => editor.sendToBack([shapeId]), {
-				history: 'ignore',
-				ignoreShapeLock: true,
-			})
+		if (siblings[0] === shapeId) return
+		const sendToBack = () =>
+			runReviewSystemMutation(editor, () =>
+				editor.run(() => editor.sendToBack([shapeId]), {
+					history: 'ignore',
+					ignoreShapeLock: true,
+				})
+			)
+		if (!options.localOnly) {
+			sendToBack()
+			return
 		}
+		if (repairScheduled) return
+		repairScheduled = true
+		queueMicrotask(() => {
+			repairScheduled = false
+			if (disposed) return
+			const current = editor.getShape(shapeId)
+			if (!current || editor.getSortedChildIdsForParent(current.parentId)[0] === shapeId) {
+				return
+			}
+			// Side-effect callbacks run inside a Store atomic operation. Defer the local-only
+			// repair so mergeRemoteChanges cannot nest and the source index is never uploaded.
+			editor.store.mergeRemoteChanges(sendToBack)
+		})
 	}
 
 	const disposers = [
-		editor.sideEffects.registerBeforeChangeHandler('shape', (previous, next) => {
+		editor.sideEffects.registerBeforeChangeHandler('shape', (previous, next, source) => {
 			if (next.id !== shapeId) return next
+			if (source === 'remote') return next
 			if (next.type !== 'image' || previous.type !== 'image') return previous
 			return {
 				...next,
@@ -164,17 +197,20 @@ export function protectReviewImage(editor: Editor, image: LoadedReviewImage) {
 				y: 0,
 			}
 		}),
-		editor.sideEffects.registerBeforeDeleteHandler('shape', (shape) => {
-			if (shape.id === shapeId) return false
+		editor.sideEffects.registerBeforeDeleteHandler('shape', (shape, source) => {
+			if (source !== 'remote' && shape.id === shapeId) return false
 		}),
-		editor.sideEffects.registerBeforeDeleteHandler('asset', (asset) => {
-			if (asset.id === assetId) return false
+		editor.sideEffects.registerBeforeDeleteHandler('asset', (asset, source) => {
+			if (source !== 'remote' && asset.id === assetId) return false
 		}),
 		editor.sideEffects.registerAfterCreateHandler('shape', ensureBackgroundIsBottom),
 		editor.sideEffects.registerAfterChangeHandler('shape', ensureBackgroundIsBottom),
 	]
 	ensureBackgroundIsBottom()
-	return () => disposers.forEach((dispose) => dispose())
+	return () => {
+		disposed = true
+		disposers.forEach((dispose) => dispose())
+	}
 }
 
 export function getReviewCameraOptions(width: number, height: number): Partial<TLCameraOptions> {

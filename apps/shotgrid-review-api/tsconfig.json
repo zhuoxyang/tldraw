@@ -8,5 +8,10 @@
 		"noEmit": true,
 		"types": ["node", "vitest/globals"]
 	},
-	"references": [{ "path": "../../packages/shotgrid-review-contracts" }]
+	"references": [
+		{ "path": "../../packages/shotgrid-review-contracts" },
+		{ "path": "../../packages/sync-core" },
+		{ "path": "../../packages/tlschema" },
+		{ "path": "../../packages/validate" }
+	]
 }

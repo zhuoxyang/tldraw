@@ -47,6 +47,33 @@ function createMockSocket(overrides: Partial<WebSocketMinimal> = {}): WebSocketM
 	}
 }
 
+function createEventedMockSocket() {
+	type SocketEventType = 'message' | 'close' | 'error'
+	const listeners: Record<SocketEventType, Set<(event: any) => void>> = {
+		message: new Set(),
+		close: new Set(),
+		error: new Set(),
+	}
+	const socket = createMockSocket({
+		addEventListener: vi.fn((type: SocketEventType, listener: (event: any) => void) => {
+			listeners[type].add(listener)
+		}),
+		removeEventListener: vi.fn((type: SocketEventType, listener: (event: any) => void) => {
+			listeners[type].delete(listener)
+		}),
+	})
+
+	return {
+		dispatch(type: SocketEventType, event: any) {
+			for (const listener of listeners[type]) listener(event)
+		},
+		getListenerCount(type: SocketEventType) {
+			return listeners[type].size
+		},
+		socket,
+	}
+}
+
 // Connect a session and complete the connect handshake
 function connectSession(room: TLSocketRoom<any, any>, sessionId: string, socket: WebSocketMinimal) {
 	room.handleSocketConnect({ sessionId, socket })
@@ -269,6 +296,39 @@ describe('28. TLSocketRoom (SR)', () => {
 			expect(events.sort()).toEqual(['close', 'error', 'message'])
 		})
 
+		it('[SR4] safely replaces an existing transport for the same session id', () => {
+			const room = new TLSocketRoom({})
+			const oldTransport = createEventedMockSocket()
+			const newTransport = createEventedMockSocket()
+
+			room.handleSocketConnect({ sessionId: 'test-session', socket: oldTransport.socket })
+			room.handleSocketConnect({ sessionId: 'test-session', socket: newTransport.socket })
+
+			expect(oldTransport.socket.close).toHaveBeenCalledWith(
+				TLSyncErrorCloseEventCode,
+				TLSyncErrorCloseEventReason.RATE_LIMITED
+			)
+			expect(oldTransport.getListenerCount('message')).toBe(0)
+			expect(oldTransport.getListenerCount('close')).toBe(0)
+			expect(oldTransport.getListenerCount('error')).toBe(0)
+
+			const connectRequest = {
+				type: 'connect' as const,
+				connectRequestId: 'replacement-connect',
+				lastServerClock: 0,
+				protocolVersion: getTlsyncProtocolVersion(),
+				schema: createTLSchema().serialize(),
+			}
+			newTransport.dispatch('message', { data: JSON.stringify(connectRequest) })
+			expect(room.getSessions()).toMatchObject([{ sessionId: 'test-session', isConnected: true }])
+
+			oldTransport.dispatch('close', {})
+			expect(room.getSessions()[0].isConnected).toBe(true)
+
+			room.close()
+			expect(newTransport.socket.close).toHaveBeenCalledTimes(1)
+		})
+
 		it('[SR4] tolerates sockets without addEventListener', () => {
 			const room = new TLSocketRoom({})
 			const socket: WebSocketMinimal = {
@@ -332,6 +392,30 @@ describe('28. TLSocketRoom (SR)', () => {
 	})
 
 	describe('handleSocketMessage', () => {
+		it('[SR5] applies the configured maximum assembled message size', () => {
+			const log: TLSyncLog = { warn: vi.fn(), error: vi.fn() }
+			const room = new TLSocketRoom({ log, maxMessageSizeBytes: 8 })
+			const socket = createMockSocket()
+			room.handleSocketConnect({ sessionId: 'test-session', socket })
+
+			room.handleSocketMessage('test-session', '{"value":1}')
+
+			expect(log.error).toHaveBeenCalledWith('Error assembling message', expect.anything())
+			expect(socket.close).toHaveBeenCalled()
+		})
+
+		it('[SR5] applies the configured maximum chunk count', () => {
+			const log: TLSyncLog = { warn: vi.fn(), error: vi.fn() }
+			const room = new TLSocketRoom({ log, maxMessageChunks: 2 })
+			const socket = createMockSocket()
+			room.handleSocketConnect({ sessionId: 'test-session', socket })
+
+			room.handleSocketMessage('test-session', '2_{}')
+
+			expect(log.error).toHaveBeenCalledWith('Error assembling message', expect.anything())
+			expect(socket.close).toHaveBeenCalled()
+		})
+
 		it('[SR5] closes the socket via the error path on chunk assembly errors', () => {
 			const log: TLSyncLog = { warn: vi.fn(), error: vi.fn() }
 			const room = new TLSocketRoom({ log })

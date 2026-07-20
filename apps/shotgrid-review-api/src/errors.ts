@@ -9,6 +9,7 @@ const CLIENT_MESSAGES: Record<ReviewApiErrorCode, string> = {
 	AUTHENTICATION_REQUIRED: 'Authentication is required.',
 	PERMISSION_DENIED: 'You do not have permission to perform this review action.',
 	NOT_FOUND: 'The requested review item was not found.',
+	COLLABORATION_UNAVAILABLE: 'The collaboration room is temporarily unavailable.',
 	DECISION_CONFLICT: 'The Version status changed. Refresh the review decision before trying again.',
 	DECISION_INDETERMINATE:
 		'The review decision outcome is uncertain. Refresh it from ShotGrid before trying again.',

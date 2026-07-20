@@ -13,7 +13,8 @@ yarn dev-shotgrid-review-api
 yarn dev-shotgrid-review
 ```
 
-Vite proxies `/api` to `http://127.0.0.1:5431` by default. Set the server-only
+Vite proxies `/api`, including collaboration WebSocket upgrades, to
+`http://127.0.0.1:5431` by default. Set the server-only
 `REVIEW_API_DEV_TARGET` environment variable before starting Vite to use another local gateway.
 The development proxy deliberately does not inject live authentication headers, so live ShotGrid
 mode still requires the trusted reverse proxy described in the API README.
@@ -36,16 +37,29 @@ Empty selections use explicit partial links so browser history remains truthful:
 ```
 
 ShotGrid builds must set `VITE_REVIEW_STORAGE_NAMESPACE` to a stable, non-secret deployment/site
-identifier (for example `studio-sandbox`). Canvas persistence keys also include the API scope,
-gateway mode, and reviewer kind. If the gateway exposes only a shared ShotGrid service identity,
-the canvas remains session-only to avoid loading another reviewer's local annotations.
+identifier (for example `studio-sandbox`). Browser-local publication retry keys also include the API
+scope, gateway mode, and reviewer identity. The shared annotation document is instead restored from
+the API's Version-specific SQLite room; it is not loaded from another reviewer's browser storage.
+If the gateway exposes only a shared ShotGrid service identity, the app does not initialize human
+publication state for that identity.
+
+Shared annotation editing also requires a human reviewer identity. The collaboration session binds
+the canvas to one Version-specific room, keeps media sources browser-local, and synchronizes only
+the annotation document. A ShotGrid service identity joins as a viewer: it can inspect live shared
+annotations but cannot create, change, or delete them.
 
 Browser publication requires a human reviewer identity. In live ShotGrid mode, configure
 `SHOTGRID_SUDO_AS_LOGIN` so the gateway resolves the authenticated request to that human reviewer.
 When `/api/review/me` returns a service identity, the app deliberately disables publication: it
 does not open publication IndexedDB state, load Note options, or send publication requests. The
-service identity may still browse, annotate, save/open editable snapshots, and export PNGs. Do not
-replace this boundary with a session nonce or an in-memory publication fallback.
+service identity may still browse, inspect synchronized annotations, save an editable snapshot, and
+export PNGs. Do not replace this boundary with a session nonce or an in-memory publication fallback.
+
+Live multi-user attribution depends on the trusted reverse proxy mapping each authenticated person
+to the correct ShotGrid reviewer; that deployment work remains tracked by issue #2. A shared
+`SHOTGRID_SUDO_AS_LOGIN` is not a substitute for per-person identity. See the API README for the
+required same-origin WebSocket proxy, single-replica SQLite topology, capacity limits, and recovery
+test.
 
 Review decisions use the deployment's server-side decision mapping; the browser never hard-codes
 studio status meanings. A human reviewer can open the decision control to see the current ShotGrid

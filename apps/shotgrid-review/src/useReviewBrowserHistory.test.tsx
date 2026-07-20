@@ -52,6 +52,7 @@ const version: ReviewVersion = {
 
 function createApi(overrides: Partial<ReviewApiClient> = {}): ReviewApiClient {
 	return {
+		createCollaborationSession: vi.fn(),
 		getDecisionContext: vi.fn(),
 		getCurrentReviewer: vi.fn(async () => reviewer),
 		getHealth: vi.fn(async () => health),

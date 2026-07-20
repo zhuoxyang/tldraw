@@ -9,6 +9,7 @@ import {
 	type TLCameraOptions,
 	type TLShape,
 } from 'tldraw'
+import { runReviewSystemMutation } from './reviewSystemMutation'
 
 export const REVIEW_VIDEO_SHAPE_TYPE = 'review-video' as const
 
@@ -189,54 +190,63 @@ export function isReviewVideoShapeForSource(
 	)
 }
 
-export function installReviewVideo(editor: Editor, source: ReviewVideoSource) {
+export function installReviewVideo(
+	editor: Editor,
+	source: ReviewVideoSource,
+	options: { localOnly?: boolean } = {}
+) {
 	assertReviewVideoSource(source)
 	const shapeId = getReviewVideoShapeId(source.versionId)
 	const existingShape = editor.getShape(shapeId)
 	const createdBackground = !existingShape
 	const sourceChanged = !isReviewVideoShapeForSource(existingShape, source)
 
-	editor.run(
-		() => {
-			if (existingShape && existingShape.type !== REVIEW_VIDEO_SHAPE_TYPE) {
-				editor.deleteShape(existingShape)
-			}
+	const install = () =>
+		runReviewSystemMutation(editor, () =>
+			editor.run(
+				() => {
+					if (existingShape && existingShape.type !== REVIEW_VIDEO_SHAPE_TYPE) {
+						editor.deleteShape(existingShape)
+					}
 
-			const currentShape = editor.getShape(shapeId)
-			if (currentShape?.type === REVIEW_VIDEO_SHAPE_TYPE) {
-				editor.updateShape<ReviewVideoShape>({
-					id: shapeId,
-					isLocked: true,
-					meta: reviewVideoMeta(source),
-					opacity: 1,
-					props: getReviewVideoShapeProps(source),
-					rotation: 0,
-					type: REVIEW_VIDEO_SHAPE_TYPE,
-					x: 0,
-					y: 0,
-				})
-			} else {
-				editor.createShape<ReviewVideoShape>({
-					id: shapeId,
-					isLocked: true,
-					meta: reviewVideoMeta(source),
-					opacity: 1,
-					props: getReviewVideoShapeProps(source),
-					rotation: 0,
-					type: REVIEW_VIDEO_SHAPE_TYPE,
-					x: 0,
-					y: 0,
-				})
-			}
+					const currentShape = editor.getShape(shapeId)
+					if (currentShape?.type === REVIEW_VIDEO_SHAPE_TYPE) {
+						editor.updateShape<ReviewVideoShape>({
+							id: shapeId,
+							isLocked: true,
+							meta: reviewVideoMeta(source),
+							opacity: 1,
+							props: getReviewVideoShapeProps(source),
+							rotation: 0,
+							type: REVIEW_VIDEO_SHAPE_TYPE,
+							x: 0,
+							y: 0,
+						})
+					} else {
+						editor.createShape<ReviewVideoShape>({
+							id: shapeId,
+							isLocked: true,
+							meta: reviewVideoMeta(source),
+							opacity: 1,
+							props: getReviewVideoShapeProps(source),
+							rotation: 0,
+							type: REVIEW_VIDEO_SHAPE_TYPE,
+							x: 0,
+							y: 0,
+						})
+					}
 
-			const background = editor.getShape(shapeId)
-			if (background && background.parentId !== editor.getCurrentPageId()) {
-				editor.moveShapesToPage([background], editor.getCurrentPageId())
-			}
-			editor.sendToBack([shapeId])
-		},
-		{ history: 'ignore', ignoreShapeLock: true }
-	)
+					const background = editor.getShape(shapeId)
+					if (background && background.parentId !== editor.getCurrentPageId()) {
+						editor.moveShapesToPage([background], editor.getCurrentPageId())
+					}
+					editor.sendToBack([shapeId])
+				},
+				{ history: 'ignore', ignoreShapeLock: true }
+			)
+		)
+	if (options.localOnly) editor.store.mergeRemoteChanges(install)
+	else install()
 
 	editor.setCameraOptions(getReviewVideoCameraOptions(source.width, source.height))
 	if (sourceChanged) editor.setCamera(editor.getCamera(), { reset: true })
@@ -244,24 +254,48 @@ export function installReviewVideo(editor: Editor, source: ReviewVideoSource) {
 	return { createdBackground, shapeId, sourceChanged }
 }
 
-export function protectReviewVideo(editor: Editor, source: ReviewVideoSource) {
+export function protectReviewVideo(
+	editor: Editor,
+	source: ReviewVideoSource,
+	options: { localOnly?: boolean } = {}
+) {
 	assertReviewVideoSource(source)
 	const shapeId = getReviewVideoShapeId(source.versionId)
+	let disposed = false
+	let repairScheduled = false
 	const ensureBackgroundIsBottom = () => {
 		const shape = editor.getShape(shapeId)
 		if (!shape) return
 		const siblings = editor.getSortedChildIdsForParent(shape.parentId)
-		if (siblings[0] !== shapeId) {
-			editor.run(() => editor.sendToBack([shapeId]), {
-				history: 'ignore',
-				ignoreShapeLock: true,
-			})
+		if (siblings[0] === shapeId) return
+		const sendToBack = () =>
+			runReviewSystemMutation(editor, () =>
+				editor.run(() => editor.sendToBack([shapeId]), {
+					history: 'ignore',
+					ignoreShapeLock: true,
+				})
+			)
+		if (!options.localOnly) {
+			sendToBack()
+			return
 		}
+		if (repairScheduled) return
+		repairScheduled = true
+		queueMicrotask(() => {
+			repairScheduled = false
+			if (disposed) return
+			const current = editor.getShape(shapeId)
+			if (!current || editor.getSortedChildIdsForParent(current.parentId)[0] === shapeId) {
+				return
+			}
+			editor.store.mergeRemoteChanges(sendToBack)
+		})
 	}
 
 	const disposers = [
-		editor.sideEffects.registerBeforeChangeHandler('shape', (previous, next) => {
+		editor.sideEffects.registerBeforeChangeHandler('shape', (previous, next, changeSource) => {
 			if (next.id !== shapeId) return next
+			if (changeSource === 'remote') return next
 			if (previous.type !== REVIEW_VIDEO_SHAPE_TYPE || next.type !== REVIEW_VIDEO_SHAPE_TYPE) {
 				return previous
 			}
@@ -278,14 +312,17 @@ export function protectReviewVideo(editor: Editor, source: ReviewVideoSource) {
 				y: 0,
 			}
 		}),
-		editor.sideEffects.registerBeforeDeleteHandler('shape', (shape) => {
-			if (shape.id === shapeId) return false
+		editor.sideEffects.registerBeforeDeleteHandler('shape', (shape, changeSource) => {
+			if (changeSource !== 'remote' && shape.id === shapeId) return false
 		}),
 		editor.sideEffects.registerAfterCreateHandler('shape', ensureBackgroundIsBottom),
 		editor.sideEffects.registerAfterChangeHandler('shape', ensureBackgroundIsBottom),
 	]
 	ensureBackgroundIsBottom()
-	return () => disposers.forEach((dispose) => dispose())
+	return () => {
+		disposed = true
+		disposers.forEach((dispose) => dispose())
+	}
 }
 
 export function getReviewVideoCameraOptions(

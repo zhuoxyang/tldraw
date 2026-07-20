@@ -1,4 +1,5 @@
 import type {
+	ReviewCollaborationSession,
 	ReviewDecisionContext,
 	ReviewDecisionRequest,
 	ReviewDecisionResult,
@@ -20,6 +21,13 @@ import {
 } from './reviewApiClient'
 
 const health: ReviewHealth = { mode: 'shotgrid', status: 'ok' }
+const collaborationRoomId = `r1_${'A'.repeat(43)}`
+const collaborationSession: ReviewCollaborationSession = {
+	permission: 'editor',
+	roomId: collaborationRoomId,
+	socketUrl: `/api/review/sync/${collaborationRoomId}?ticket=${'b'.repeat(43)}`,
+	ticketExpiresAt: '2026-07-21T00:01:00.000Z',
+}
 const reviewer: ReviewUser = {
 	avatarUrl: null,
 	id: 7,
@@ -134,6 +142,44 @@ const decisionResult: ReviewDecisionResult = {
 }
 
 describe('createReviewApiClient', () => {
+	it('creates a collaboration session with a bodyless POST and forwards AbortSignal', async () => {
+		const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+			jsonResponse({ data: collaborationSession })
+		)
+		const client = createReviewApiClient({ baseUrl: '/api', fetch })
+		const signal = new AbortController().signal
+
+		await expect(client.createCollaborationSession(201, 301, signal)).resolves.toEqual(
+			collaborationSession
+		)
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/review/playlists/201/versions/301/collaboration-session',
+			expect.objectContaining({ body: undefined, method: 'POST', signal })
+		)
+		expect(new Headers(fetch.mock.calls[0][1]?.headers)).toEqual(
+			new Headers({ Accept: 'application/json' })
+		)
+	})
+
+	it.each([
+		{ ...collaborationSession, permission: 'owner' },
+		{ ...collaborationSession, socketUrl: `${collaborationSession.socketUrl}&token=secret` },
+		{ ...collaborationSession, ticketExpiresAt: 'not-an-iso-timestamp' },
+	])('rejects an invalid collaboration session response', async (session) => {
+		const client = createReviewApiClient({
+			baseUrl: '/api',
+			fetch: vi.fn(async () =>
+				jsonResponse({ data: session }, 200, { 'X-Request-Id': 'invalid-session' })
+			),
+		})
+
+		await expect(client.createCollaborationSession(201, 301)).rejects.toMatchObject({
+			code: 'INVALID_RESPONSE',
+			requestId: 'invalid-session',
+			status: 200,
+		})
+	})
+
 	it('calls every endpoint through a relative base URL and forwards AbortSignal', async () => {
 		const responses = [
 			jsonResponse(health),
@@ -420,6 +466,10 @@ describe('createReviewApiClient', () => {
 				status: 0,
 			})
 			await expect(client.getVersion(201, id)).rejects.toBeInstanceOf(ReviewApiClientError)
+			await expect(client.createCollaborationSession(201, id)).rejects.toMatchObject({
+				code: 'INVALID_REQUEST',
+				status: 0,
+			})
 			expect(fetch).not.toHaveBeenCalled()
 		}
 	)
