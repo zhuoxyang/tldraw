@@ -11,7 +11,7 @@ import type {
 	UploadReviewAttachmentRequest,
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
-import type { ReviewGateway } from './ReviewGateway'
+import type { ReviewGateway, ReviewImageProxyPayload } from './ReviewGateway'
 
 const reviewer: ReviewUser = {
 	avatarUrl: null,
@@ -64,11 +64,11 @@ const initialVersions: ReviewVersion[] = [
 		entity: { id: 501, name: 'shot_010', type: 'Shot' },
 		id: 301,
 		media: {
-			contentType: 'image/svg+xml',
+			contentType: 'image/png',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: '/mock-media/northstar-lighting.svg',
-			url: '/mock-media/northstar-lighting.svg',
+			thumbnailUrl: '/mock-media/northstar-lighting.png',
+			url: '/mock-media/northstar-lighting.png',
 			width: 1920,
 		},
 		name: 'shot_010_lgt_v014',
@@ -85,11 +85,11 @@ const initialVersions: ReviewVersion[] = [
 		entity: { id: 502, name: 'shot_020', type: 'Shot' },
 		id: 302,
 		media: {
-			contentType: 'image/svg+xml',
+			contentType: 'image/png',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: '/mock-media/shot-comp.svg',
-			url: '/mock-media/shot-comp.svg',
+			thumbnailUrl: '/mock-media/shot-comp.png',
+			url: '/mock-media/shot-comp.png',
 			width: 1920,
 		},
 		name: 'shot_020_comp_v008',
@@ -106,11 +106,11 @@ const initialVersions: ReviewVersion[] = [
 		entity: { id: 503, name: 'Drone', type: 'Asset' },
 		id: 303,
 		media: {
-			contentType: 'image/svg+xml',
+			contentType: 'image/png',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: '/mock-media/drone-animation.svg',
-			url: '/mock-media/drone-animation.svg',
+			thumbnailUrl: '/mock-media/drone-animation.png',
+			url: '/mock-media/drone-animation.png',
 			width: 1920,
 		},
 		name: 'asset_drone_anim_v021',
@@ -127,11 +127,11 @@ const initialVersions: ReviewVersion[] = [
 		entity: { id: 504, name: 'Market Environment', type: 'Asset' },
 		id: 304,
 		media: {
-			contentType: 'image/svg+xml',
+			contentType: 'image/png',
 			height: 1080,
 			kind: 'image',
-			thumbnailUrl: '/mock-media/market-environment.svg',
-			url: '/mock-media/market-environment.svg',
+			thumbnailUrl: '/mock-media/market-environment.png',
+			url: '/mock-media/market-environment.png',
 			width: 1920,
 		},
 		name: 'env_market_v005',
@@ -187,6 +187,14 @@ export class MockReviewGateway implements ReviewGateway {
 		const version = this.requireVersion(versionId)
 		if (version.playlistId !== playlistId) throw this.notFound('Version')
 		return version
+	}
+
+	async getVersionImage(
+		_playlistId: number,
+		_versionId: number,
+		_signal?: AbortSignal
+	): Promise<ReviewImageProxyPayload> {
+		throw this.notFound('Version image')
 	}
 
 	async listPlaylists(projectId: number) {

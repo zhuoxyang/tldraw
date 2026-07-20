@@ -1,10 +1,10 @@
 import type { ReviewMedia, ReviewVersion } from '@tldraw/shotgrid-review-contracts'
 import type { ReactNode } from 'react'
 import 'tldraw/tldraw.css'
-import { Tldraw } from 'tldraw'
 import { reviewConfig } from './config'
 import { createReviewApiClient } from './reviewApiClient'
 import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowser'
+import { ReviewImageCanvas } from './ReviewImageCanvas'
 import { useReviewBrowser } from './useReviewBrowser'
 
 const reviewApi = createReviewApiClient({ baseUrl: reviewConfig.apiBaseUrl })
@@ -201,13 +201,15 @@ function ActiveReview({
 	refreshing: boolean
 	state: ReadyReviewBrowser
 }) {
-	const { health, playlist, project, reviewer, version } = state
+	const { health, project, reviewer, version } = state
 	const reviewerIdentity =
 		reviewer.id === null ? reviewer.login || reviewer.name : String(reviewer.id)
 	const reviewerScope = `${reviewer.kind}-${encodeURIComponent(reviewerIdentity)}`
 	const gatewayScope = `${reviewConfig.dataMode}-${health.mode}-${encodeURIComponent(reviewConfig.apiBaseUrl)}`
-	const canvasKey = `shotgrid-review:v3:${reviewConfig.storageNamespace}:${gatewayScope}:project-${project.id}:playlist-${playlist.id}:version-${version.id}:user-${reviewerScope}`
+	const canvasKey = `shotgrid-review:v4:${reviewConfig.storageNamespace}:${gatewayScope}:project-${project.id}:version-${version.id}:user-${reviewerScope}`
 	const persistenceKey = reviewer.kind === 'service' ? undefined : canvasKey
+	const reviewApiOrigin = new URL(reviewConfig.apiBaseUrl, globalThis.location.href).origin
+	const reviewScope = `${reviewConfig.storageNamespace}:${reviewConfig.dataMode}:${health.mode}:${encodeURIComponent(reviewApiOrigin)}:${encodeURIComponent(reviewConfig.apiBaseUrl)}`
 
 	return (
 		<main aria-busy={busy || refreshing || undefined} className="review-main">
@@ -237,14 +239,38 @@ function ActiveReview({
 			<div className="review-stage">
 				<VersionInspector version={version} />
 				<section className="review-canvas" aria-label={`Annotation canvas for ${version.name}`}>
-					<Tldraw
-						key={canvasKey}
-						licenseKey={reviewConfig.tldrawLicenseKey}
-						{...(persistenceKey ? { persistenceKey } : {})}
-					/>
+					{version.media?.kind === 'image' ? (
+						<ReviewImageCanvas
+							documentKey={canvasKey}
+							licenseKey={reviewConfig.tldrawLicenseKey}
+							media={version.media}
+							persistenceKey={persistenceKey}
+							projectId={project.id}
+							reviewScope={reviewScope}
+							versionId={version.id}
+							versionName={version.name}
+						/>
+					) : (
+						<UnavailableAnnotationCanvas media={version.media} />
+					)}
 				</section>
 			</div>
 		</main>
+	)
+}
+
+function UnavailableAnnotationCanvas({ media }: { media: ReviewMedia | null }) {
+	return (
+		<div className="review-canvas-message" role="status">
+			<strong>
+				{media?.kind === 'video' ? 'Video review comes next' : 'No image to annotate'}
+			</strong>
+			<span>
+				{media?.kind === 'video'
+					? 'This MVP supports source-resolution image annotation. Frame-accurate video review is tracked separately.'
+					: 'Attach accessible image media to this ShotGrid Version to start an annotation review.'}
+			</span>
+		</div>
 	)
 }
 

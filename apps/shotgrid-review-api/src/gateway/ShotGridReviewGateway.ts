@@ -17,7 +17,7 @@ import type {
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ShotGridClient } from '../shotgrid/ShotGridClient'
-import type { ReviewGateway } from './ReviewGateway'
+import type { ReviewGateway, ReviewImageProxyPayload } from './ReviewGateway'
 
 type FetchImplementation = typeof fetch
 
@@ -77,7 +77,19 @@ const SEARCH_PAGE_SIZE = 500
 const MAX_SEARCH_PAGES = 100
 const MAX_SEARCH_ENTITIES = 10_000
 const MAX_SEARCH_AGGREGATE_BYTES = 32 * 1024 * 1024
+const MAX_REVIEW_IMAGE_BYTES = 32 * 1024 * 1024
+const MAX_CONCURRENT_REVIEW_IMAGE_REQUESTS = 4
+const MAX_REVIEW_IMAGE_DIMENSION = 8_192
+const MAX_REVIEW_IMAGE_PIXELS = 16_777_216
+const MAX_REVIEW_IMAGE_REDIRECTS = 3
 const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
+const REVIEW_IMAGE_CONTENT_TYPES = new Set<ReviewImageProxyPayload['contentType']>([
+	'image/jpeg',
+	'image/png',
+	'image/webp',
+])
+const REVIEW_IMAGE_ACCEPT = [...REVIEW_IMAGE_CONTENT_TYPES].join(', ')
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const VERSION_FIELDS = [
 	'code',
 	'description',
@@ -96,6 +108,7 @@ const VERSION_FIELDS = [
 ]
 
 export class ShotGridReviewGateway implements ReviewGateway {
+	private activeReviewImageRequests = 0
 	private readonly fetch: FetchImplementation
 	private readonly now: () => number
 
@@ -166,13 +179,27 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async getVersion(playlistId: number, versionId: number): Promise<ReviewVersion> {
-		await this.readEntity('playlists', playlistId, 'Playlist')
-		const entity = await this.readEntity('versions', versionId, 'Version', VERSION_FIELDS)
-		const belongsToPlaylist = readRelationshipList(entity.relationships, 'playlists').some(
-			(playlist) => playlist.type === 'Playlist' && playlist.id === playlistId
-		)
-		if (!belongsToPlaylist) throw reviewItemNotFound()
+		const entity = await this.readVersionForPlaylist(playlistId, versionId)
 		return mapVersion(entity, playlistId)
+	}
+
+	async getVersionImage(
+		playlistId: number,
+		versionId: number,
+		signal?: AbortSignal
+	): Promise<ReviewImageProxyPayload> {
+		if (this.activeReviewImageRequests >= MAX_CONCURRENT_REVIEW_IMAGE_REQUESTS) {
+			throw reviewImageCapacityExceeded()
+		}
+		this.activeReviewImageRequests++
+		try {
+			const entity = await this.readVersionForPlaylist(playlistId, versionId)
+			const imageUrl = readVersionImageSourceUrl(entity.attributes)
+			if (!imageUrl) throw reviewItemNotFound()
+			return await this.fetchReviewImage(imageUrl, signal)
+		} finally {
+			this.activeReviewImageRequests--
+		}
 	}
 
 	async listProjects(): Promise<ReviewProject[]> {
@@ -339,6 +366,90 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			query: { fields: fields.join(',') },
 		})
 		return requireResponseEntity(response, expectedType, id)
+	}
+
+	private async readVersionForPlaylist(playlistId: number, versionId: number) {
+		await this.readEntity('playlists', playlistId, 'Playlist')
+		const entity = await this.readEntity('versions', versionId, 'Version', VERSION_FIELDS)
+		const belongsToPlaylist = readRelationshipList(entity.relationships, 'playlists').some(
+			(playlist) => playlist.type === 'Playlist' && playlist.id === playlistId
+		)
+		if (!belongsToPlaylist) throw reviewItemNotFound()
+		return entity
+	}
+
+	private async fetchReviewImage(
+		urlValue: string,
+		externalSignal?: AbortSignal
+	): Promise<ReviewImageProxyPayload> {
+		let url = validateReviewImageUrl(urlValue, this.config.siteUrl)
+		const controller = new AbortController()
+		let timedOut = false
+		const handleExternalAbort = () => controller.abort()
+		externalSignal?.addEventListener('abort', handleExternalAbort, { once: true })
+		if (externalSignal?.aborted) controller.abort()
+		const timeout = setTimeout(() => {
+			timedOut = true
+			controller.abort()
+		}, this.config.timeoutMs)
+
+		try {
+			for (let redirectCount = 0; ; redirectCount++) {
+				const response = await this.fetch(url, {
+					cache: 'no-store',
+					credentials: 'omit',
+					headers: {
+						Accept: REVIEW_IMAGE_ACCEPT,
+						'Accept-Encoding': 'identity',
+					},
+					method: 'GET',
+					redirect: 'manual',
+					referrerPolicy: 'no-referrer',
+					signal: controller.signal,
+				})
+
+				if (REDIRECT_STATUSES.has(response.status)) {
+					await cancelResponseBody(response)
+					if (redirectCount >= MAX_REVIEW_IMAGE_REDIRECTS) throw invalidShotGridResponse()
+					const location = response.headers.get('location')
+					if (!location) throw invalidShotGridResponse()
+					url = resolveReviewImageRedirect(location, url, this.config.siteUrl)
+					continue
+				}
+
+				if (response.status >= 300 && response.status < 400) {
+					await cancelResponseBody(response)
+					throw invalidShotGridResponse()
+				}
+				if (!response.ok) {
+					await cancelResponseBody(response)
+					throw reviewImageRequestFailed(response.status)
+				}
+
+				let contentType: ReviewImageProxyPayload['contentType']
+				let declaredLength: number | null
+				try {
+					contentType = readReviewImageContentType(response)
+					declaredLength = readReviewImageContentLength(response)
+				} catch (error) {
+					await cancelResponseBody(response)
+					throw error
+				}
+				const body = await readReviewImageBody(response, declaredLength)
+				validateReviewImageBytes(contentType, body)
+				return { body, contentType }
+			}
+		} catch (error) {
+			if (error instanceof ReviewGatewayError) throw error
+			throw new ReviewGatewayError({
+				code: timedOut ? 'SHOTGRID_TIMEOUT' : 'SHOTGRID_REQUEST_FAILED',
+				retryable: false,
+				status: timedOut ? 504 : 502,
+			})
+		} finally {
+			clearTimeout(timeout)
+			externalSignal?.removeEventListener('abort', handleExternalAbort)
+		}
 	}
 
 	private getConfiguredActor(): ReviewUser {
@@ -525,7 +636,7 @@ function mapVersion(entity: ShotGridEntity, playlistId: number): ReviewVersion {
 		description: readNullableString(entity.attributes, 'description'),
 		entity: mapVersionEntity(readRelationship(entity.relationships, 'entity')),
 		id: entity.id,
-		media: mapVersionMedia(entity.attributes),
+		media: mapVersionMedia(entity.attributes, playlistId, entity.id),
 		name: readString(entity.attributes, 'code') || `Version ${entity.id}`,
 		playlistId,
 		projectId: project.id,
@@ -570,7 +681,11 @@ function mapOptionalRelationshipUser(relationship: ShotGridRelationship | null):
 	return relationship ? mapRelationshipUser(relationship) : null
 }
 
-function mapVersionMedia(attributes: Record<string, unknown> | undefined): ReviewMedia | null {
+function mapVersionMedia(
+	attributes: Record<string, unknown> | undefined,
+	playlistId: number,
+	versionId: number
+): ReviewMedia | null {
 	const movie = readRecord(attributes?.sg_uploaded_movie)
 	const movieUrl = readUrlValue(movie?.url)
 	const thumbnailUrl = readNullableUrl(attributes, 'image')
@@ -592,14 +707,25 @@ function mapVersionMedia(attributes: Record<string, unknown> | undefined): Revie
 		}
 	}
 	if (!thumbnailUrl) return null
+	const proxyUrl = buildReviewImageProxyUrl(playlistId, versionId)
 	return {
 		contentType: 'image/jpeg',
 		height: null,
 		kind: 'image',
-		thumbnailUrl,
-		url: thumbnailUrl,
+		thumbnailUrl: proxyUrl,
+		url: proxyUrl,
 		width: null,
 	}
+}
+
+function buildReviewImageProxyUrl(playlistId: number, versionId: number) {
+	return `/review/playlists/${playlistId}/versions/${versionId}/media/image`
+}
+
+function readVersionImageSourceUrl(attributes: Record<string, unknown> | undefined) {
+	const movie = readRecord(attributes?.sg_uploaded_movie)
+	if (readUrlValue(movie?.url)) return null
+	return readNullableUrl(attributes, 'image')
 }
 
 function readString(source: Record<string, unknown> | undefined, key: string) {
@@ -668,6 +794,270 @@ function readRelationshipList(relationships: Record<string, unknown> | undefined
 	return value
 		.map((item) => readRelationshipValue(item))
 		.filter((item): item is ShotGridRelationship => item !== null)
+}
+
+function validateReviewImageUrl(value: string, siteUrl: string) {
+	let url: URL
+	try {
+		url = new URL(value, siteUrl)
+	} catch {
+		throw invalidShotGridResponse()
+	}
+
+	const site = new URL(siteUrl)
+	if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.hash !== '') {
+		throw invalidShotGridResponse()
+	}
+	if (url.origin === site.origin) return url
+	if (url.port === '' && url.pathname !== '/' && isAmazonS3Hostname(url.hostname)) return url
+	throw invalidShotGridResponse()
+}
+
+function resolveReviewImageRedirect(location: string, currentUrl: URL, siteUrl: string) {
+	try {
+		return validateReviewImageUrl(new URL(location, currentUrl).toString(), siteUrl)
+	} catch {
+		throw invalidShotGridResponse()
+	}
+}
+
+function readReviewImageContentType(response: Response): ReviewImageProxyPayload['contentType'] {
+	const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+	if (
+		!contentType ||
+		!REVIEW_IMAGE_CONTENT_TYPES.has(contentType as ReviewImageProxyPayload['contentType'])
+	) {
+		throw invalidShotGridResponse()
+	}
+	return contentType as ReviewImageProxyPayload['contentType']
+}
+
+function readReviewImageContentLength(response: Response) {
+	const value = response.headers.get('content-length')
+	if (value === null) return null
+	if (!/^(?:0|[1-9]\d*)$/.test(value)) throw invalidShotGridResponse()
+	const length = Number(value)
+	if (!Number.isSafeInteger(length) || length > MAX_REVIEW_IMAGE_BYTES) {
+		throw invalidShotGridResponse()
+	}
+	return length
+}
+
+async function readReviewImageBody(response: Response, declaredLength: number | null) {
+	if (!response.body) throw invalidShotGridResponse()
+
+	const reader = response.body.getReader()
+	const chunks: Buffer[] = []
+	let byteLength = 0
+	try {
+		for (;;) {
+			const { done, value } = await reader.read()
+			if (done) break
+			byteLength += value.byteLength
+			if (byteLength > MAX_REVIEW_IMAGE_BYTES) {
+				try {
+					await reader.cancel()
+				} catch {
+					// Preserve the invalid-response classification that caused cancellation.
+				}
+				throw invalidShotGridResponse()
+			}
+			chunks.push(Buffer.from(value))
+		}
+	} finally {
+		reader.releaseLock()
+	}
+
+	if (declaredLength !== null && declaredLength !== byteLength) throw invalidShotGridResponse()
+	return Buffer.concat(chunks, byteLength)
+}
+
+async function cancelResponseBody(response: Response) {
+	try {
+		await response.body?.cancel()
+	} catch {
+		// The response is already being rejected; cancellation is best-effort cleanup.
+	}
+}
+
+function validateReviewImageBytes(
+	contentType: ReviewImageProxyPayload['contentType'],
+	body: Uint8Array
+) {
+	const bytes = Buffer.from(body.buffer, body.byteOffset, body.byteLength)
+	const dimensions =
+		contentType === 'image/jpeg'
+			? readJpegDimensions(bytes)
+			: contentType === 'image/png'
+				? readStaticPngDimensions(bytes)
+				: readStaticWebpDimensions(bytes)
+	if (
+		!dimensions ||
+		dimensions.width <= 0 ||
+		dimensions.height <= 0 ||
+		dimensions.width > MAX_REVIEW_IMAGE_DIMENSION ||
+		dimensions.height > MAX_REVIEW_IMAGE_DIMENSION ||
+		dimensions.width * dimensions.height > MAX_REVIEW_IMAGE_PIXELS
+	) {
+		throw invalidShotGridResponse()
+	}
+}
+
+function readJpegDimensions(bytes: Buffer) {
+	if (
+		bytes.length < 12 ||
+		bytes[0] !== 0xff ||
+		bytes[1] !== 0xd8 ||
+		bytes[bytes.length - 2] !== 0xff ||
+		bytes[bytes.length - 1] !== 0xd9
+	) {
+		return null
+	}
+
+	let offset = 2
+	while (offset < bytes.length - 2) {
+		if (bytes[offset] !== 0xff) return null
+		while (offset < bytes.length && bytes[offset] === 0xff) offset++
+		const marker = bytes[offset++]
+		if (marker === undefined || marker === 0x00) return null
+		if (marker === 0xd9 || marker === 0xda) break
+		if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue
+		if (offset + 2 > bytes.length) return null
+		const segmentLength = bytes.readUInt16BE(offset)
+		if (segmentLength < 2 || offset + segmentLength > bytes.length) return null
+		if (isJpegStartOfFrame(marker)) {
+			if (segmentLength < 7) return null
+			return {
+				height: bytes.readUInt16BE(offset + 3),
+				width: bytes.readUInt16BE(offset + 5),
+			}
+		}
+		offset += segmentLength
+	}
+	return null
+}
+
+function isJpegStartOfFrame(marker: number) {
+	return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+}
+
+function readStaticPngDimensions(bytes: Buffer) {
+	const signature = Buffer.from('89504e470d0a1a0a', 'hex')
+	if (bytes.length < 8 || !bytes.subarray(0, 8).equals(signature)) return null
+
+	let offset = 8
+	let sawHeader = false
+	let sawImageData = false
+	let dimensions: { height: number; width: number } | null = null
+	while (offset + 12 <= bytes.length) {
+		const dataLength = bytes.readUInt32BE(offset)
+		const chunkEnd = offset + 12 + dataLength
+		if (chunkEnd > bytes.length) return null
+		const chunkType = bytes.toString('ascii', offset + 4, offset + 8)
+		if (!sawHeader) {
+			if (chunkType !== 'IHDR' || dataLength !== 13) return null
+			sawHeader = true
+			dimensions = {
+				height: bytes.readUInt32BE(offset + 12),
+				width: bytes.readUInt32BE(offset + 8),
+			}
+		}
+		if (chunkType === 'acTL' || chunkType === 'fcTL' || chunkType === 'fdAT') return null
+		if (chunkType === 'IDAT') sawImageData = true
+		if (chunkType === 'IEND') {
+			return dataLength === 0 && sawHeader && sawImageData && chunkEnd === bytes.length
+				? dimensions
+				: null
+		}
+		offset = chunkEnd
+	}
+	return null
+}
+
+function readStaticWebpDimensions(bytes: Buffer) {
+	if (
+		bytes.length < 20 ||
+		bytes.toString('ascii', 0, 4) !== 'RIFF' ||
+		bytes.toString('ascii', 8, 12) !== 'WEBP' ||
+		bytes.readUInt32LE(4) + 8 !== bytes.length
+	) {
+		return null
+	}
+
+	let offset = 12
+	let sawImageData = false
+	let dimensions: { height: number; width: number } | null = null
+	while (offset + 8 <= bytes.length) {
+		const chunkType = bytes.toString('ascii', offset, offset + 4)
+		const dataLength = bytes.readUInt32LE(offset + 4)
+		const dataStart = offset + 8
+		const chunkEnd = dataStart + dataLength
+		if (chunkEnd > bytes.length) return null
+		if (chunkType === 'ANIM' || chunkType === 'ANMF') return null
+		if (chunkType === 'VP8X') {
+			if (dataLength < 10 || (bytes[dataStart] & 0x02) !== 0) return null
+			dimensions = {
+				height: readUInt24LE(bytes, dataStart + 7) + 1,
+				width: readUInt24LE(bytes, dataStart + 4) + 1,
+			}
+		}
+		if (chunkType === 'VP8 ') {
+			sawImageData = true
+			if (!dimensions) dimensions = readLossyWebpDimensions(bytes, dataStart, dataLength)
+		}
+		if (chunkType === 'VP8L') {
+			sawImageData = true
+			if (!dimensions) dimensions = readLosslessWebpDimensions(bytes, dataStart, dataLength)
+		}
+		offset = chunkEnd + (dataLength % 2)
+	}
+	return sawImageData && offset === bytes.length ? dimensions : null
+}
+
+function readLossyWebpDimensions(bytes: Buffer, dataStart: number, dataLength: number) {
+	if (
+		dataLength < 10 ||
+		bytes[dataStart + 3] !== 0x9d ||
+		bytes[dataStart + 4] !== 0x01 ||
+		bytes[dataStart + 5] !== 0x2a
+	) {
+		return null
+	}
+	return {
+		height: bytes.readUInt16LE(dataStart + 8) & 0x3fff,
+		width: bytes.readUInt16LE(dataStart + 6) & 0x3fff,
+	}
+}
+
+function readLosslessWebpDimensions(bytes: Buffer, dataStart: number, dataLength: number) {
+	if (dataLength < 5 || bytes[dataStart] !== 0x2f) return null
+	const bits = bytes.readUInt32LE(dataStart + 1)
+	return {
+		height: ((bits >>> 14) & 0x3fff) + 1,
+		width: (bits & 0x3fff) + 1,
+	}
+}
+
+function readUInt24LE(bytes: Buffer, offset: number) {
+	return bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)
+}
+
+function reviewImageRequestFailed(upstreamStatus: number) {
+	const permissionDenied = upstreamStatus === 401 || upstreamStatus === 403
+	return new ReviewGatewayError({
+		code: permissionDenied ? 'SHOTGRID_PERMISSION_DENIED' : 'SHOTGRID_REQUEST_FAILED',
+		retryable: upstreamStatus === 429 || upstreamStatus >= 500,
+		status: permissionDenied ? 403 : 502,
+		upstreamStatus,
+	})
+}
+
+function reviewImageCapacityExceeded() {
+	return new ReviewGatewayError({
+		code: 'SHOTGRID_RATE_LIMITED',
+		retryable: true,
+		status: 429,
+	})
 }
 
 function validateUploadUrl(

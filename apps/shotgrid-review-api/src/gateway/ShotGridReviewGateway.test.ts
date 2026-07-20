@@ -191,6 +191,305 @@ describe('ShotGridReviewGateway', () => {
 		expect(request.mock.calls[1][1]?.query?.fields).toContain('sg_uploaded_movie')
 	})
 
+	test('replaces live still-image URLs with the same-origin proxy contract', async () => {
+		const playlistResponse = { data: { id: 201, type: 'Playlist' } }
+		const stillVersion = makeStillVersionResponse(
+			'https://studio.example.com/media/image.jpg?signature=do-not-expose'
+		)
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce(playlistResponse)
+			.mockResolvedValueOnce({ data: [stillVersion.data] })
+			.mockResolvedValueOnce(playlistResponse)
+			.mockResolvedValueOnce(stillVersion)
+		const gateway = makeGateway(request)
+		const proxyUrl = '/review/playlists/201/versions/301/media/image'
+
+		const listed = await gateway.listVersions(201)
+		expect(listed).toMatchObject([
+			{ media: { kind: 'image', thumbnailUrl: proxyUrl, url: proxyUrl } },
+		])
+		const selected = await gateway.getVersion(201, 301)
+		expect(selected).toMatchObject({
+			media: { kind: 'image', thumbnailUrl: proxyUrl, url: proxyUrl },
+		})
+		expect(JSON.stringify([listed, selected])).not.toContain('do-not-expose')
+	})
+
+	test('revalidates a still image and downloads it without forwarding credentials', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeStillVersionResponse('https://studio.example.com/media/image.jpg'))
+		const imageBytes = makeJpeg()
+		const imageFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(imageBytes, {
+					headers: {
+						'Content-Length': String(imageBytes.byteLength),
+						'Content-Type': 'image/jpeg; charset=binary',
+					},
+				})
+		)
+		const gateway = makeGateway(request, config, imageFetch)
+
+		const image = await gateway.getVersionImage(201, 301)
+
+		expect(Buffer.from(image.body)).toEqual(imageBytes)
+		expect(image.contentType).toBe('image/jpeg')
+		expect(request.mock.calls.map((call) => call[0])).toEqual([
+			'/entity/playlists/201',
+			'/entity/versions/301',
+		])
+		expect(imageFetch).toHaveBeenCalledOnce()
+		expect(imageFetch.mock.calls[0][0].toString()).toBe(
+			'https://studio.example.com/media/image.jpg'
+		)
+		const fetchOptions = imageFetch.mock.calls[0][1]
+		const headers = new Headers(fetchOptions?.headers)
+		expect(fetchOptions).toMatchObject({
+			cache: 'no-store',
+			credentials: 'omit',
+			method: 'GET',
+			redirect: 'manual',
+			referrerPolicy: 'no-referrer',
+		})
+		expect(headers.get('Accept')).toContain('image/jpeg')
+		expect(headers.get('Accept-Encoding')).toBe('identity')
+		expect(headers.has('Authorization')).toBe(false)
+		expect(headers.has('Cookie')).toBe(false)
+	})
+
+	test('allows a bounded redirect to a validated regional S3 image', async () => {
+		const request = makeStillImageRequest('https://studio.example.com/media/redirect')
+		const imageBytes = makeStaticWebp()
+		const imageFetch = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(null, {
+					headers: {
+						Location:
+							'https://review-bucket.s3.us-east-1.amazonaws.com/image.webp?X-Amz-Signature=safe',
+					},
+					status: 302,
+				})
+			)
+			.mockResolvedValueOnce(
+				new Response(imageBytes, { headers: { 'Content-Type': 'image/webp' } })
+			)
+		const gateway = makeGateway(request, config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).resolves.toMatchObject({
+			contentType: 'image/webp',
+		})
+		expect(imageFetch).toHaveBeenCalledTimes(2)
+		expect(imageFetch.mock.calls[1][0].toString()).toContain(
+			'review-bucket.s3.us-east-1.amazonaws.com/image.webp'
+		)
+	})
+
+	test('rejects an image after the bounded redirect limit', async () => {
+		const imageFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(null, {
+					headers: { Location: '/media/redirect-again' },
+					status: 302,
+				})
+		)
+		const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		expect(imageFetch).toHaveBeenCalledTimes(4)
+	})
+
+	test('times out and cancels a stalled image request', async () => {
+		const imageFetch = vi.fn<typeof fetch>(async (_url, init) => {
+			return await new Promise<Response>((_resolve, reject) => {
+				const signal = init?.signal
+				if (signal?.aborted) {
+					reject(new Error('aborted'))
+					return
+				}
+				signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+			})
+		})
+		const gateway = makeGateway(makeStillImageRequest(), { ...config, timeoutMs: 1 }, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_TIMEOUT',
+			status: 504,
+		})
+		expect(imageFetch).toHaveBeenCalledOnce()
+		expect(imageFetch.mock.calls[0][1]?.signal?.aborted).toBe(true)
+	})
+
+	test('bounds concurrent image work before buffering more response bodies', async () => {
+		let release!: () => void
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const imageFetch = vi.fn<typeof fetch>(async () => {
+			await gate
+			return new Response(makePng(false), { headers: { 'Content-Type': 'image/png' } })
+		})
+		const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+		const pending = Array.from({ length: 4 }, () => gateway.getVersionImage(201, 301))
+		await vi.waitFor(() => expect(imageFetch).toHaveBeenCalledTimes(4))
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_RATE_LIMITED',
+			retryable: true,
+			status: 429,
+		})
+
+		release()
+		await expect(Promise.all(pending)).resolves.toHaveLength(4)
+	})
+
+	test.each([
+		['untrusted source', 'https://evil.example/image.jpg', null],
+		[
+			'untrusted redirect',
+			'https://studio.example.com/media/redirect',
+			'https://evil.example/image.jpg',
+		],
+		[
+			'lookalike S3 redirect',
+			'https://studio.example.com/media/redirect',
+			'https://bucket.s3.us-east-1.amazonaws.com.evil.example/image.jpg',
+		],
+	] as const)('rejects an %s URL before downloading its body', async (_name, source, redirect) => {
+		const request = makeStillImageRequest(source)
+		const cancel = vi.fn()
+		const imageFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(
+					new ReadableStream({
+						cancel,
+						start() {
+							// Keep the redirect body pending so cancellation is observable.
+						},
+					}),
+					redirect ? { headers: { Location: redirect }, status: 302 } : { status: 200 }
+				)
+		)
+		const gateway = makeGateway(request, config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		if (redirect) {
+			expect(imageFetch).toHaveBeenCalledOnce()
+			expect(cancel).toHaveBeenCalledOnce()
+		} else {
+			expect(imageFetch).not.toHaveBeenCalled()
+		}
+	})
+
+	test('rejects a Version that no longer belongs to the exact Playlist before fetching media', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 201, type: 'Playlist' } })
+			.mockResolvedValueOnce(makeStillVersionResponse('https://studio.example.com/image.jpg', 202))
+		const imageFetch = vi.fn<typeof fetch>()
+		const gateway = makeGateway(request, config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+		expect(imageFetch).not.toHaveBeenCalled()
+	})
+
+	test('rejects and cancels image bodies over the declared or streamed 32 MiB cap', async () => {
+		const overLimit = 32 * 1024 * 1024 + 1
+		const headerCancel = vi.fn()
+		const streamCancel = vi.fn()
+		const imageFetch = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(new ReadableStream({ cancel: headerCancel }), {
+					headers: {
+						'Content-Length': String(overLimit),
+						'Content-Type': 'image/jpeg',
+					},
+				})
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					new ReadableStream<Uint8Array>({
+						cancel: streamCancel,
+						start(controller) {
+							controller.enqueue(new Uint8Array(32 * 1024 * 1024))
+							controller.enqueue(new Uint8Array(1))
+						},
+					}),
+					{ headers: { 'Content-Type': 'image/jpeg' } }
+				)
+			)
+		const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+		})
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+		})
+		expect(headerCancel).toHaveBeenCalledOnce()
+		expect(streamCancel).toHaveBeenCalledOnce()
+	})
+
+	test.each([
+		['forged JPEG', 'image/jpeg', Buffer.from('<html>not an image</html>')],
+		['animated PNG', 'image/png', makePng(true)],
+		['animated WebP', 'image/webp', makeAnimatedWebp()],
+		['SVG', 'image/svg+xml', Buffer.from('<svg/>')],
+	] as const)('rejects %s media', async (_name, contentType, body) => {
+		const imageFetch = vi.fn<typeof fetch>(
+			async () => new Response(body, { headers: { 'Content-Type': contentType } })
+		)
+		const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+	})
+
+	test.each([
+		['PNG', 'image/png', makePng(false)],
+		['WebP', 'image/webp', makeStaticWebp()],
+	] as const)(
+		'accepts static %s media with matching magic bytes',
+		async (_name, contentType, body) => {
+			const imageFetch = vi.fn<typeof fetch>(
+				async () => new Response(body, { headers: { 'Content-Type': contentType } })
+			)
+			const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+
+			await expect(gateway.getVersionImage(201, 301)).resolves.toMatchObject({ contentType })
+		}
+	)
+
+	test('rejects static raster headers whose dimensions exceed the review limits', async () => {
+		const imageFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(makePng(false, 8192, 8192), {
+					headers: { 'Content-Type': 'image/png' },
+				})
+		)
+		const gateway = makeGateway(makeStillImageRequest(), config, imageFetch)
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+	})
+
 	test('rejects a selected version whose typed playlist relationship does not match', async () => {
 		const request = vi
 			.fn()
@@ -646,6 +945,95 @@ function makeVersionResponse(
 			type: 'Version',
 		},
 	}
+}
+
+function makeStillVersionResponse(
+	imageUrl: string,
+	playlistId = 201,
+	playlistType = 'Playlist',
+	versionId = 301
+) {
+	const response = makeVersionResponse('', playlistId, playlistType, versionId)
+	const { sg_uploaded_movie: _movie, ...attributes } = response.data.attributes
+	return { data: { ...response.data, attributes: { ...attributes, image: imageUrl } } }
+}
+
+function makeStillImageRequest(imageUrl = 'https://studio.example.com/media/image.jpg') {
+	return vi.fn(async (path: string) => {
+		if (path === '/entity/playlists/201') return { data: { id: 201, type: 'Playlist' } }
+		if (path === '/entity/versions/301') return makeStillVersionResponse(imageUrl)
+		throw new Error(`Unexpected request: ${path}`)
+	})
+}
+
+function makeJpeg(width = 1, height = 1) {
+	const startOfFrame = Buffer.alloc(11)
+	startOfFrame.writeUInt16BE(11, 0)
+	startOfFrame[2] = 8
+	startOfFrame.writeUInt16BE(height, 3)
+	startOfFrame.writeUInt16BE(width, 5)
+	startOfFrame[7] = 1
+	startOfFrame[8] = 1
+	startOfFrame[9] = 0x11
+	return Buffer.concat([
+		Buffer.from([0xff, 0xd8, 0xff, 0xc0]),
+		startOfFrame,
+		Buffer.from([0xff, 0xd9]),
+	])
+}
+
+function makePng(animated: boolean, width = 1, height = 1) {
+	const header = Buffer.alloc(13)
+	header.writeUInt32BE(width, 0)
+	header.writeUInt32BE(height, 4)
+	header[8] = 8
+	header[9] = 6
+	return Buffer.concat([
+		Buffer.from('89504e470d0a1a0a', 'hex'),
+		makePngChunk('IHDR', header),
+		...(animated ? [makePngChunk('acTL', Buffer.alloc(8))] : []),
+		makePngChunk('IDAT', Buffer.alloc(0)),
+		makePngChunk('IEND', Buffer.alloc(0)),
+	])
+}
+
+function makePngChunk(type: string, data: Buffer) {
+	const header = Buffer.alloc(8)
+	header.writeUInt32BE(data.byteLength, 0)
+	header.write(type, 4, 4, 'ascii')
+	return Buffer.concat([header, data, Buffer.alloc(4)])
+}
+
+function makeStaticWebp() {
+	return makeWebp([
+		makeWebpChunk('VP8X', Buffer.alloc(10)),
+		makeWebpChunk('VP8 ', Buffer.from([0])),
+	])
+}
+
+function makeAnimatedWebp() {
+	const extendedHeader = Buffer.alloc(10)
+	extendedHeader[0] = 0x02
+	return makeWebp([
+		makeWebpChunk('VP8X', extendedHeader),
+		makeWebpChunk('ANIM', Buffer.alloc(6)),
+		makeWebpChunk('VP8 ', Buffer.from([0])),
+	])
+}
+
+function makeWebp(chunks: Buffer[]) {
+	const payload = Buffer.concat([Buffer.from('WEBP'), ...chunks])
+	const header = Buffer.alloc(8)
+	header.write('RIFF', 0, 4, 'ascii')
+	header.writeUInt32LE(payload.byteLength, 4)
+	return Buffer.concat([header, payload])
+}
+
+function makeWebpChunk(type: string, data: Buffer) {
+	const header = Buffer.alloc(8)
+	header.write(type, 0, 4, 'ascii')
+	header.writeUInt32LE(data.byteLength, 4)
+	return Buffer.concat([header, data, ...(data.byteLength % 2 ? [Buffer.alloc(1)] : [])])
 }
 
 function makeGateway(

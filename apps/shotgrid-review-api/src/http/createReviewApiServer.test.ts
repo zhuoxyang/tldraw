@@ -77,6 +77,30 @@ describe('createReviewApiServer', () => {
 		expect(gateway.listVersions).toHaveBeenCalledWith(201)
 	})
 
+	test('serves a bounded image payload with non-cacheable, non-sniffable headers', async () => {
+		const imageBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0])
+		const getVersionImage = vi.fn<ReviewGateway['getVersionImage']>(async () => ({
+			body: imageBytes,
+			contentType: 'image/jpeg',
+		}))
+		const gateway = makeGateway({ getVersionImage })
+		const baseUrl = await start(gateway)
+
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/media/image`)
+
+		expect(response.status).toBe(200)
+		expect(response.headers.get('cache-control')).toBe('no-store')
+		expect(response.headers.get('content-length')).toBe(String(imageBytes.byteLength))
+		expect(response.headers.get('content-type')).toBe('image/jpeg')
+		expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+		expect(response.headers.get('x-request-id')).toBe('test-request-id')
+		expect(Buffer.from(await response.arrayBuffer())).toEqual(imageBytes)
+		expect(getVersionImage).toHaveBeenCalledOnce()
+		const [playlistId, versionId, signal] = getVersionImage.mock.calls[0]
+		expect([playlistId, versionId]).toEqual([201, 301])
+		expect(signal).toBeInstanceOf(AbortSignal)
+	})
+
 	test('keeps health public but requires the trusted proxy for live review routes', async () => {
 		const gateway = makeGateway()
 		const logger = { error: vi.fn() }
@@ -287,6 +311,12 @@ describe('createReviewApiServer', () => {
 			error: { code: 'INVALID_REQUEST', retryable: false },
 		})
 
+		const invalidMediaId = await fetch(`${baseUrl}/api/review/playlists/201/versions/0/media/image`)
+		expect(invalidMediaId.status).toBe(400)
+		expect(await invalidMediaId.json()).toMatchObject({
+			error: { code: 'INVALID_REQUEST', retryable: false },
+		})
+
 		const missing = await fetch(`${baseUrl}/api/unknown`)
 		expect(missing.status).toBe(404)
 		expect(await missing.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
@@ -464,6 +494,10 @@ function makeGateway(overrides: Partial<ReviewGateway> = {}): ReviewGateway {
 			...VERSION_FIXTURE,
 			id: versionId,
 			playlistId,
+		})),
+		getVersionImage: vi.fn(async () => ({
+			body: PNG_BYTES,
+			contentType: 'image/png' as const,
 		})),
 		listPlaylists: vi.fn(async (projectId) => [
 			{
