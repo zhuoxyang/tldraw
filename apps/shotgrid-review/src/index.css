@@ -405,6 +405,84 @@ select {
 	position: relative;
 }
 
+.review-canvas-message {
+	align-items: center;
+	background: radial-gradient(circle at 50% 35%, rgb(27 98 130 / 18%), transparent 42%), #0b121d;
+	color: #dbeafe;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	inset: 0;
+	justify-content: center;
+	padding: 32px;
+	position: absolute;
+	text-align: center;
+}
+
+.review-canvas-message span {
+	color: #94a3b8;
+	font-size: 12px;
+	line-height: 1.55;
+	max-width: 460px;
+}
+
+.review-canvas-message button,
+.review-editor-actions button {
+	background: #1b6282;
+	border: 1px solid #2b85aa;
+	border-radius: 7px;
+	color: #e0f2fe;
+	cursor: pointer;
+	font: inherit;
+	padding: 7px 10px;
+}
+
+.review-canvas-message button:disabled,
+.review-editor-actions button:disabled {
+	cursor: not-allowed;
+	opacity: 0.5;
+}
+
+.review-editor-actions {
+	align-items: flex-end;
+	background: rgb(15 23 36 / 94%);
+	border: 1px solid #344258;
+	border-radius: 10px;
+	box-shadow: 0 8px 28px rgb(0 0 0 / 30%);
+	display: flex;
+	flex-direction: column;
+	gap: 7px;
+	margin: 8px;
+	max-width: min(620px, calc(100vw - 48px));
+	padding: 7px;
+	pointer-events: all;
+}
+
+.review-editor-actions__buttons {
+	display: flex;
+	gap: 6px;
+}
+
+.review-editor-actions button {
+	font-size: 11px;
+}
+
+.review-editor-actions > span {
+	color: #bae6fd;
+	font-size: 10px;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+}
+
+.review-editor-actions > .review-editor-actions__error {
+	color: #fca5a5;
+}
+
+.review-image-bounds-overlay {
+	fill: rgb(3 8 15 / 58%);
+	pointer-events: none;
+}
+
 .review-message {
 	align-items: center;
 	background: #0f1724;

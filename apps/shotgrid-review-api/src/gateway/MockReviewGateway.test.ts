@@ -45,14 +45,23 @@ describe('MockReviewGateway', () => {
 			entity: { id: 501, name: 'shot_010', type: 'Shot' },
 			id: 301,
 			media: {
-				contentType: 'image/svg+xml',
-				thumbnailUrl: '/mock-media/northstar-lighting.svg',
-				url: '/mock-media/northstar-lighting.svg',
+				contentType: 'image/png',
+				thumbnailUrl: '/mock-media/northstar-lighting.png',
+				url: '/mock-media/northstar-lighting.png',
 			},
 			playlistId: 201,
 			task: { id: 601, name: 'Lighting' },
 		})
 		await expect(gateway.getVersion(202, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+	})
+
+	test('does not proxy mock media that is already served by the review app', async () => {
+		const gateway = new MockReviewGateway()
+
+		await expect(gateway.getVersionImage(201, 301)).rejects.toMatchObject({
 			code: 'NOT_FOUND',
 			status: 404,
 		})

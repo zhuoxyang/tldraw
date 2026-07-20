@@ -93,6 +93,36 @@ describe('createReviewApiClient', () => {
 		expect(String(fetch.mock.calls[0][0])).toBe('https://review.example.test/gateway/api/health')
 	})
 
+	it('resolves protected media routes through the configured API base URL', async () => {
+		const proxyPath = '/review/playlists/201/versions/301/media/image'
+		const imageVersion: ReviewVersion = {
+			...version,
+			media: {
+				contentType: 'image/jpeg',
+				height: null,
+				kind: 'image',
+				thumbnailUrl: proxyPath,
+				url: proxyPath,
+				width: null,
+			},
+		}
+		const responses = [jsonResponse({ data: [imageVersion] }), jsonResponse({ data: imageVersion })]
+		const fetch = vi.fn<typeof globalThis.fetch>(async () => responses.shift()!)
+		const client = createReviewApiClient({
+			baseUrl: 'https://review.example.test/gateway/api',
+			fetch,
+		})
+		const expectedUrl =
+			'https://review.example.test/gateway/api/review/playlists/201/versions/301/media/image'
+
+		await expect(client.listVersions(201)).resolves.toMatchObject([
+			{ media: { thumbnailUrl: expectedUrl, url: expectedUrl } },
+		])
+		await expect(client.getVersion(201, 301)).resolves.toMatchObject({
+			media: { thumbnailUrl: expectedUrl, url: expectedUrl },
+		})
+	})
+
 	it.each([
 		'',
 		'api',

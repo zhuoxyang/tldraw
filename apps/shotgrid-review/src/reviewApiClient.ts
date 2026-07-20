@@ -131,10 +131,11 @@ export function createReviewApiClient({
 		async getVersion(playlistId, versionId, signal) {
 			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
 			const validVersionId = requirePositiveId(versionId, 'versionId')
-			return unwrapData(
+			const version = unwrapData(
 				await request(`/review/playlists/${validPlaylistId}/versions/${validVersionId}`, signal),
 				isReviewVersion
 			)
+			return resolveReviewVersionMediaUrls(version, normalizedBaseUrl)
 		},
 
 		async listPlaylists(projectId, signal) {
@@ -151,12 +152,28 @@ export function createReviewApiClient({
 
 		async listVersions(playlistId, signal) {
 			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
-			return unwrapDataArray(
+			const versions = unwrapDataArray(
 				await request(`/review/playlists/${validPlaylistId}/versions`, signal),
 				isReviewVersion
 			)
+			return versions.map((version) => resolveReviewVersionMediaUrls(version, normalizedBaseUrl))
 		},
 	}
+}
+
+function resolveReviewVersionMediaUrls(version: ReviewVersion, baseUrl: string): ReviewVersion {
+	if (!version.media) return version
+	const url = resolveReviewMediaUrl(version.media.url, baseUrl)
+	const thumbnailUrl = resolveReviewMediaUrl(version.media.thumbnailUrl, baseUrl)
+	if (url === version.media.url && thumbnailUrl === version.media.thumbnailUrl) return version
+	return { ...version, media: { ...version.media, thumbnailUrl, url } }
+}
+
+function resolveReviewMediaUrl(value: string, baseUrl: string): string
+function resolveReviewMediaUrl(value: null, baseUrl: string): null
+function resolveReviewMediaUrl(value: null | string, baseUrl: string): null | string
+function resolveReviewMediaUrl(value: null | string, baseUrl: string) {
+	return value?.startsWith('/review/') ? `${baseUrl}${value}` : value
 }
 
 function normalizeBaseUrl(value: string) {

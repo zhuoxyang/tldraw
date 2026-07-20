@@ -8,7 +8,7 @@ import type {
 	UploadReviewAttachmentRequest,
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
-import type { ReviewGateway } from '../gateway/ReviewGateway'
+import type { ReviewGateway, ReviewImageProxyPayload } from '../gateway/ReviewGateway'
 
 const JSON_BODY_LIMIT = 1024 * 1024
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -168,6 +168,34 @@ function matchRoute(
 		})
 	}
 
+	const playlistVersionImage = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/media\/image$/
+	)
+	if (playlistVersionImage.matched) {
+		return getRoute(async (request) => {
+			const playlistId = requirePositiveId(playlistVersionImage.firstId, 'playlistId')
+			const versionId = requirePositiveId(playlistVersionImage.secondId, 'versionId')
+			const controller = new AbortController()
+			const abort = () => controller.abort()
+			const abortOnPrematureClose = () => {
+				if (!response.writableEnded) abort()
+			}
+			request.once('aborted', abort)
+			response.once('close', abortOnPrematureClose)
+			try {
+				const image = await gateway.getVersionImage(playlistId, versionId, controller.signal)
+				if (!controller.signal.aborted && !response.destroyed) sendImage(response, image)
+			} catch (error) {
+				if (controller.signal.aborted && (request.destroyed || response.destroyed)) return
+				throw error
+			} finally {
+				request.off('aborted', abort)
+				response.off('close', abortOnPrematureClose)
+			}
+		})
+	}
+
 	const playlistVersion = matchTwoIdPath(
 		pathname,
 		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)$/
@@ -208,10 +236,10 @@ function matchRoute(
 
 	return undefined
 
-	function getRoute(handle: () => Promise<void>): RouteMatch {
+	function getRoute(handle: (request: IncomingMessage) => Promise<void>): RouteMatch {
 		return {
 			allowedMethods: ['GET'],
-			handle: async () => handle(),
+			handle: async (_method, request) => handle(request),
 		}
 	}
 
@@ -526,4 +554,13 @@ function sendJson(response: ServerResponse, status: number, body: unknown) {
 	response.statusCode = status
 	response.setHeader('Content-Type', 'application/json; charset=utf-8')
 	response.end(JSON.stringify(body))
+}
+
+function sendImage(response: ServerResponse, image: ReviewImageProxyPayload) {
+	if (response.writableEnded || response.destroyed) return
+	const body = Buffer.from(image.body.buffer, image.body.byteOffset, image.body.byteLength)
+	response.statusCode = 200
+	response.setHeader('Content-Length', String(body.byteLength))
+	response.setHeader('Content-Type', image.contentType)
+	response.end(body)
 }
