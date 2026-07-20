@@ -244,6 +244,26 @@ describe('review video installation and protection', () => {
 		expect(harness.disposers.every((disposer) => disposer.mock.calls.length === 1)).toBe(true)
 	})
 
+	it('defers local-only layer repairs until after the triggering atomic side effect', async () => {
+		const shape = makeShape(source)
+		const harness = makeProtectionEditor(shape)
+		const dispose = protectReviewVideo(harness.editor, source, { localOnly: true })
+
+		expect(harness.mergeRemoteChanges).not.toHaveBeenCalled()
+		await Promise.resolve()
+		expect(harness.mergeRemoteChanges).toHaveBeenCalledOnce()
+
+		harness.ids = [createShapeId('new-annotation'), shape.id]
+		harness.insideSideEffect = true
+		harness.afterCreate?.()
+		harness.insideSideEffect = false
+		expect(harness.mergeRemoteChanges).toHaveBeenCalledOnce()
+		await Promise.resolve()
+		expect(harness.mergeRemoteChanges).toHaveBeenCalledTimes(2)
+
+		dispose()
+	})
+
 	it('binds identity to both the Version and Attachment', () => {
 		const shape = makeShape(source)
 		expect(isReviewVideoShapeForSource(shape, source)).toBe(true)
@@ -296,6 +316,7 @@ function makeInstallEditor() {
 		}),
 		getCamera: () => ({ x: 1, y: 2, z: 3 }),
 		getCurrentPageId: () => pageId,
+		getIsReadonly: () => false,
 		getShape: () => shape,
 		moveShapesToPage: vi.fn(),
 		run: (operation: () => void) => operation(),
@@ -317,6 +338,10 @@ function makeProtectionEditor(shape: ReviewVideoShape) {
 	const sendToBack = vi.fn(() => {
 		harness.ids = [shape.id]
 	})
+	const mergeRemoteChanges = vi.fn((operation: () => void) => {
+		if (harness.insideSideEffect) throw new Error('nested remote merge')
+		operation()
+	})
 	const harness = {
 		afterCreate,
 		beforeChange,
@@ -324,13 +349,17 @@ function makeProtectionEditor(shape: ReviewVideoShape) {
 		disposers,
 		editor: undefined as unknown as Editor,
 		ids: [createShapeId('annotation'), shape.id] as TLShapeId[],
+		insideSideEffect: false,
+		mergeRemoteChanges,
 		sendToBack,
 	}
 	harness.editor = {
+		getIsReadonly: () => false,
 		getShape: (id: TLShapeId) => (id === shape.id ? shape : undefined),
 		getSortedChildIdsForParent: () => harness.ids,
 		run: (operation: () => void) => operation(),
 		sendToBack,
+		store: { mergeRemoteChanges },
 		sideEffects: {
 			registerAfterChangeHandler: (_type: string, handler: () => void) => {
 				harness.afterCreate = handler

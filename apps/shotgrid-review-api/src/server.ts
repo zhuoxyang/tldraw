@@ -1,3 +1,4 @@
+import { ReviewCollaborationService } from './collaboration/ReviewCollaborationService'
 import { parseGatewayConfig } from './config'
 import { MockReviewGateway } from './gateway/MockReviewGateway'
 import type { ReviewGateway } from './gateway/ReviewGateway'
@@ -28,8 +29,19 @@ if (config.mode === 'shotgrid') {
 	gateway = new MockReviewGateway()
 }
 
+const collaboration = new ReviewCollaborationService({
+	deploymentScope:
+		config.mode === 'shotgrid' ? config.shotgrid.siteUrl : `mock:${config.allowedOrigin}`,
+	gateway,
+	maxRooms: config.collaborationMaxRooms,
+	maxSessionsPerRoom: config.collaborationMaxSessionsPerRoom,
+	secret: config.collaborationSecret,
+	storeDir: config.collaborationStoreDir,
+})
+
 const server = createReviewApiServer({
 	allowedOrigin: config.allowedOrigin,
+	collaboration,
 	decisions: config.decisions,
 	gateway,
 	mode: config.mode,
@@ -51,3 +63,15 @@ server.listen(config.port, config.host, () => {
 		`ShotGrid review API listening on http://${config.host}:${config.port} (${config.mode} mode)\n`
 	)
 })
+
+function requestShutdown(signal: 'SIGINT' | 'SIGTERM') {
+	process.stdout.write(`ShotGrid review API received ${signal}; closing active review rooms\n`)
+	server.close((error) => {
+		if (!error) return
+		process.stderr.write('ShotGrid review API could not shut down cleanly\n')
+		process.exitCode = 1
+	})
+}
+
+process.once('SIGINT', () => requestShutdown('SIGINT'))
+process.once('SIGTERM', () => requestShutdown('SIGTERM'))

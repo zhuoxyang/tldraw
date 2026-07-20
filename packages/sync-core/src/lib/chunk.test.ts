@@ -141,7 +141,7 @@ for (let i = 0; i < 1000; i++) {
 	testObject['key_' + i] = 'value_' + i
 }
 
-describe('JsonChunkAssembler (CH4–CH8)', () => {
+describe('JsonChunkAssembler (CH4–CH10)', () => {
 	describe('whole JSON messages while idle (CH4)', () => {
 		it('[CH4] parses a message starting with { immediately and returns data and stringified', () => {
 			const unchunker = new JsonChunkAssembler()
@@ -368,5 +368,73 @@ describe('JsonChunkAssembler (CH4–CH8)', () => {
 				data: { text: 'hello\u2028world\u2029end' },
 			})
 		})
+	})
+
+	describe('resource limits (CH9)', () => {
+		it.each([
+			['Infinity', 'Infinity_{}'],
+			['negative', '-1_{}'],
+			['fractional', '1.5_{}'],
+			['unsafe integer', '9007199254740992_{}'],
+			['non-finite numeric text', `${'9'.repeat(400)}_{}`],
+		])('[CH9] rejects a %s chunk count and resets', (_description, message) => {
+			const assembler = new JsonChunkAssembler()
+			expect(assembler.handleMessage('1_{')).toBeNull()
+
+			const result = assembler.handleMessage(message)
+			assert(result && 'error' in result, 'expected error result')
+
+			expect(assembler.handleMessage('0_{"ok":true}')).toMatchObject({ data: { ok: true } })
+		})
+
+		it('[CH9] rejects a declared chunk count above the configured limit and resets', () => {
+			const assembler = new JsonChunkAssembler({ maxMessageChunks: 2 })
+
+			const result = assembler.handleMessage('2_{}')
+			assert(result && 'error' in result, 'expected error result')
+			expect(result.error.message).toContain('maximum chunk count of 2')
+
+			expect(assembler.handleMessage('0_{"ok":true}')).toMatchObject({ data: { ok: true } })
+		})
+
+		it('[CH9] enforces cumulative UTF-8 bytes and handles surrogate pairs across chunks', () => {
+			const emoji = '🎨'
+			const exactAssembler = new JsonChunkAssembler({ maxMessageSizeBytes: 12 })
+			expect(exactAssembler.handleMessage(`1_{"x":"${emoji[0]}`)).toBeNull()
+			expect(exactAssembler.handleMessage(`0_${emoji[1]}"}`)).toMatchObject({
+				data: { x: emoji },
+			})
+
+			const oversizedAssembler = new JsonChunkAssembler({ maxMessageSizeBytes: 11 })
+			expect(oversizedAssembler.handleMessage(`1_{"x":"${emoji[0]}`)).toBeNull()
+			const result = oversizedAssembler.handleMessage(`0_${emoji[1]}"}`)
+			assert(result && 'error' in result, 'expected error result')
+			expect(result.error.message).toContain('maximum size of 11 bytes')
+
+			expect(oversizedAssembler.handleMessage('{"ok":1}')).toMatchObject({ data: { ok: 1 } })
+		})
+
+		it('[CH9] applies the UTF-8 byte limit to unchunked messages', () => {
+			const assembler = new JsonChunkAssembler({ maxMessageSizeBytes: 11 })
+			const result = assembler.handleMessage('{"x":"🎨"}')
+			assert(result && 'error' in result, 'expected error result')
+			expect(result.error.message).toContain('maximum size of 11 bytes')
+		})
+	})
+
+	describe('limit configuration (CH10)', () => {
+		it.each([0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+			'[CH10] rejects invalid maxMessageSizeBytes value %s',
+			(value) => {
+				expect(() => new JsonChunkAssembler({ maxMessageSizeBytes: value })).toThrow(RangeError)
+			}
+		)
+
+		it.each([0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+			'[CH10] rejects invalid maxMessageChunks value %s',
+			(value) => {
+				expect(() => new JsonChunkAssembler({ maxMessageChunks: value })).toThrow(RangeError)
+			}
+		)
 	})
 })

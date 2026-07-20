@@ -516,18 +516,30 @@ export class ReconnectManager {
 	private scheduleAttempt() {
 		assert(this.state === 'pendingAttempt')
 		debug('scheduling a connection attempt')
-		Promise.resolve(this.getUri()).then((uri) => {
-			// this can happen if the promise gets resolved too late
-			if (this.state !== 'pendingAttempt' || this.isDisposed) return
-			assert(
-				this.socketAdapter._ws?.readyState !== WebSocket.OPEN,
-				'There should be no connection attempts while already connected'
-			)
+		Promise.resolve()
+			.then(() => this.getUri())
+			.then(
+				(uri) => {
+					// this can happen if the promise gets resolved too late
+					if (this.state !== 'pendingAttempt' || this.isDisposed) return
+					assert(
+						this.socketAdapter._ws?.readyState !== WebSocket.OPEN,
+						'There should be no connection attempts while already connected'
+					)
 
-			this.lastAttemptStart = Date.now()
-			this.socketAdapter._setNewSocket(new WebSocket(httpToWs(uri)))
-			this.state = 'pendingAttemptResult'
-		})
+					this.lastAttemptStart = Date.now()
+					this.socketAdapter._setNewSocket(new WebSocket(httpToWs(uri)))
+					this.state = 'pendingAttemptResult'
+				},
+				() => {
+					if (this.state !== 'pendingAttempt' || this.isDisposed) return
+					// Dynamic URI providers often fetch one-use authorization. Treat a rejected
+					// fetch like a failed socket attempt so it backs off and requests a fresh URI.
+					this.lastAttemptStart = Date.now()
+					this.state = 'pendingAttemptResult'
+					this.disconnected()
+				}
+			)
 	}
 
 	private getMaxDelay() {

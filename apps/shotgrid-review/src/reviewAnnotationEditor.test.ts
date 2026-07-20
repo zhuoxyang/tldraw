@@ -1,4 +1,4 @@
-import { Box, createShapeId, type Editor, type TLShape } from 'tldraw'
+import { Box, createShapeId, type Editor, type TLShape, type TLShapeId } from 'tldraw'
 import { describe, expect, it, vi } from 'vitest'
 import {
 	disableReviewExternalContent,
@@ -8,6 +8,7 @@ import {
 	getReviewImageIds,
 	getReviewImageShapeProps,
 	getReviewMarkerSize,
+	protectReviewImage,
 } from './reviewAnnotationEditor'
 
 describe('review annotation editor helpers', () => {
@@ -94,5 +95,65 @@ describe('review annotation editor helpers', () => {
 		expect(getReviewMarkerSize(320, 180)).toBe(36)
 		expect(getReviewMarkerSize(1920, 1080)).toBe(54)
 		expect(getReviewMarkerSize(8192, 4096)).toBe(96)
+	})
+
+	it('defers local-only image layer repairs outside store side effects', async () => {
+		const image = {
+			blob: new Blob(['image'], { type: 'image/png' }),
+			contentType: 'image/png',
+			height: 1080,
+			name: 'shot_010_lgt_v014',
+			sha256: 'a'.repeat(64),
+			versionId: 301,
+			width: 1920,
+		}
+		const { shapeId } = getReviewImageIds(image.versionId)
+		const parentId = createShapeId('page-parent')
+		const shape = { id: shapeId, parentId, type: 'image' } as TLShape
+		let ids = [createShapeId('annotation'), shapeId] as TLShapeId[]
+		let insideSideEffect = false
+		let afterChange: (() => void) | undefined
+		const sendToBack = vi.fn(() => {
+			ids = [shapeId]
+		})
+		const mergeRemoteChanges = vi.fn((operation: () => void) => {
+			if (insideSideEffect) throw new Error('nested remote merge')
+			operation()
+		})
+		const editor = {
+			getIsReadonly: () => false,
+			getShape: (id: TLShapeId) => (id === shapeId ? shape : undefined),
+			getSortedChildIdsForParent: () => ids,
+			run: (operation: () => void) => operation(),
+			sendToBack,
+			sideEffects: {
+				registerAfterChangeHandler: (_type: string, handler: () => void) => {
+					afterChange = handler
+					return vi.fn()
+				},
+				registerAfterCreateHandler: (_type: string, handler: () => void) => {
+					afterChange = handler
+					return vi.fn()
+				},
+				registerBeforeChangeHandler: () => vi.fn(),
+				registerBeforeDeleteHandler: () => vi.fn(),
+			},
+			store: { mergeRemoteChanges },
+		} as unknown as Editor
+		const dispose = protectReviewImage(editor, image, { localOnly: true })
+
+		expect(mergeRemoteChanges).not.toHaveBeenCalled()
+		await Promise.resolve()
+		expect(mergeRemoteChanges).toHaveBeenCalledOnce()
+
+		ids = [createShapeId('new-annotation'), shapeId]
+		insideSideEffect = true
+		afterChange?.()
+		insideSideEffect = false
+		expect(mergeRemoteChanges).toHaveBeenCalledOnce()
+		await Promise.resolve()
+		expect(mergeRemoteChanges).toHaveBeenCalledTimes(2)
+
+		dispose()
 	})
 })

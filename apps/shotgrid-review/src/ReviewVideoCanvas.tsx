@@ -24,6 +24,7 @@ import {
 	type TLComponents,
 	type TLShape,
 	type TLShapeId,
+	type TLStore,
 	type TLUiOverrides,
 } from 'tldraw'
 import { disableReviewExternalContent, ReviewMarkerTool } from './reviewAnnotationEditor'
@@ -90,12 +91,15 @@ const baseReviewVideoUiOverrides: TLUiOverrides = {
 }
 
 export interface ReviewVideoCanvasProps {
+	allowSnapshotImport?: boolean
+	collaborationReadOnly?: boolean
 	documentKey: string
 	licenseKey?: string
 	media: ReviewVideoMedia
 	persistenceKey?: string
 	projectId: number
 	reviewScope: string
+	store?: TLStore
 	versionId: number
 	versionName: string
 }
@@ -123,12 +127,15 @@ type OperationState =
 	| { message: string; status: 'error' | 'success' }
 
 export function ReviewVideoCanvas({
+	allowSnapshotImport = true,
+	collaborationReadOnly = false,
 	documentKey,
 	licenseKey,
 	media,
 	persistenceKey,
 	projectId,
 	reviewScope,
+	store,
 	versionId,
 	versionName,
 }: ReviewVideoCanvasProps) {
@@ -331,14 +338,25 @@ export function ReviewVideoCanvas({
 
 	useEffect(() => {
 		if (!editor) return
-		installReviewVideo(editor, source)
+		const localOnly = store !== undefined
+		const install = () => installReviewVideo(editor, source, { localOnly })
+		install()
 		protectionRef.current?.()
-		protectionRef.current = protectReviewVideo(editor, source)
+		protectionRef.current = protectReviewVideo(editor, source, { localOnly })
+		const stopWatching = localOnly
+			? editor.store.listen(
+					() => {
+						if (!editor.getShape(getReviewVideoShapeId(source.versionId))) install()
+					},
+					{ scope: 'document', source: 'remote' }
+				)
+			: undefined
 		return () => {
+			stopWatching?.()
 			protectionRef.current?.()
 			protectionRef.current = null
 		}
-	}, [editor, source])
+	}, [editor, source, store])
 
 	useEffect(() => {
 		if (!editor || metadata.status !== 'ready') return
@@ -349,29 +367,38 @@ export function ReviewVideoCanvas({
 				status: 'error',
 			})
 		const pendingPageReparents = new Set<TLShapeId>()
-		const disposeCreate = editor.sideEffects.registerBeforeCreateHandler('shape', (shape) => {
-			if (!isTargetedAnnotationShape(shape) || !targetRef.current) return shape
-			const targetedShape = {
-				...shape,
-				meta: {
-					...shape.meta,
-					[REVIEW_ANNOTATION_TARGET_META_KEY]: targetRef.current as unknown as JsonObject,
-				},
-			}
-			if (isReviewAnnotationShapeParentCompatible(editor, targetedShape, timing)) {
+		const disposeCreate = editor.sideEffects.registerBeforeCreateHandler(
+			'shape',
+			(shape, changeSource) => {
+				if (changeSource === 'remote') return shape
+				if (!isTargetedAnnotationShape(shape) || !targetRef.current) return shape
+				const targetedShape = {
+					...shape,
+					meta: {
+						...shape.meta,
+						[REVIEW_ANNOTATION_TARGET_META_KEY]: targetRef.current as unknown as JsonObject,
+					},
+				}
+				if (isReviewAnnotationShapeParentCompatible(editor, targetedShape, timing)) {
+					return targetedShape
+				}
+				reportTemporalRelationshipError()
+				pendingPageReparents.add(targetedShape.id)
 				return targetedShape
 			}
-			reportTemporalRelationshipError()
-			pendingPageReparents.add(targetedShape.id)
-			return targetedShape
-		})
-		const disposeShapeCreate = editor.sideEffects.registerAfterCreateHandler('shape', (shape) => {
-			if (!pendingPageReparents.delete(shape.id)) return
-			editor.reparentShapes([shape.id], editor.getCurrentPageId())
-		})
+		)
+		const disposeShapeCreate = editor.sideEffects.registerAfterCreateHandler(
+			'shape',
+			(shape, changeSource) => {
+				if (changeSource === 'remote') return
+				if (!pendingPageReparents.delete(shape.id)) return
+				editor.reparentShapes([shape.id], editor.getCurrentPageId())
+			}
+		)
 		const disposeChange = editor.sideEffects.registerBeforeChangeHandler(
 			'shape',
-			(previous, next) => {
+			(previous, next, changeSource) => {
+				if (changeSource === 'remote') return next
 				if (isTargetedAnnotationShape(next)) {
 					try {
 						normalizeReviewAnnotationTarget(next.meta[REVIEW_ANNOTATION_TARGET_META_KEY], timing)
@@ -391,7 +418,8 @@ export function ReviewVideoCanvas({
 		)
 		const disposeBindingCreate = editor.sideEffects.registerAfterCreateHandler(
 			'binding',
-			(binding) => {
+			(binding, changeSource) => {
+				if (changeSource === 'remote') return
 				if (isReviewAnnotationBindingCompatible(editor, binding, timing)) return
 				editor.deleteBinding(binding)
 				reportTemporalRelationshipError()
@@ -399,7 +427,8 @@ export function ReviewVideoCanvas({
 		)
 		const disposeBindingChange = editor.sideEffects.registerBeforeChangeHandler(
 			'binding',
-			(previous, next) => {
+			(previous, next, changeSource) => {
+				if (changeSource === 'remote') return next
 				if (isReviewAnnotationBindingCompatible(editor, next, timing)) return next
 				reportTemporalRelationshipError()
 				return previous
@@ -407,7 +436,8 @@ export function ReviewVideoCanvas({
 		)
 		const disposeShapeChange = editor.sideEffects.registerAfterChangeHandler(
 			'shape',
-			(previous, next) => {
+			(previous, next, changeSource) => {
+				if (changeSource === 'remote') return
 				const bindings = getReviewAnnotationBindingsForChangedShape(editor, previous, next)
 				const incompatible = bindings.filter(
 					(binding) => !isReviewAnnotationBindingCompatible(editor, binding, timing)
@@ -458,6 +488,7 @@ export function ReviewVideoCanvas({
 	useEffect(() => {
 		if (!editor) return
 		const readonly =
+			collaborationReadOnly ||
 			metadata.status !== 'ready' ||
 			!frameReady ||
 			!annotationTarget ||
@@ -465,7 +496,16 @@ export function ReviewVideoCanvas({
 			seeking ||
 			operation.status === 'working'
 		editor.updateInstanceState({ isReadonly: readonly })
-	}, [annotationTarget, editor, frameReady, metadata.status, operation.status, playing, seeking])
+	}, [
+		annotationTarget,
+		collaborationReadOnly,
+		editor,
+		frameReady,
+		metadata.status,
+		operation.status,
+		playing,
+		seeking,
+	])
 
 	const timingMode = metadata.status === 'ready' ? metadata.timing.mode : null
 	useEffect(() => {
@@ -803,6 +843,7 @@ export function ReviewVideoCanvas({
 		media.height === null ? 'unknown-height' : `${media.height}h`,
 	].join(':')
 	const editorDisabled =
+		collaborationReadOnly ||
 		metadata.status !== 'ready' ||
 		!frameReady ||
 		!annotationTarget ||
@@ -823,9 +864,11 @@ export function ReviewVideoCanvas({
 					onMount={handleMount}
 					options={REVIEW_EDITOR_OPTIONS}
 					overrides={uiOverrides}
-					{...(persistenceKey
-						? { persistenceKey: `${persistenceKey}:video-${persistenceIdentity}` }
-						: {})}
+					{...(store
+						? { store }
+						: persistenceKey
+							? { persistenceKey: `${persistenceKey}:video-${persistenceIdentity}` }
+							: {})}
 					shapeUtils={reviewVideoShapeUtils}
 					tools={[ReviewMarkerTool]}
 				/>
@@ -909,25 +952,29 @@ export function ReviewVideoCanvas({
 				<button disabled={editorDisabled} onClick={saveEditable} type="button">
 					Save editable
 				</button>
-				<button
-					disabled={editorDisabled}
-					onClick={() => editableInputRef.current?.click()}
-					type="button"
-				>
-					Open editable
-				</button>
-				<input
-					accept="application/json,.json"
-					aria-label="Open editable video review snapshot"
-					hidden
-					onChange={(event) => {
-						const file = event.currentTarget.files?.[0]
-						event.currentTarget.value = ''
-						if (file) void openEditable(file)
-					}}
-					ref={editableInputRef}
-					type="file"
-				/>
+				{allowSnapshotImport ? (
+					<>
+						<button
+							disabled={editorDisabled}
+							onClick={() => editableInputRef.current?.click()}
+							type="button"
+						>
+							Open editable
+						</button>
+						<input
+							accept="application/json,.json"
+							aria-label="Open editable video review snapshot"
+							hidden
+							onChange={(event) => {
+								const file = event.currentTarget.files?.[0]
+								event.currentTarget.value = ''
+								if (file) void openEditable(file)
+							}}
+							ref={editableInputRef}
+							type="file"
+						/>
+					</>
+				) : null}
 				{metadata.status === 'loading' ? (
 					<span aria-live="polite">Loading MP4 metadata…</span>
 				) : metadata.status === 'ready' && !frameReady ? (

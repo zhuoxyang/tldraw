@@ -48,6 +48,7 @@ export default defineConfig(({ command, mode }) => {
 							'/api': {
 								changeOrigin: true,
 								target: parseReviewApiDevTarget(environment.REVIEW_API_DEV_TARGET),
+								ws: true,
 							},
 						},
 					},

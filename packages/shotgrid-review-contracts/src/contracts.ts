@@ -10,12 +10,74 @@ export interface ReviewHealth {
 	status: 'ok'
 }
 
+export type ReviewCollaborationPermission = 'editor' | 'viewer'
+
+export interface ReviewCollaborationSession {
+	permission: ReviewCollaborationPermission
+	roomId: string
+	socketUrl: string
+	ticketExpiresAt: string
+}
+
+export interface ReviewCollaborationPresence {
+	color: string
+	userId: string
+	userName: string
+}
+
 export interface ReviewUser {
 	id: ReviewEntityId | null
 	kind: 'human' | 'service'
 	name: string
 	login: string | null
 	avatarUrl: string | null
+}
+
+const REVIEW_COLLABORATION_COLORS = [
+	'#FF6B6B',
+	'#4ECDC4',
+	'#45B7D1',
+	'#96CEB4',
+	'#FFEAA7',
+	'#DDA0DD',
+	'#FF9F43',
+	'#6C5CE7',
+] as const
+
+export function createReviewCollaborationPresence(
+	reviewer: ReviewUser
+): ReviewCollaborationPresence {
+	if (
+		reviewer.kind === 'human' &&
+		(!Number.isSafeInteger(reviewer.id) || Number(reviewer.id) <= 0)
+	) {
+		throw new Error('A human reviewer must have a ShotGrid id.')
+	}
+
+	const identity =
+		reviewer.kind === 'human'
+			? `human:${reviewer.id}`
+			: `service:${reviewer.id ?? ''}:${reviewer.login ?? ''}:${reviewer.name}`
+	const identityHash = fnv1a(identity)
+	const userId =
+		reviewer.kind === 'human'
+			? `user:shotgrid-human-${reviewer.id}`
+			: `user:shotgrid-service-${identityHash.toString(16).padStart(8, '0')}`
+
+	return {
+		color: REVIEW_COLLABORATION_COLORS[identityHash % REVIEW_COLLABORATION_COLORS.length],
+		userId,
+		userName: reviewer.name,
+	}
+}
+
+function fnv1a(value: string) {
+	let hash = 0x811c9dc5
+	for (let index = 0; index < value.length; index++) {
+		hash ^= value.charCodeAt(index)
+		hash = Math.imul(hash, 0x01000193)
+	}
+	return hash >>> 0
 }
 
 export interface ReviewProject {
@@ -220,6 +282,7 @@ export const REVIEW_API_ERROR_CODES = [
 	'AUTHENTICATION_REQUIRED',
 	'PERMISSION_DENIED',
 	'NOT_FOUND',
+	'COLLABORATION_UNAVAILABLE',
 	'DECISION_CONFLICT',
 	'DECISION_INDETERMINATE',
 	'PUBLICATION_CONFLICT',

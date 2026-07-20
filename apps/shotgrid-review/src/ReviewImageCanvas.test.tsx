@@ -10,6 +10,7 @@ const imageMocks = vi.hoisted(() => ({
 	digest: vi.fn(async (blob: Blob) => (await blob.text()).padEnd(64, 'a').slice(0, 64)),
 	fetch: vi.fn(),
 	renderedPersistenceKeys: [] as string[],
+	renderedShapeUtils: [] as Array<readonly unknown[] | undefined>,
 }))
 
 vi.mock('./reviewImage', () => ({
@@ -26,8 +27,15 @@ vi.mock('tldraw', async (importOriginal) => {
 	const original = await importOriginal<typeof import('tldraw')>()
 	return {
 		...original,
-		Tldraw: ({ persistenceKey }: { persistenceKey?: string }) => {
+		Tldraw: ({
+			persistenceKey,
+			shapeUtils,
+		}: {
+			persistenceKey?: string
+			shapeUtils?: readonly unknown[]
+		}) => {
 			imageMocks.renderedPersistenceKeys.push(persistenceKey ?? 'none')
+			imageMocks.renderedShapeUtils.push(shapeUtils)
 			return <div data-persistence-key={persistenceKey}>Mock editor</div>
 		},
 	}
@@ -76,6 +84,7 @@ afterEach(() => {
 	imageMocks.decode.mockClear()
 	imageMocks.digest.mockClear()
 	imageMocks.renderedPersistenceKeys.length = 0
+	imageMocks.renderedShapeUtils.length = 0
 	vi.mocked(api.getNoteOptions).mockClear()
 	publicationStore.addIfAbsent.mockClear()
 	publicationStore.claimForSend.mockClear()
@@ -95,6 +104,11 @@ describe('ReviewImageCanvas media isolation', () => {
 
 		await act(async () => render(baseProps()))
 		expect(container.textContent).toContain('Mock editor')
+		expect(
+			imageMocks.renderedShapeUtils
+				.at(-1)
+				?.some((shapeUtil) => (shapeUtil as { type?: string }).type === 'review-video')
+		).toBe(true)
 		const initialKey = container
 			.querySelector('[data-persistence-key]')
 			?.getAttribute('data-persistence-key')

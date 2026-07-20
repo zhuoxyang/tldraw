@@ -151,6 +151,21 @@ describe('ClientWebSocketAdapter', () => {
 				asyncAdapter.close()
 			}
 		})
+
+		it('[CW1] retries when an async getUri attempt rejects', async () => {
+			let uriCallCount = 0
+			const dynamicAdapter = new ClientWebSocketAdapter(() => {
+				uriCallCount++
+				if (uriCallCount === 1) return Promise.reject(new Error('authorization unavailable'))
+				return Promise.resolve('ws://localhost:2233')
+			})
+			try {
+				await waitFor(() => dynamicAdapter._ws?.readyState === WebSocket.OPEN && uriCallCount >= 2)
+				expect(dynamicAdapter.connectionStatus).toBe('online')
+			} finally {
+				dynamicAdapter.close()
+			}
+		})
 	})
 
 	describe('close codes and status changes (CW3, CW4, CW5)', () => {

@@ -136,6 +136,10 @@ export class InMemorySyncStorage<R extends UnknownRecord> implements TLSyncStora
 
 // @public
 export class JsonChunkAssembler {
+    constructor(options?: {
+        maxMessageSizeBytes?: number;
+        maxMessageChunks?: number;
+    });
     handleMessage(msg: string): {
         data: object;
         stringified: string;
@@ -499,6 +503,8 @@ export interface TLSocketRoomOptions<R extends UnknownRecord, SessionMeta> {
     initialSnapshot?: RoomSnapshot | TLStoreSnapshot;
     // (undocumented)
     log?: TLSyncLog;
+    maxMessageChunks?: number;
+    maxMessageSizeBytes?: number;
     // (undocumented)
     onAfterReceiveMessage?: (args: {
         message: TLSocketServerSentEvent<R>;

@@ -6,7 +6,7 @@ import { DEFAULT_INITIAL_SNAPSHOT, InMemorySyncStorage } from './InMemorySyncSto
 import { TLSocketServerSentEvent } from './protocol'
 import { RoomSessionState } from './RoomSession'
 import { ServerSocketAdapter, WebSocketMinimal } from './ServerSocketAdapter'
-import { TLSyncErrorCloseEventReason } from './TLSyncClient'
+import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from './TLSyncClient'
 import { RoomSnapshot, TLSyncRoom } from './TLSyncRoom'
 import {
 	convertStoreSnapshotToRoomSnapshot,
@@ -94,6 +94,10 @@ export interface TLSocketRoomOptions<R extends UnknownRecord, SessionMeta> {
 	schema?: StoreSchema<R, any>
 	// how long to wait for a client to communicate before disconnecting them
 	clientTimeout?: number
+	/** Maximum UTF-8 byte size of one fully assembled client message. */
+	maxMessageSizeBytes?: number
+	/** Maximum number of chunks allowed in one fully assembled client message. */
+	maxMessageChunks?: number
 	log?: TLSyncLog
 	// a callback that is called when a client is disconnected
 	// eslint-disable-next-line tldraw/method-signature-style
@@ -204,6 +208,13 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 	private disposables = new Set<() => void>()
 	private readonly snapshotTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
+	private createChunkAssembler() {
+		return new JsonChunkAssembler({
+			maxMessageSizeBytes: this.opts.maxMessageSizeBytes,
+			maxMessageChunks: this.opts.maxMessageChunks,
+		})
+	}
+
 	/**
 	 * Creates a new TLSocketRoom instance for managing collaborative document synchronization.
 	 *
@@ -313,13 +324,27 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 		} & (SessionMeta extends void ? object : { meta: SessionMeta })
 	) {
 		const { sessionId, socket, isReadonly = false } = opts
+		const assembler = this.createChunkAssembler()
 		const handleSocketMessage = (event: MessageEvent) =>
 			this.handleSocketMessage(sessionId, event.data)
 		const handleSocketError = this.handleSocketError.bind(this, sessionId)
 		const handleSocketClose = this.handleSocketClose.bind(this, sessionId)
+		const existing = this.sessions.get(sessionId)
+		if (existing) {
+			// A reconnect can reuse a logical session id before the old transport has
+			// finished closing. Detach its callbacks first so a late close/error event
+			// cannot cancel the replacement session.
+			existing.unlisten()
+			this.clearSnapshotTimer(sessionId)
+			try {
+				existing.socket.close(TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason.RATE_LIMITED)
+			} catch {
+				// Calling close repeatedly, or on an already-closed transport, is safe to ignore.
+			}
+		}
 
 		this.sessions.set(sessionId, {
-			assembler: new JsonChunkAssembler(),
+			assembler,
 			socket,
 			unlisten: () => {
 				socket.removeEventListener?.('message', handleSocketMessage)
@@ -530,7 +555,7 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 		const { sessionId, socket, snapshot } = opts
 
 		this.sessions.set(sessionId, {
-			assembler: new JsonChunkAssembler(),
+			assembler: this.createChunkAssembler(),
 			socket,
 			unlisten: () => {
 				// no-op: hibernation environments use class methods, not addEventListener

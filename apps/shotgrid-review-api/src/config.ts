@@ -20,6 +20,9 @@ const DEFAULT_MOCK_DECISIONS: ReviewDecisionOption[] = [
 ]
 const DEFAULT_PUBLICATION_MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 const DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT = 10_000
+const DEFAULT_COLLABORATION_MAX_ROOMS = 100
+const DEFAULT_COLLABORATION_MAX_SESSIONS_PER_ROOM = 16
+const DEFAULT_MOCK_COLLABORATION_SECRET = 'local-development-only-review-sync-secret'
 const MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES = Math.max(
 	1024 * 1024,
 	minimumReviewPublicationJournalBytes(DEFAULT_REVIEW_PUBLICATION_MAX_RECORD_BYTES)
@@ -39,6 +42,10 @@ interface GatewayConfigBase {
 	host: string
 	port: number
 	allowedOrigin: string
+	collaborationMaxRooms: number
+	collaborationMaxSessionsPerRoom: number
+	collaborationSecret: string
+	collaborationStoreDir: string
 	decisions: ReviewDecisionOption[]
 }
 
@@ -151,13 +158,10 @@ function parseSiteUrl(rawValue: string): string {
 	return url.origin
 }
 
-function parsePublicationStoreDirectory(rawValue: string) {
+function parseAbsoluteStoreDirectory(rawValue: string, variableName: string) {
 	const value = rawValue.trim()
 	if (!isAbsolute(value) || /\p{Cc}/u.test(value)) {
-		throw configurationError(
-			'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
-			'must be an absolute filesystem path'
-		)
+		throw configurationError(variableName, 'must be an absolute filesystem path')
 	}
 	return resolve(value)
 }
@@ -213,15 +217,42 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const host = environment.REVIEW_API_HOST?.trim() || DEFAULT_HOST
 	const port = parseInteger(environment, 'REVIEW_API_PORT', DEFAULT_PORT, 1, 65_535)
 	const allowedOrigin = parseOrigin(environment)
+	const collaborationMaxRooms = parseInteger(
+		environment,
+		'SHOTGRID_REVIEW_SYNC_MAX_ROOMS',
+		DEFAULT_COLLABORATION_MAX_ROOMS,
+		1,
+		1_000
+	)
+	const collaborationMaxSessionsPerRoom = parseInteger(
+		environment,
+		'SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM',
+		DEFAULT_COLLABORATION_MAX_SESSIONS_PER_ROOM,
+		1,
+		100
+	)
 	const timeoutMs = parseInteger(environment, 'SHOTGRID_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 1, 120_000)
 	const maxRetries = parseInteger(environment, 'SHOTGRID_MAX_RETRIES', DEFAULT_MAX_RETRIES, 0, 10)
 
 	if (rawMode === 'mock') {
+		const collaborationSecret =
+			environment.REVIEW_SYNC_SECRET?.trim() || DEFAULT_MOCK_COLLABORATION_SECRET
+		if (collaborationSecret.length < 32 || /\p{Cc}/u.test(collaborationSecret)) {
+			throw configurationError('REVIEW_SYNC_SECRET', 'must contain at least 32 characters')
+		}
 		return {
 			mode: rawMode,
 			host,
 			port,
 			allowedOrigin,
+			collaborationMaxRooms,
+			collaborationMaxSessionsPerRoom,
+			collaborationSecret,
+			collaborationStoreDir: parseAbsoluteStoreDirectory(
+				environment.SHOTGRID_REVIEW_SYNC_STORE_DIR ||
+					resolve(process.cwd(), '.shotgrid-review-sync'),
+				'SHOTGRID_REVIEW_SYNC_STORE_DIR'
+			),
 			decisions: parseDecisionOptions(environment, {
 				defaultDecisions: DEFAULT_MOCK_DECISIONS,
 			}),
@@ -231,8 +262,14 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const scriptName = readRequired(environment, 'SHOTGRID_SCRIPT_NAME').trim()
 	const scriptKey = readRequired(environment, 'SHOTGRID_SCRIPT_KEY')
 	const trustedProxyToken = readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN').trim()
-	const publicationStoreDir = parsePublicationStoreDirectory(
-		readRequired(environment, 'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR')
+	const collaborationSecret = readRequired(environment, 'REVIEW_SYNC_SECRET').trim()
+	const collaborationStoreDir = parseAbsoluteStoreDirectory(
+		readRequired(environment, 'SHOTGRID_REVIEW_SYNC_STORE_DIR'),
+		'SHOTGRID_REVIEW_SYNC_STORE_DIR'
+	)
+	const publicationStoreDir = parseAbsoluteStoreDirectory(
+		readRequired(environment, 'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR'),
+		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR'
 	)
 	const publicationMaxJournalBytes = parseInteger(
 		environment,
@@ -254,6 +291,9 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 			'must contain at least 32 characters'
 		)
 	}
+	if (collaborationSecret.length < 32 || /\p{Cc}/u.test(collaborationSecret)) {
+		throw configurationError('REVIEW_SYNC_SECRET', 'must contain at least 32 characters')
+	}
 	const sudoAsLogin = environment.SHOTGRID_SUDO_AS_LOGIN?.trim() || undefined
 	const decisions = parseDecisionOptions(environment, { defaultDecisions: [] })
 
@@ -262,6 +302,10 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		host,
 		port,
 		allowedOrigin,
+		collaborationMaxRooms,
+		collaborationMaxSessionsPerRoom,
+		collaborationSecret,
+		collaborationStoreDir,
 		decisions,
 		publicationMaxJournalBytes,
 		publicationMaxJournalCount,

@@ -4,6 +4,7 @@ import { parseGatewayConfig } from './config'
 import { ReviewGatewayError } from './errors'
 
 const PUBLICATION_STORE_DIR = resolve('/var/lib/shotgrid-review-publications')
+const SYNC_STORE_DIR = resolve('/var/lib/shotgrid-review-sync')
 
 const LIVE_ENVIRONMENT = {
 	SHOTGRID_GATEWAY_MODE: 'shotgrid',
@@ -11,7 +12,9 @@ const LIVE_ENVIRONMENT = {
 	SHOTGRID_SCRIPT_NAME: 'review-gateway',
 	SHOTGRID_SCRIPT_KEY: 'private-test-key',
 	SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: PUBLICATION_STORE_DIR,
+	SHOTGRID_REVIEW_SYNC_STORE_DIR: SYNC_STORE_DIR,
 	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
+	REVIEW_SYNC_SECRET: 'review-sync-secret-with-at-least-32-characters',
 } as const
 
 function expectConfigurationError(environment: Record<string, string | undefined>) {
@@ -36,6 +39,10 @@ describe('parseGatewayConfig', () => {
 			host: '127.0.0.1',
 			port: 5431,
 			allowedOrigin: 'http://127.0.0.1:5430',
+			collaborationMaxRooms: 100,
+			collaborationMaxSessionsPerRoom: 16,
+			collaborationSecret: 'local-development-only-review-sync-secret',
+			collaborationStoreDir: resolve('.shotgrid-review-sync'),
 			decisions: [
 				{ key: 'approve', label: 'Approve', statusCode: 'apr' },
 				{ key: 'needs-changes', label: 'Needs changes', statusCode: 'chg' },
@@ -64,6 +71,10 @@ describe('parseGatewayConfig', () => {
 			host: '0.0.0.0',
 			port: 6543,
 			allowedOrigin: 'https://review.example.test',
+			collaborationMaxRooms: 100,
+			collaborationMaxSessionsPerRoom: 16,
+			collaborationSecret: 'review-sync-secret-with-at-least-32-characters',
+			collaborationStoreDir: SYNC_STORE_DIR,
 			decisions: [],
 			publicationMaxJournalBytes: 4_194_304,
 			publicationMaxJournalCount: 10_000,
@@ -148,6 +159,10 @@ describe('parseGatewayConfig', () => {
 		['SHOTGRID_MAX_RETRIES', '-1'],
 		['SHOTGRID_MAX_RETRIES', '11'],
 		['SHOTGRID_MAX_RETRIES', '1.5'],
+		['SHOTGRID_REVIEW_SYNC_MAX_ROOMS', '0'],
+		['SHOTGRID_REVIEW_SYNC_MAX_ROOMS', '1001'],
+		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '0'],
+		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '101'],
 	])('rejects an invalid %s value', (name, value) => {
 		expectConfigurationError({ [name]: value })
 	})
@@ -173,7 +188,9 @@ describe('parseGatewayConfig', () => {
 		'SHOTGRID_SCRIPT_NAME',
 		'SHOTGRID_SCRIPT_KEY',
 		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
+		'SHOTGRID_REVIEW_SYNC_STORE_DIR',
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
+		'REVIEW_SYNC_SECRET',
 	])('requires %s in ShotGrid mode', (name) => {
 		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
 	})
@@ -190,10 +207,29 @@ describe('parseGatewayConfig', () => {
 		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
 	})
 
+	it('requires a strong collaboration secret without leaking it', () => {
+		const secret = 'short-sync-secret'
+		const error = expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			REVIEW_SYNC_SECRET: secret,
+		})
+
+		expect(error.message).not.toContain(secret)
+		expect(String(error.cause)).not.toContain(secret)
+		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
+	})
+
 	it('requires an absolute durable publication store in live mode', () => {
 		expectConfigurationError({
 			...LIVE_ENVIRONMENT,
 			SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: './review-publications',
+		})
+	})
+
+	it('requires an absolute durable collaboration store in live mode', () => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_SYNC_STORE_DIR: './review-sync',
 		})
 	})
 

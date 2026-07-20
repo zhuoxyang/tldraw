@@ -1,4 +1,5 @@
 import {
+	type ReviewCollaborationSession,
 	type ReviewDecisionContext,
 	type ReviewDecisionRequest,
 	type ReviewDecisionResult,
@@ -12,6 +13,7 @@ import {
 	type ReviewUser,
 	type ReviewVersion,
 	isReviewApiErrorEnvelope,
+	isReviewCollaborationSession,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -37,6 +39,11 @@ const MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 const MAX_RESPONSE_ITEMS = 10_000
 
 export interface ReviewApiClient {
+	createCollaborationSession(
+		playlistId: number,
+		versionId: number,
+		signal?: AbortSignal
+	): Promise<ReviewCollaborationSession>
 	getCurrentReviewer(signal?: AbortSignal): Promise<ReviewUser>
 	getDecisionContext(
 		playlistId: number,
@@ -110,7 +117,7 @@ export function createReviewApiClient({
 		path: string,
 		options: {
 			body?: string
-			method?: 'GET' | 'PUT'
+			method?: 'GET' | 'POST' | 'PUT'
 			signal?: AbortSignal
 		} = {}
 	): Promise<ParsedReviewApiResponse> {
@@ -167,6 +174,18 @@ export function createReviewApiClient({
 	}
 
 	return {
+		async createCollaborationSession(playlistId, versionId, signal) {
+			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
+			const validVersionId = requirePositiveId(versionId, 'versionId')
+			return unwrapData(
+				await request(
+					`/review/playlists/${validPlaylistId}/versions/${validVersionId}/collaboration-session`,
+					{ method: 'POST', signal }
+				),
+				isReviewCollaborationSession
+			)
+		},
+
 		async getCurrentReviewer(signal) {
 			return unwrapData(await request('/review/me', { signal }), isReviewUser)
 		},

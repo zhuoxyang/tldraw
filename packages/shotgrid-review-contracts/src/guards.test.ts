@@ -1,8 +1,11 @@
 import { describe, expect, test } from 'vitest'
 import {
+	createReviewCollaborationPresence,
 	isReviewApiDataEnvelope,
 	isReviewApiErrorEnvelope,
 	isReviewArrayOf,
+	isReviewCollaborationPresence,
+	isReviewCollaborationSession,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -57,6 +60,83 @@ const version: ReviewVersion = {
 }
 
 describe('review contract runtime guards', () => {
+	test('accepts only bound collaboration session URLs and canonical expirations', () => {
+		const roomId = `r1_${'A'.repeat(43)}`
+		const session = {
+			permission: 'editor',
+			roomId,
+			socketUrl: `/api/review/sync/${roomId}?ticket=${'b'.repeat(43)}`,
+			ticketExpiresAt: '2026-07-21T00:01:00.000Z',
+		}
+
+		expect(isReviewCollaborationSession(session)).toBe(true)
+		expect(isReviewCollaborationSession({ ...session, permission: 'viewer' })).toBe(true)
+		for (const invalid of [
+			{ ...session, permission: 'owner' },
+			{ ...session, roomId: `r1_${'A'.repeat(42)}` },
+			{
+				...session,
+				socketUrl: `/api/review/sync/r1_${'B'.repeat(43)}?ticket=${'b'.repeat(43)}`,
+			},
+			{ ...session, socketUrl: `https://review.example.test${session.socketUrl}` },
+			{ ...session, socketUrl: `${session.socketUrl}&proxyToken=secret` },
+			{ ...session, ticketExpiresAt: '2026-07-21T00:01:00Z' },
+			{ ...session, unexpected: true },
+		]) {
+			expect(isReviewCollaborationSession(invalid)).toBe(false)
+		}
+	})
+
+	test('maps reviewer identities to stable, non-sensitive collaboration presence', () => {
+		const human = createReviewCollaborationPresence({
+			avatarUrl: null,
+			id: 7,
+			kind: 'human',
+			login: 'reviewer',
+			name: 'Reviewer',
+		})
+		const serviceReviewer = {
+			avatarUrl: null,
+			id: null,
+			kind: 'service' as const,
+			login: null,
+			name: 'Review Service',
+		}
+		const service = createReviewCollaborationPresence(serviceReviewer)
+
+		expect(human).toEqual({
+			color: '#DDA0DD',
+			userId: 'user:shotgrid-human-7',
+			userName: 'Reviewer',
+		})
+		expect(service).toEqual({
+			color: '#4ECDC4',
+			userId: 'user:shotgrid-service-d414e2f9',
+			userName: 'Review Service',
+		})
+		expect(createReviewCollaborationPresence(serviceReviewer)).toEqual(service)
+		expect(service.userId).not.toContain('Review')
+		expect(isReviewCollaborationPresence(human)).toBe(true)
+		expect(isReviewCollaborationPresence(service)).toBe(true)
+		expect(isReviewCollaborationPresence({ ...service, color: '#000000' })).toBe(false)
+		expect(isReviewCollaborationPresence({ ...service, userId: 'user:shotgrid-service-xyz' })).toBe(
+			false
+		)
+		expect(isReviewCollaborationPresence({ ...human, userId: 'user:shotgrid-human-0' })).toBe(false)
+		expect(isReviewCollaborationPresence({ ...human, extra: true })).toBe(false)
+		for (const id of [null, 0, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(() =>
+				createReviewCollaborationPresence({
+					avatarUrl: null,
+					id,
+					kind: 'human',
+					login: 'broken',
+					name: 'Broken human',
+				})
+			).toThrow(/ShotGrid id/)
+		}
+	})
+
 	test('accepts complete health, navigation, identity, and version contracts', () => {
 		expect(isReviewHealth({ mode: 'mock', status: 'ok' })).toBe(true)
 		expect(

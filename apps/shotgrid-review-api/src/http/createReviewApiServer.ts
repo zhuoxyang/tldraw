@@ -1,7 +1,15 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
 import { promisify } from 'node:util'
 import { inflate } from 'node:zlib'
+import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
+import { WebSocketServer } from 'ws'
+import {
+	ReviewCollaborationError,
+	REVIEW_SYNC_MAX_MESSAGE_SIZE_BYTES,
+	type ReviewCollaborationService,
+} from '../collaboration/ReviewCollaborationService'
 import type {
 	ReviewApiErrorCode,
 	ReviewDecisionOption,
@@ -33,7 +41,7 @@ const HEADERS_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 30_000
 const DEFAULT_VIDEO_DOWNSTREAM_IDLE_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
-const MUTATION_METHODS = ['PUT'] as const
+const MUTATION_METHODS = ['POST', 'PUT'] as const
 const inflateAsync = promisify(inflate)
 
 type GatewayMode = 'mock' | 'shotgrid'
@@ -44,6 +52,7 @@ interface SafeLogger {
 
 export interface ReviewApiServerOptions {
 	allowedOrigin: string
+	collaboration?: ReviewCollaborationService
 	decisions?: readonly ReviewDecisionOption[]
 	gateway: ReviewGateway
 	logger?: SafeLogger
@@ -168,6 +177,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				options.mode,
 				decisions,
 				publications,
+				options.collaboration,
 				publicationLimiter,
 				publicationActorScope,
 				videoDownstreamIdleTimeoutMs,
@@ -229,7 +239,163 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 	server.maxHeadersCount = 100
 	server.maxRequestsPerSocket = 100
 	server.requestTimeout = REQUEST_TIMEOUT_MS
+	if (options.collaboration) {
+		attachReviewCollaborationWebSocket(
+			server,
+			options.collaboration,
+			options.allowedOrigin,
+			logger,
+			createRequestId
+		)
+	}
 	return server
+}
+
+function attachReviewCollaborationWebSocket(
+	server: Server,
+	collaboration: ReviewCollaborationService,
+	allowedOrigin: string,
+	logger: SafeLogger,
+	createRequestId: () => string
+) {
+	let collaborationClosed = false
+	const closeCollaboration = () => {
+		if (collaborationClosed) return
+		collaborationClosed = true
+		collaboration.close()
+	}
+	const closeHttpServer = server.close.bind(server)
+	server.close = ((callback?: (error?: Error) => void) => {
+		// Node waits for upgraded sockets before emitting `close`. End sync rooms first so
+		// callers can use the standard Server.close() API without deadlocking shutdown.
+		closeCollaboration()
+		return closeHttpServer(callback)
+	}) as Server['close']
+	const webSocketServer = new WebSocketServer({
+		clientTracking: false,
+		maxPayload: REVIEW_SYNC_MAX_MESSAGE_SIZE_BYTES,
+		noServer: true,
+		perMessageDeflate: false,
+	})
+
+	server.on('upgrade', (request, socket, head) => {
+		const requestId = createRequestId()
+		try {
+			if (request.method !== 'GET' || readSingleHeader(request, 'origin') !== allowedOrigin) {
+				rejectWebSocketUpgrade(socket, 403)
+				return
+			}
+			if (request.headers['sec-websocket-protocol'] !== undefined) {
+				rejectWebSocketUpgrade(socket, 400)
+				return
+			}
+
+			const url = parseRequestUrl(request.url)
+			const roomMatch = /^\/api\/review\/sync\/(r1_[A-Za-z0-9_-]{43})$/.exec(url.pathname)
+			if (!roomMatch || !hasOnlySyncSearchParameters(url.searchParams)) {
+				rejectWebSocketUpgrade(socket, 404)
+				return
+			}
+
+			const ticket = readSingleSearchParameter(url.searchParams, 'ticket')
+			const sessionId = readSingleSearchParameter(url.searchParams, 'sessionId')
+			const storeId = readSingleSearchParameter(url.searchParams, 'storeId')
+			if (!ticket || !sessionId || !storeId) {
+				rejectWebSocketUpgrade(socket, 400)
+				return
+			}
+
+			const authorization = collaboration.consumeSocketTicket(roomMatch[1], ticket)
+			webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+				try {
+					collaboration.connectSocket(authorization, { sessionId, socket: webSocket, storeId })
+				} catch (error) {
+					const reason = collaborationSocketCloseReason(error)
+					webSocket.close(TLSyncErrorCloseEventCode, reason)
+					if (!(error instanceof ReviewCollaborationError)) {
+						logger.error('Review collaboration connection failed', {
+							code: 'INTERNAL_ERROR',
+							requestId,
+							status: 500,
+						})
+					}
+				}
+			})
+		} catch (error) {
+			const status = collaborationUpgradeStatus(error)
+			rejectWebSocketUpgrade(socket, status)
+			if (!(error instanceof ReviewCollaborationError)) {
+				logger.error('Review collaboration upgrade failed', {
+					code: 'INTERNAL_ERROR',
+					requestId,
+					status,
+				})
+			}
+		}
+	})
+
+	server.once('close', () => {
+		closeCollaboration()
+		webSocketServer.close()
+	})
+}
+
+function hasOnlySyncSearchParameters(search: URLSearchParams) {
+	const keys = [...search.keys()]
+	return (
+		keys.length === 3 &&
+		new Set(keys).size === 3 &&
+		keys.every((key) => key === 'sessionId' || key === 'storeId' || key === 'ticket')
+	)
+}
+
+function readSingleSearchParameter(search: URLSearchParams, name: string) {
+	const values = search.getAll(name)
+	return values.length === 1 ? values[0] : undefined
+}
+
+function collaborationUpgradeStatus(error: unknown) {
+	if (!(error instanceof ReviewCollaborationError)) return 500
+	switch (error.code) {
+		case 'INVALID_REQUEST':
+			return 400
+		case 'UNAUTHORIZED':
+			return 401
+		case 'NOT_FOUND':
+			return 404
+		case 'ROOM_FULL':
+			return 503
+		case 'CONFIGURATION_ERROR':
+			return 500
+	}
+}
+
+function collaborationSocketCloseReason(error: unknown) {
+	if (!(error instanceof ReviewCollaborationError)) {
+		return TLSyncErrorCloseEventReason.UNKNOWN_ERROR
+	}
+	if (error.code === 'ROOM_FULL') return TLSyncErrorCloseEventReason.ROOM_FULL
+	if (error.code === 'UNAUTHORIZED') return TLSyncErrorCloseEventReason.NOT_AUTHENTICATED
+	return TLSyncErrorCloseEventReason.FORBIDDEN
+}
+
+function rejectWebSocketUpgrade(socket: Duplex, status: number) {
+	if (socket.destroyed) return
+	const reason =
+		status === 400
+			? 'Bad Request'
+			: status === 401
+				? 'Unauthorized'
+				: status === 403
+					? 'Forbidden'
+					: status === 404
+						? 'Not Found'
+						: status === 503
+							? 'Service Unavailable'
+							: 'Internal Server Error'
+	socket.end(
+		`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Length: 0\r\nX-Content-Type-Options: nosniff\r\n\r\n`
+	)
 }
 
 function isCanonicalShotGridOrigin(value: unknown): value is string {
@@ -288,6 +454,7 @@ function matchRoute(
 	mode: GatewayMode,
 	decisions: ReviewDecisionCoordinator,
 	publications: ReviewPublicationCoordinator,
+	collaboration: ReviewCollaborationService | undefined,
 	publicationLimiter: InFlightLimiter,
 	publicationActorScope: string,
 	videoDownstreamIdleTimeoutMs: number,
@@ -325,6 +492,21 @@ function matchRoute(
 		return getRoute(async () => {
 			const playlistId = requirePositiveId(playlistVersions.id, 'playlistId')
 			sendJson(response, 200, { data: await gateway.listVersions(playlistId) })
+		})
+	}
+
+	const collaborationSession = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/collaboration-session$/
+	)
+	if (collaborationSession.matched && collaboration) {
+		return mutationRoute('POST', async (request) => {
+			requireEmptyRequestBody(request)
+			const playlistId = requirePositiveId(collaborationSession.firstId, 'playlistId')
+			const versionId = requirePositiveId(collaborationSession.secondId, 'versionId')
+			sendJson(response, 201, {
+				data: await collaboration.createSession(playlistId, versionId),
+			})
 		})
 	}
 
@@ -557,6 +739,16 @@ function parseRequestUrl(rawUrl: string | undefined) {
 		return new URL(rawUrl ?? '/', 'http://review-api.local')
 	} catch {
 		throw invalidRequest('Request URL is invalid')
+	}
+}
+
+function requireEmptyRequestBody(request: IncomingMessage) {
+	const contentLength = readSingleHeader(request, 'content-length')
+	if (
+		request.headers['transfer-encoding'] !== undefined ||
+		(contentLength !== undefined && contentLength !== '0')
+	) {
+		throw invalidRequest('The collaboration session request must not contain a body.')
 	}
 }
 
@@ -1049,6 +1241,45 @@ function invalidReviewVideoRange() {
 
 function normalizeError(error: unknown) {
 	if (error instanceof ReviewGatewayError) return error
+	if (error instanceof ReviewCollaborationError) {
+		switch (error.code) {
+			case 'INVALID_REQUEST':
+				return new ReviewGatewayError({
+					cause: error,
+					code: 'INVALID_REQUEST',
+					retryable: false,
+					status: 400,
+				})
+			case 'UNAUTHORIZED':
+				return new ReviewGatewayError({
+					cause: error,
+					code: 'AUTHENTICATION_REQUIRED',
+					retryable: false,
+					status: 401,
+				})
+			case 'NOT_FOUND':
+				return new ReviewGatewayError({
+					cause: error,
+					code: 'NOT_FOUND',
+					retryable: false,
+					status: 404,
+				})
+			case 'ROOM_FULL':
+				return new ReviewGatewayError({
+					cause: error,
+					code: 'COLLABORATION_UNAVAILABLE',
+					retryable: true,
+					status: 503,
+				})
+			case 'CONFIGURATION_ERROR':
+				return new ReviewGatewayError({
+					cause: error,
+					code: 'CONFIGURATION_ERROR',
+					retryable: false,
+					status: 500,
+				})
+		}
+	}
 	return new ReviewGatewayError({
 		code: 'INTERNAL_ERROR',
 		message: 'The review service encountered an unexpected error',
