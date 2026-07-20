@@ -1,12 +1,16 @@
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parseGatewayConfig } from './config'
 import { ReviewGatewayError } from './errors'
+
+const PUBLICATION_STORE_DIR = resolve('/var/lib/shotgrid-review-publications')
 
 const LIVE_ENVIRONMENT = {
 	SHOTGRID_GATEWAY_MODE: 'shotgrid',
 	SHOTGRID_SITE_URL: 'https://studio.shotgrid.autodesk.com',
 	SHOTGRID_SCRIPT_NAME: 'review-gateway',
 	SHOTGRID_SCRIPT_KEY: 'private-test-key',
+	SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: PUBLICATION_STORE_DIR,
 	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
 } as const
 
@@ -51,6 +55,9 @@ describe('parseGatewayConfig', () => {
 			host: '0.0.0.0',
 			port: 6543,
 			allowedOrigin: 'https://review.example.test',
+			publicationMaxJournalBytes: 4_194_304,
+			publicationMaxJournalCount: 10_000,
+			publicationStoreDir: PUBLICATION_STORE_DIR,
 			trustedProxyToken: 'trusted-proxy-token-with-32-characters',
 			shotgrid: {
 				siteUrl: 'https://studio.shotgrid.autodesk.com',
@@ -77,9 +84,26 @@ describe('parseGatewayConfig', () => {
 	})
 
 	it.each([
+		['SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES', '1024'],
+		['SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS', '0'],
+	])('rejects an invalid live %s value', (name, value) => {
+		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: value })
+	})
+
+	it('accepts the one-mebibyte minimum publication journal capacity', () => {
+		const parsed = parseGatewayConfig({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES: String(1024 * 1024),
+		})
+		if (parsed.mode !== 'shotgrid') throw new Error('Expected live ShotGrid configuration')
+		expect(parsed.publicationMaxJournalBytes).toBe(1024 * 1024)
+	})
+
+	it.each([
 		'SHOTGRID_SITE_URL',
 		'SHOTGRID_SCRIPT_NAME',
 		'SHOTGRID_SCRIPT_KEY',
+		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
 	])('requires %s in ShotGrid mode', (name) => {
 		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
@@ -95,6 +119,13 @@ describe('parseGatewayConfig', () => {
 		expect(error.message).not.toContain(secret)
 		expect(String(error.cause)).not.toContain(secret)
 		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
+	})
+
+	it('requires an absolute durable publication store in live mode', () => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: './review-publications',
+		})
 	})
 
 	it.each([

@@ -7,8 +7,14 @@ import {
 	type ReviewHealth,
 	type ReviewImageMedia,
 	type ReviewMedia,
+	type ReviewNote,
+	type ReviewNoteOptions,
 	type ReviewPlaylist,
 	type ReviewProject,
+	type ReviewPublicationLinks,
+	type ReviewPublicationErrorContext,
+	type ReviewPublicationResult,
+	type ReviewAttachmentResult,
 	type ReviewTaskLink,
 	type ReviewUser,
 	type ReviewVersion,
@@ -18,6 +24,11 @@ import {
 export type ReviewRuntimeGuard<T> = (value: unknown) => value is T
 
 const reviewApiErrorCodes = new Set<string>(REVIEW_API_ERROR_CODES)
+const MAX_PUBLICATION_ATTACHMENT_BYTES = 10 * 1024 * 1024
+const MAX_PUBLICATION_CONTENT_LENGTH = 10_000
+const MAX_PUBLICATION_DISPLAY_TEXT_LENGTH = 255
+const MAX_PUBLICATION_TIMESTAMP_LENGTH = 32
+const SHOTGRID_ENTITY_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 
 export function isReviewApiDataEnvelope<T>(
 	value: unknown,
@@ -107,6 +118,87 @@ export function isReviewTaskLink(value: unknown): value is ReviewTaskLink {
 	)
 }
 
+export function isReviewPublicationLinks(value: unknown): value is ReviewPublicationLinks {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['entity', 'project', 'task', 'version']) &&
+		isTypedReviewEntityLink(record.project, 'Project') &&
+		isTypedReviewEntityLink(record.version, 'Version') &&
+		(record.entity === null || isReviewEntityLink(record.entity)) &&
+		(record.task === null || isReviewTaskLink(record.task))
+	)
+}
+
+export function isReviewNoteOptions(value: unknown): value is ReviewNoteOptions {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['links', 'recipients']) &&
+		isReviewArrayOf(record.recipients, isHumanReviewRecipient) &&
+		isReviewPublicationLinks(record.links)
+	)
+}
+
+export function isReviewNote(value: unknown): value is ReviewNote {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, [
+			'content',
+			'createdAt',
+			'createdBy',
+			'frame',
+			'id',
+			'projectId',
+			'subject',
+			'versionId',
+		]) &&
+		isPositiveId(record.id) &&
+		isPositiveId(record.projectId) &&
+		isPositiveId(record.versionId) &&
+		isNonEmptyString(record.subject) &&
+		isNonEmptyString(record.content) &&
+		(record.frame === null || isNonNegativeInteger(record.frame)) &&
+		isNonEmptyString(record.createdAt) &&
+		isReviewUser(record.createdBy)
+	)
+}
+
+export function isReviewAttachmentResult(value: unknown): value is ReviewAttachmentResult {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['contentType', 'fileName', 'id', 'noteId', 'sizeBytes']) &&
+		(record.id === null || isPositiveId(record.id)) &&
+		isPositiveId(record.noteId) &&
+		isNonEmptyString(record.fileName) &&
+		isNonEmptyString(record.contentType) &&
+		isNonNegativeInteger(record.sizeBytes)
+	)
+}
+
+export function isReviewPublicationResult(value: unknown): value is ReviewPublicationResult {
+	const record = readRecord(value)
+	return (
+		record !== null &&
+		hasOnlyKeys(record, ['attachment', 'links', 'note', 'publicationId', 'status']) &&
+		isCanonicalUuid(record.publicationId) &&
+		record.status === 'complete' &&
+		isBoundedPublicationNote(record.note) &&
+		isReviewAttachmentResult(record.attachment) &&
+		record.attachment.noteId === record.note.id &&
+		record.attachment.contentType === 'image/png' &&
+		record.attachment.fileName.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		isPngBasename(record.attachment.fileName) &&
+		record.attachment.sizeBytes > 0 &&
+		record.attachment.sizeBytes <= MAX_PUBLICATION_ATTACHMENT_BYTES &&
+		isBoundedPublicationLinks(record.links) &&
+		record.note.projectId === record.links.project.id &&
+		record.note.versionId === record.links.version.id
+	)
+}
+
 export function isReviewVersion(value: unknown): value is ReviewVersion {
 	const record = readRecord(value)
 	return (
@@ -151,10 +243,24 @@ export function isReviewApiErrorEnvelope(value: unknown): value is ReviewApiErro
 	const error = readRecord(envelope.error)
 	if (
 		!error ||
-		!hasOnlyKeys(error, ['code', 'message', 'requestId', 'retryable', 'upstreamStatus']) ||
+		!hasOnlyKeys(error, [
+			'code',
+			'message',
+			'publication',
+			'requestId',
+			'retryable',
+			'upstreamStatus',
+		]) ||
 		!isReviewApiErrorCode(error.code) ||
 		typeof error.message !== 'string' ||
 		typeof error.retryable !== 'boolean'
+	) {
+		return false
+	}
+	if (
+		hasOwn(error, 'publication') &&
+		(error.code !== 'PUBLICATION_INDETERMINATE' ||
+			!isReviewPublicationErrorContext(error.publication))
 	) {
 		return false
 	}
@@ -167,6 +273,65 @@ export function isReviewApiErrorEnvelope(value: unknown): value is ReviewApiErro
 		return false
 	}
 	return !hasOwn(error, 'requestId') || isNonEmptyString(error.requestId)
+}
+
+export function isReviewPublicationErrorContext(
+	value: unknown
+): value is ReviewPublicationErrorContext {
+	const record = readRecord(value)
+	if (!record || !isCanonicalUuid(record.publicationId)) return false
+	if (record.stage === 'note-creation') {
+		return hasOnlyKeys(record, ['publicationId', 'stage'])
+	}
+	if (record.stage === 'note-created') {
+		return (
+			hasOnlyKeys(record, ['links', 'noteId', 'publicationId', 'stage']) &&
+			isPositiveId(record.noteId) &&
+			isBoundedPublicationLinks(record.links)
+		)
+	}
+	return (
+		record.stage === 'attachment-completion' &&
+		hasOnlyKeys(record, ['attachmentId', 'links', 'noteId', 'publicationId', 'stage']) &&
+		(!hasOwn(record, 'attachmentId') || isPositiveId(record.attachmentId)) &&
+		isPositiveId(record.noteId) &&
+		isBoundedPublicationLinks(record.links)
+	)
+}
+
+function isBoundedPublicationNote(value: unknown): value is ReviewNote {
+	return (
+		isReviewNote(value) &&
+		value.subject.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		value.content.length <= MAX_PUBLICATION_CONTENT_LENGTH &&
+		value.createdAt.length <= MAX_PUBLICATION_TIMESTAMP_LENGTH &&
+		Number.isFinite(Date.parse(value.createdAt)) &&
+		isBoundedPublicationUser(value.createdBy)
+	)
+}
+
+function isBoundedPublicationUser(value: ReviewUser) {
+	return (
+		value.name.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		(value.login === null || value.login.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH)
+	)
+}
+
+function isBoundedPublicationLinks(value: unknown): value is ReviewPublicationLinks {
+	return (
+		isReviewPublicationLinks(value) &&
+		isBoundedPublicationEntityLink(value.project) &&
+		isBoundedPublicationEntityLink(value.version) &&
+		(value.entity === null || isBoundedPublicationEntityLink(value.entity)) &&
+		(value.task === null || value.task.name.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH)
+	)
+}
+
+function isBoundedPublicationEntityLink(value: ReviewEntityLink) {
+	return (
+		value.name.length <= MAX_PUBLICATION_DISPLAY_TEXT_LENGTH &&
+		SHOTGRID_ENTITY_TYPE_PATTERN.test(value.type)
+	)
 }
 
 export function isSafeReviewUrl(value: unknown): value is string {
@@ -274,6 +439,35 @@ function isNullableSafeReviewUrl(value: unknown): value is string | null {
 
 function isNullableFiniteNumber(value: unknown): value is number | null {
 	return value === null || (typeof value === 'number' && Number.isFinite(value))
+}
+
+function isTypedReviewEntityLink(value: unknown, expectedType: string) {
+	return isReviewEntityLink(value) && value.type === expectedType
+}
+
+function isHumanReviewRecipient(value: unknown): value is ReviewUser {
+	return isReviewUser(value) && value.kind === 'human' && value.id !== null
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+	return Number.isSafeInteger(value) && Number(value) >= 0
+}
+
+function isCanonicalUuid(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+	)
+}
+
+function isPngBasename(value: string) {
+	return (
+		value.toLowerCase().endsWith('.png') &&
+		value !== '.' &&
+		value !== '..' &&
+		value === value.replaceAll('\\', '/').split('/').at(-1) &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(value)
+	)
 }
 
 function hasUnsafeUrlCharacter(value: string) {

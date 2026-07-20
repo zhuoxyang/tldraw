@@ -2,8 +2,10 @@ import type {
 	CreateReviewNoteRequest,
 	ReviewAttachmentResult,
 	ReviewNote,
+	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
+	ReviewPublicationLinks,
 	ReviewStatusResult,
 	ReviewUser,
 	ReviewVersion,
@@ -11,7 +13,12 @@ import type {
 	UploadReviewAttachmentRequest,
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
-import type { ReviewGateway, ReviewImageProxyPayload } from './ReviewGateway'
+import type {
+	CreateReviewPublicationNoteRequest,
+	ReviewGateway,
+	ReviewImageProxyPayload,
+	ReviewPublicationNoteResult,
+} from './ReviewGateway'
 
 const reviewer: ReviewUser = {
 	avatarUrl: null,
@@ -22,6 +29,19 @@ const reviewer: ReviewUser = {
 }
 
 const DEFAULT_RETAINED_NOTE_ID_LIMIT = 10_000
+
+const recipients: ReviewUser[] = [
+	reviewer,
+	{ avatarUrl: null, id: 11, kind: 'human', login: 'mchen', name: 'Mei Chen' },
+	{ avatarUrl: null, id: 12, kind: 'human', login: 'akim', name: 'Alex Kim' },
+	{ avatarUrl: null, id: 13, kind: 'human', login: 'srivera', name: 'Sam Rivera' },
+	{ avatarUrl: null, id: 14, kind: 'human', login: 'jlee', name: 'Jordan Lee' },
+]
+
+const recipientProjectIds = new Map<number, readonly number[]>([
+	[101, [7, 11, 12, 13]],
+	[102, [7, 14]],
+])
 
 const projects: ReviewProject[] = [
 	{ id: 101, name: 'Project Northstar', statusCode: 'act', thumbnailUrl: null },
@@ -178,8 +198,35 @@ export class MockReviewGateway implements ReviewGateway {
 		return note
 	}
 
+	async createPublicationNote(
+		playlistId: number,
+		versionId: number,
+		request: CreateReviewPublicationNoteRequest
+	): Promise<ReviewPublicationNoteResult> {
+		const version = await this.getVersion(playlistId, versionId)
+		this.requireRecipients(version.projectId, request.recipientIds)
+		return {
+			links: this.buildPublicationLinks(version),
+			note: await this.createNote({
+				content: request.content,
+				frame: null,
+				projectId: version.projectId,
+				subject: request.subject,
+				versionId,
+			}),
+		}
+	}
+
 	async getCurrentReviewer() {
 		return reviewer
+	}
+
+	async getNoteOptions(playlistId: number, versionId: number): Promise<ReviewNoteOptions> {
+		const version = await this.getVersion(playlistId, versionId)
+		return {
+			links: this.buildPublicationLinks(version),
+			recipients: this.getProjectRecipients(version.projectId),
+		}
 	}
 
 	async getVersion(playlistId: number, versionId: number) {
@@ -234,6 +281,35 @@ export class MockReviewGateway implements ReviewGateway {
 
 	private requireNote(id: number) {
 		if (!this.retainedNoteIds.has(id)) throw this.notFound('Note')
+	}
+
+	private requireRecipients(projectId: number, ids: number[]) {
+		const projectRecipients = this.getProjectRecipients(projectId)
+		for (const id of ids) {
+			if (!projectRecipients.some((recipient) => recipient.id === id)) {
+				throw new ReviewGatewayError({
+					code: 'INVALID_REQUEST',
+					message: 'A selected recipient is unavailable',
+					retryable: false,
+					status: 400,
+				})
+			}
+		}
+	}
+
+	private getProjectRecipients(projectId: number) {
+		const ids = recipientProjectIds.get(projectId) ?? []
+		return recipients.filter((recipient) => recipient.id !== null && ids.includes(recipient.id))
+	}
+
+	private buildPublicationLinks(version: ReviewVersion): ReviewPublicationLinks {
+		const project = this.requireProject(version.projectId)
+		return {
+			entity: version.entity,
+			project: { id: project.id, name: project.name, type: 'Project' },
+			task: version.task,
+			version: { id: version.id, name: version.name, type: 'Version' },
+		}
 	}
 
 	private retainNoteId(id: number) {

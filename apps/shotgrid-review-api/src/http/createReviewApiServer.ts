@@ -1,21 +1,31 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { promisify } from 'node:util'
+import { inflate } from 'node:zlib'
 import type {
-	CreateReviewNoteRequest,
 	ReviewApiErrorCode,
 	ReviewHealth,
+	ReviewPublicationRequest,
 	UpdateReviewStatusRequest,
-	UploadReviewAttachmentRequest,
 } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ReviewGateway, ReviewImageProxyPayload } from '../gateway/ReviewGateway'
+import { ReviewPublicationCoordinator } from './ReviewPublicationCoordinator'
+import type { ReviewPublicationStore } from './ReviewPublicationStore'
 
 const JSON_BODY_LIMIT = 1024 * 1024
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
-const ATTACHMENT_BODY_LIMIT = Math.ceil((MAX_ATTACHMENT_BYTES * 4) / 3) + 4096
+const PUBLICATION_BODY_LIMIT = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4 + 64 * 1024
+const MAX_PNG_DIMENSION = 8_192
+const MAX_PNG_PIXELS = 16_777_216
+const MAX_PNG_INFLATED_BYTES = MAX_PNG_PIXELS * 4 + MAX_PNG_DIMENSION
+const MAX_RECIPIENTS = 50
+const PNG_CRC_TABLE = createPngCrcTable()
 const HEADERS_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 30_000
-const MUTATION_METHODS = ['PATCH', 'POST'] as const
+const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
+const MUTATION_METHODS = ['PATCH', 'PUT'] as const
+const inflateAsync = promisify(inflate)
 
 type GatewayMode = 'mock' | 'shotgrid'
 
@@ -27,8 +37,12 @@ export interface ReviewApiServerOptions {
 	allowedOrigin: string
 	gateway: ReviewGateway
 	logger?: SafeLogger
+	maxConcurrentPublications?: number
 	mode: GatewayMode
+	publicationDeploymentScope?: string
+	publicationStore?: ReviewPublicationStore
 	requestId?(): string
+	serviceActorName?: string
 	sudoAsLogin?: string
 	trustedProxyToken?: string
 }
@@ -36,11 +50,74 @@ export interface ReviewApiServerOptions {
 interface RouteMatch {
 	allowedMethods: string[]
 	handle(method: string, request: IncomingMessage, response: ServerResponse): Promise<void>
+	requiresHumanReviewer: boolean
 }
 
 export function createReviewApiServer(options: ReviewApiServerOptions): Server {
+	if (options.mode === 'shotgrid' && !options.publicationStore) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
+	if (
+		options.mode === 'shotgrid' &&
+		!isCanonicalShotGridOrigin(options.publicationDeploymentScope)
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
+	if (
+		options.mode === 'shotgrid' &&
+		options.sudoAsLogin === undefined &&
+		(!options.serviceActorName ||
+			options.serviceActorName.trim() !== options.serviceActorName ||
+			options.serviceActorName.length > 255 ||
+			/\p{Cc}/u.test(options.serviceActorName))
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
+	if (
+		options.mode === 'shotgrid' &&
+		options.sudoAsLogin !== undefined &&
+		(options.sudoAsLogin.trim() === '' ||
+			options.sudoAsLogin.trim() !== options.sudoAsLogin ||
+			options.sudoAsLogin.length > 255 ||
+			/\p{Cc}/u.test(options.sudoAsLogin))
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
 	const createRequestId = options.requestId ?? randomUUID
 	const logger = options.logger ?? console
+	const maxConcurrentPublications =
+		options.maxConcurrentPublications ?? DEFAULT_MAX_CONCURRENT_PUBLICATIONS
+	if (!Number.isSafeInteger(maxConcurrentPublications) || maxConcurrentPublications <= 0) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
+	const publications = new ReviewPublicationCoordinator(options.gateway, options.publicationStore)
+	const publicationLimiter = new InFlightLimiter(maxConcurrentPublications)
+	const publicationActorScope =
+		options.mode === 'mock'
+			? 'mock:local.reviewer'
+			: options.sudoAsLogin !== undefined
+				? `shotgrid:${options.publicationDeploymentScope}:human:${options.sudoAsLogin}`
+				: `shotgrid:${options.publicationDeploymentScope}:script:${options.serviceActorName}`
 
 	const server = createServer(async (request, response) => {
 		const requestId = createRequestId()
@@ -50,7 +127,15 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			if (!applyCors(request, response, options.allowedOrigin, requestId)) return
 
 			const url = parseRequestUrl(request.url)
-			const route = matchRoute(url.pathname, options.gateway, options.mode, response)
+			const route = matchRoute(
+				url.pathname,
+				options.gateway,
+				options.mode,
+				publications,
+				publicationLimiter,
+				publicationActorScope,
+				response
+			)
 			if (!route) {
 				sendError(response, 404, 'NOT_FOUND', false, requestId)
 				return
@@ -75,6 +160,14 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				sendError(response, 405, 'INVALID_REQUEST', false, requestId)
 				return
 			}
+			if (
+				options.mode === 'shotgrid' &&
+				options.sudoAsLogin === undefined &&
+				route.requiresHumanReviewer
+			) {
+				sendError(response, 403, 'PERMISSION_DENIED', false, requestId)
+				return
+			}
 
 			await route.handle(method, request, response)
 		} catch (error) {
@@ -93,6 +186,24 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 	server.maxRequestsPerSocket = 100
 	server.requestTimeout = REQUEST_TIMEOUT_MS
 	return server
+}
+
+function isCanonicalShotGridOrigin(value: unknown): value is string {
+	if (typeof value !== 'string') return false
+	try {
+		const url = new URL(value)
+		return (
+			url.protocol === 'https:' &&
+			url.username === '' &&
+			url.password === '' &&
+			url.origin === value &&
+			(url.pathname === '' || url.pathname === '/') &&
+			url.search === '' &&
+			url.hash === ''
+		)
+	} catch {
+		return false
+	}
 }
 
 function authenticateTrustedProxy(
@@ -131,6 +242,9 @@ function matchRoute(
 	pathname: string,
 	gateway: ReviewGateway,
 	mode: GatewayMode,
+	publications: ReviewPublicationCoordinator,
+	publicationLimiter: InFlightLimiter,
+	publicationActorScope: string,
 	response: ServerResponse
 ): RouteMatch | undefined {
 	if (pathname === '/api/health') {
@@ -208,20 +322,45 @@ function matchRoute(
 		})
 	}
 
-	if (pathname === '/api/review/notes') {
-		return mutationRoute('POST', async (request) => {
-			const body = await readJson(request, JSON_BODY_LIMIT)
-			const note = await gateway.createNote(parseNoteRequest(body))
-			sendJson(response, 201, { data: note })
-		})
+	const noteOptions = matchTwoIdPath(
+		pathname,
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/note-options$/
+	)
+	if (noteOptions.matched) {
+		return getRoute(async () => {
+			const playlistId = requirePositiveId(noteOptions.firstId, 'playlistId')
+			const versionId = requirePositiveId(noteOptions.secondId, 'versionId')
+			sendJson(response, 200, { data: await gateway.getNoteOptions(playlistId, versionId) })
+		}, true)
 	}
 
-	if (pathname === '/api/review/attachments') {
-		return mutationRoute('POST', async (request) => {
-			const body = await readJson(request, ATTACHMENT_BODY_LIMIT)
-			const attachment = await gateway.uploadAttachment(parseAttachmentRequest(body))
-			sendJson(response, 201, { data: attachment })
-		})
+	const publication = matchPublicationPath(pathname)
+	if (publication.matched) {
+		return mutationRoute(
+			'PUT',
+			async (request) => {
+				const playlistId = requirePositiveId(publication.playlistId, 'playlistId')
+				const versionId = requirePositiveId(publication.versionId, 'versionId')
+				const publicationId = requirePublicationId(publication.publicationId)
+				const release = publicationLimiter.tryAcquire()
+				if (!release) throw publicationConcurrencyExceeded()
+				try {
+					const body = await readJson(request, PUBLICATION_BODY_LIMIT)
+					const publicationRequest = await parsePublicationRequest(body)
+					const result = await publications.publish(
+						publicationActorScope,
+						publicationId,
+						playlistId,
+						versionId,
+						publicationRequest
+					)
+					sendJson(response, 200, { data: result })
+				} finally {
+					release()
+				}
+			},
+			true
+		)
 	}
 
 	const statusUpdate = matchIdPath(pathname, /^\/api\/review\/versions\/([^/]+)\/status$/)
@@ -236,20 +375,26 @@ function matchRoute(
 
 	return undefined
 
-	function getRoute(handle: (request: IncomingMessage) => Promise<void>): RouteMatch {
+	function getRoute(
+		handle: (request: IncomingMessage) => Promise<void>,
+		requiresHumanReviewer = false
+	): RouteMatch {
 		return {
 			allowedMethods: ['GET'],
 			handle: async (_method, request) => handle(request),
+			requiresHumanReviewer,
 		}
 	}
 
 	function mutationRoute(
 		method: (typeof MUTATION_METHODS)[number],
-		handle: (request: IncomingMessage) => Promise<void>
+		handle: (request: IncomingMessage) => Promise<void>,
+		requiresHumanReviewer = false
 	): RouteMatch {
 		return {
 			allowedMethods: [method],
 			handle: async (_method, request) => handle(request),
+			requiresHumanReviewer,
 		}
 	}
 }
@@ -321,6 +466,19 @@ function matchTwoIdPath(pathname: string, pattern: RegExp) {
 		: { matched: false as const }
 }
 
+function matchPublicationPath(pathname: string) {
+	const match =
+		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/publications\/([^/]+)$/.exec(pathname)
+	return match
+		? {
+				matched: true as const,
+				playlistId: match[1],
+				publicationId: match[3],
+				versionId: match[2],
+			}
+		: { matched: false as const }
+}
+
 function requirePositiveId(value: string, field: string) {
 	if (!/^[1-9]\d*$/.test(value)) throw invalidRequest(`${field} must be a positive integer`)
 	const id = Number(value)
@@ -363,40 +521,44 @@ async function readJson(request: IncomingMessage, limit: number): Promise<unknow
 	}
 }
 
-function parseNoteRequest(value: unknown): CreateReviewNoteRequest {
+async function parsePublicationRequest(value: unknown): Promise<ReviewPublicationRequest> {
 	const body = requireRecord(value)
-	return {
-		content: requireString(body.content, 'content', 1, 10_000),
-		frame: body.frame === null ? null : (optionalNonNegativeInteger(body.frame, 'frame') ?? null),
-		projectId: requireBodyId(body.projectId, 'projectId'),
-		subject: requireString(body.subject, 'subject', 1, 255),
-		versionId: requireBodyId(body.versionId, 'versionId'),
-	}
-}
-
-function parseAttachmentRequest(value: unknown): UploadReviewAttachmentRequest {
-	const body = requireRecord(value)
-	const fileName = requireString(body.fileName, 'fileName', 1, 255)
+	requireOnlyKeys(body, ['attachment', 'content', 'recipientIds', 'subject'])
+	const attachment = requireRecord(body.attachment)
+	requireOnlyKeys(attachment, ['contentBase64', 'contentType', 'fileName', 'sha256'])
+	const fileName = requireString(attachment.fileName, 'attachment.fileName', 1, 255)
 	if (
 		fileName === '.' ||
 		fileName === '..' ||
 		fileName !== fileName.replaceAll('\\', '/').split('/').at(-1) ||
-		/[\p{Bidi_Control}\p{Cc}]/u.test(fileName)
+		/[\p{Bidi_Control}\p{Cc}]/u.test(fileName) ||
+		!fileName.toLowerCase().endsWith('.png')
 	) {
-		throw invalidRequest('fileName must not contain a path')
+		throw invalidRequest('attachment.fileName must be a PNG basename')
 	}
 
-	const contentType = requireString(body.contentType, 'contentType', 1, 100).toLowerCase()
-	if (
-		!['application/json', 'application/vnd.tldraw+json', 'image/jpeg', 'image/png'].includes(
-			contentType
-		)
-	) {
-		throw invalidRequest('contentType is not allowed')
+	if (attachment.contentType !== 'image/png') {
+		throw invalidRequest('attachment.contentType must be image/png')
 	}
 
-	const contentBase64 = requireString(body.contentBase64, 'contentBase64', 1, ATTACHMENT_BODY_LIMIT)
-	if (!isCanonicalBase64(contentBase64)) throw invalidRequest('contentBase64 must be valid base64')
+	const contentBase64 = requireRawString(
+		attachment.contentBase64,
+		'attachment.contentBase64',
+		1,
+		Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
+	)
+	const decodedLength = decodedBase64Length(contentBase64)
+	if (decodedLength !== null && decodedLength > MAX_ATTACHMENT_BYTES) {
+		throw new ReviewGatewayError({
+			code: 'INVALID_REQUEST',
+			message: 'Attachment is too large',
+			retryable: false,
+			status: 413,
+		})
+	}
+	if (!isCanonicalBase64(contentBase64)) {
+		throw invalidRequest('attachment.contentBase64 must be valid base64')
+	}
 	const content = Buffer.from(contentBase64, 'base64')
 	if (content.byteLength > MAX_ATTACHMENT_BYTES) {
 		throw new ReviewGatewayError({
@@ -406,53 +568,247 @@ function parseAttachmentRequest(value: unknown): UploadReviewAttachmentRequest {
 			status: 413,
 		})
 	}
-	validateAttachmentContent(fileName, contentType, content)
+	await validatePngAttachment(content)
+	const sha256 = requireRawString(attachment.sha256, 'attachment.sha256', 64, 64)
+	if (!/^[0-9a-f]{64}$/.test(sha256)) {
+		throw invalidRequest('attachment.sha256 must be a lowercase SHA-256 digest')
+	}
+	const digest = createHash('sha256').update(content).digest('hex')
+	if (!constantTimeEqual(sha256, digest)) throw invalidRequest('attachment.sha256 does not match')
 
+	if (!Array.isArray(body.recipientIds) || body.recipientIds.length > MAX_RECIPIENTS) {
+		throw invalidRequest(`recipientIds must contain at most ${MAX_RECIPIENTS} items`)
+	}
+	const recipientIds = body.recipientIds.map((id) => requireBodyId(id, 'recipientIds item'))
+	if (new Set(recipientIds).size !== recipientIds.length) {
+		throw invalidRequest('recipientIds must not contain duplicates')
+	}
 	return {
-		contentBase64,
-		contentType,
-		fileName,
-		noteId: requireBodyId(body.noteId, 'noteId'),
+		attachment: { contentBase64, contentType: 'image/png', fileName, sha256 },
+		content: requireString(body.content, 'content', 1, 10_000),
+		recipientIds: recipientIds.sort((a, b) => a - b),
+		subject: requireString(body.subject, 'subject', 1, 255),
 	}
 }
 
-function validateAttachmentContent(fileName: string, contentType: string, content: Buffer) {
-	const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
-	if (contentType === 'image/png') {
-		if (
-			extension !== '.png' ||
-			!content.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
-		) {
-			throw invalidRequest('PNG attachment content does not match its file type')
-		}
-		return
+async function validatePngAttachment(content: Buffer) {
+	const signature = Buffer.from('89504e470d0a1a0a', 'hex')
+	if (content.byteLength < 8 || !content.subarray(0, 8).equals(signature)) {
+		throw invalidRequest('PNG attachment has an invalid header')
 	}
 
-	if (contentType === 'image/jpeg') {
+	let offset = 8
+	let width = 0
+	let height = 0
+	let bitDepth = 0
+	let colorType = 0
+	let sawEnd = false
+	let sawHeader = false
+	let sawImageData = false
+	let sawImageDataChunk = false
+	let finishedImageData = false
+	let sawPalette = false
+	const compressedImageData = Buffer.allocUnsafe(content.byteLength)
+	let compressedImageDataLength = 0
+	while (offset + 12 <= content.byteLength) {
+		const dataLength = content.readUInt32BE(offset)
+		const chunkEnd = offset + 12 + dataLength
+		if (chunkEnd > content.byteLength) throw invalidRequest('PNG attachment is truncated')
+		const chunkTypeBytes = content.subarray(offset + 4, offset + 8)
+		const chunkType = content.toString('latin1', offset + 4, offset + 8)
 		if (
-			!['.jpeg', '.jpg'].includes(extension) ||
-			!content.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))
+			![...chunkTypeBytes].every(isPngChunkTypeByte) ||
+			!isAsciiUppercase(chunkTypeBytes[2]) ||
+			!hasValidPngChunkCrc(content, offset, dataLength)
 		) {
-			throw invalidRequest('JPEG attachment content does not match its file type')
+			throw invalidRequest('PNG attachment contains an invalid chunk')
 		}
-		return
+		if (/[A-Z]/.test(chunkType[0]) && !['IDAT', 'IEND', 'IHDR', 'PLTE'].includes(chunkType)) {
+			throw invalidRequest('PNG attachment contains an unknown critical chunk')
+		}
+		if (!sawHeader) {
+			if (chunkType !== 'IHDR' || dataLength !== 13) {
+				throw invalidRequest('PNG attachment has an invalid header')
+			}
+			sawHeader = true
+			width = content.readUInt32BE(offset + 8)
+			height = content.readUInt32BE(offset + 12)
+			bitDepth = content[offset + 16]
+			colorType = content[offset + 17]
+			validatePngHeaderParameters(content, offset + 8)
+		}
+		if (chunkType === 'IHDR' && offset !== 8) {
+			throw invalidRequest('PNG attachment contains more than one header')
+		}
+		if (chunkType === 'acTL' || chunkType === 'fcTL' || chunkType === 'fdAT') {
+			throw invalidRequest('Animated PNG attachments are not allowed')
+		}
+		if (chunkType === 'PLTE') {
+			if (
+				sawPalette ||
+				sawImageDataChunk ||
+				colorType === 0 ||
+				colorType === 4 ||
+				dataLength === 0 ||
+				dataLength % 3 !== 0 ||
+				dataLength > 768 ||
+				(colorType === 3 && dataLength / 3 > 2 ** bitDepth)
+			) {
+				throw invalidRequest('PNG attachment contains an invalid palette')
+			}
+			sawPalette = true
+		}
+		if (chunkType === 'IDAT') {
+			if (finishedImageData || (colorType === 3 && !sawPalette)) {
+				throw invalidRequest('PNG attachment has invalid image data ordering')
+			}
+			sawImageDataChunk = true
+			if (dataLength > 0) {
+				sawImageData = true
+				content.copy(
+					compressedImageData,
+					compressedImageDataLength,
+					offset + 8,
+					offset + 8 + dataLength
+				)
+				compressedImageDataLength += dataLength
+			}
+		} else if (sawImageDataChunk) {
+			finishedImageData = true
+		}
+		if (chunkType === 'IEND') {
+			if (dataLength !== 0 || !sawImageData || chunkEnd !== content.byteLength) {
+				throw invalidRequest('PNG attachment has an invalid ending')
+			}
+			sawEnd = true
+			offset = chunkEnd
+			break
+		}
+		offset = chunkEnd
+	}
+	if (!sawHeader || !sawImageData || !sawEnd || offset !== content.byteLength) {
+		throw invalidRequest('PNG attachment is incomplete')
+	}
+	if (
+		width === 0 ||
+		height === 0 ||
+		width > MAX_PNG_DIMENSION ||
+		height > MAX_PNG_DIMENSION ||
+		width * height > MAX_PNG_PIXELS
+	) {
+		throw invalidRequest('PNG attachment dimensions are invalid')
+	}
+	await validatePngScanlines(
+		compressedImageData.subarray(0, compressedImageDataLength),
+		width,
+		height,
+		colorType
+	)
+}
+
+function isPngChunkTypeByte(value: number) {
+	return isAsciiUppercase(value) || (value >= 0x61 && value <= 0x7a)
+}
+
+function isAsciiUppercase(value: number) {
+	return value >= 0x41 && value <= 0x5a
+}
+
+function validatePngHeaderParameters(content: Buffer, dataOffset: number) {
+	const bitDepth = content[dataOffset + 8]
+	const colorType = content[dataOffset + 9]
+	if (
+		bitDepth !== 8 ||
+		(colorType !== 2 && colorType !== 6) ||
+		content[dataOffset + 10] !== 0 ||
+		content[dataOffset + 11] !== 0 ||
+		content[dataOffset + 12] !== 0
+	) {
+		throw invalidRequest('PNG attachment uses unsupported header parameters')
+	}
+}
+
+async function validatePngScanlines(
+	compressedImageData: Buffer,
+	width: number,
+	height: number,
+	colorType: number
+) {
+	const bytesPerPixel = colorType === 6 ? 4 : 3
+	const rowLength = width * bytesPerPixel + 1
+	const expectedLength = rowLength * height
+	if (expectedLength > MAX_PNG_INFLATED_BYTES) {
+		throw invalidRequest('PNG attachment dimensions are invalid')
 	}
 
-	const requiredExtension = contentType === 'application/vnd.tldraw+json' ? '.tldr' : '.json'
-	if (extension !== requiredExtension) {
-		throw invalidRequest('JSON attachment extension does not match its content type')
-	}
+	let inflated: Buffer
+	let consumedBytes: number
 	try {
-		const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(content))
-		if (
-			contentType === 'application/vnd.tldraw+json' &&
-			(!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
-		) {
-			throw new Error('Expected a tldraw object')
-		}
+		const result = (await inflateAsync(compressedImageData, {
+			info: true,
+			maxOutputLength: expectedLength,
+		})) as unknown as { buffer: Buffer; engine: { bytesWritten: number } }
+		inflated = result.buffer
+		consumedBytes = result.engine.bytesWritten
 	} catch {
-		throw invalidRequest('JSON attachment content is invalid')
+		throw invalidRequest('PNG attachment contains invalid image data')
 	}
+
+	if (inflated.byteLength !== expectedLength || consumedBytes !== compressedImageData.byteLength) {
+		throw invalidRequest('PNG attachment contains invalid image data')
+	}
+	for (let rowOffset = 0; rowOffset < inflated.byteLength; rowOffset += rowLength) {
+		if (inflated[rowOffset] > 4) {
+			throw invalidRequest('PNG attachment contains an invalid scanline filter')
+		}
+	}
+}
+
+class InFlightLimiter {
+	private inFlight = 0
+
+	constructor(private readonly limit: number) {}
+
+	tryAcquire() {
+		if (this.inFlight >= this.limit) return null
+		this.inFlight += 1
+		let released = false
+		return () => {
+			if (released) return
+			released = true
+			this.inFlight -= 1
+		}
+	}
+}
+
+function publicationConcurrencyExceeded() {
+	return new ReviewGatewayError({
+		code: 'SHOTGRID_RATE_LIMITED',
+		message: 'Too many review publications are in progress.',
+		retryable: true,
+		status: 429,
+	})
+}
+
+function hasValidPngChunkCrc(content: Buffer, offset: number, dataLength: number) {
+	let crc = 0xffffffff
+	const end = offset + 8 + dataLength
+	for (let index = offset + 4; index < end; index++) {
+		crc = PNG_CRC_TABLE[(crc ^ content[index]) & 0xff] ^ (crc >>> 8)
+	}
+	return (crc ^ 0xffffffff) >>> 0 === content.readUInt32BE(end)
+}
+
+function createPngCrcTable() {
+	const table = new Uint32Array(256)
+	for (let index = 0; index < table.length; index++) {
+		let value = index
+		for (let bit = 0; bit < 8; bit++) {
+			value = (value & 1) !== 0 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
+		}
+		table[index] = value >>> 0
+	}
+	return table
 }
 
 function parseStatusRequest(versionId: number, value: unknown): UpdateReviewStatusRequest {
@@ -480,14 +836,6 @@ function requireBodyId(value: unknown, field: string) {
 	return Number(value)
 }
 
-function optionalNonNegativeInteger(value: unknown, field: string) {
-	if (typeof value === 'undefined') return undefined
-	if (!Number.isSafeInteger(value) || Number(value) < 0) {
-		throw invalidRequest(`${field} must be a non-negative integer`)
-	}
-	return Number(value)
-}
-
 function requireString(
 	value: unknown,
 	field: string,
@@ -502,14 +850,59 @@ function requireString(
 	return trimmed
 }
 
+function requireRawString(
+	value: unknown,
+	field: string,
+	minimumLength: number,
+	maximumLength: number
+) {
+	if (typeof value !== 'string') throw invalidRequest(`${field} must be a string`)
+	if (value.length < minimumLength || value.length > maximumLength) {
+		throw invalidRequest(`${field} has an invalid length`)
+	}
+	return value
+}
+
+function requireOnlyKeys(record: Record<string, unknown>, allowedKeys: readonly string[]) {
+	if (Object.keys(record).some((key) => !allowedKeys.includes(key))) {
+		throw invalidRequest('Request body contains an unsupported field')
+	}
+}
+
+function requirePublicationId(value: string) {
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+		throw invalidRequest('publicationId must be a canonical UUID')
+	}
+	return value
+}
+
 function isCanonicalBase64(value: string) {
-	if (
-		value.length % 4 !== 0 ||
-		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-	) {
-		return false
+	if (value.length % 4 !== 0) return false
+	const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+	if (padding > 0 && value.length < 4) return false
+	for (let index = 0; index < value.length - padding; index++) {
+		if (!isBase64Character(value.charCodeAt(index))) return false
+	}
+	for (let index = value.length - padding; index < value.length; index++) {
+		if (value[index] !== '=') return false
 	}
 	return Buffer.from(value, 'base64').toString('base64') === value
+}
+
+function decodedBase64Length(value: string) {
+	if (value.length === 0 || value.length % 4 !== 0) return null
+	const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+	return (value.length / 4) * 3 - padding
+}
+
+function isBase64Character(code: number) {
+	return (
+		(code >= 0x41 && code <= 0x5a) ||
+		(code >= 0x61 && code <= 0x7a) ||
+		(code >= 0x30 && code <= 0x39) ||
+		code === 0x2b ||
+		code === 0x2f
+	)
 }
 
 function invalidRequest(message: string) {

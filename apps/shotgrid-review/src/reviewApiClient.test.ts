@@ -1,13 +1,20 @@
 import type {
 	ReviewHealth,
+	ReviewNoteOptions,
 	ReviewPlaylist,
 	ReviewProject,
+	ReviewPublicationRequest,
+	ReviewPublicationResult,
 	ReviewUser,
 	ReviewVersion,
 } from '@tldraw/shotgrid-review-contracts'
 import { describe, expect, it, vi } from 'vitest'
 import { parseReviewApiDevTarget } from '../vite.config'
-import { createReviewApiClient, ReviewApiClientError } from './reviewApiClient'
+import {
+	createReviewApiClient,
+	decodedCanonicalBase64Length,
+	ReviewApiClientError,
+} from './reviewApiClient'
 
 const health: ReviewHealth = { mode: 'shotgrid', status: 'ok' }
 const reviewer: ReviewUser = {
@@ -44,6 +51,49 @@ const version: ReviewVersion = {
 	statusCode: 'rev',
 	submittedBy: null,
 	task: { id: 501, name: 'Compositing' },
+}
+const publicationId = '11111111-1111-4111-8111-111111111111'
+const noteOptions: ReviewNoteOptions = {
+	links: {
+		entity: version.entity,
+		project: { id: 101, name: 'Northstar', type: 'Project' },
+		task: version.task,
+		version: { id: 301, name: version.name, type: 'Version' },
+	},
+	recipients: [reviewer],
+}
+const publicationRequest: ReviewPublicationRequest = {
+	attachment: {
+		contentBase64: 'aGVsbG8=',
+		contentType: 'image/png',
+		fileName: 'shot_010.annotated.png',
+		sha256: 'a'.repeat(64),
+	},
+	content: 'Please address marker 1.',
+	recipientIds: [7],
+	subject: 'Review: shot_010_comp_v001',
+}
+const publicationResult: ReviewPublicationResult = {
+	attachment: {
+		contentType: 'image/png',
+		fileName: publicationRequest.attachment.fileName,
+		id: 901,
+		noteId: 801,
+		sizeBytes: 5,
+	},
+	links: noteOptions.links,
+	note: {
+		content: publicationRequest.content,
+		createdAt: '2026-07-21T00:00:00Z',
+		createdBy: reviewer,
+		frame: null,
+		id: 801,
+		projectId: 101,
+		subject: publicationRequest.subject,
+		versionId: 301,
+	},
+	publicationId,
+	status: 'complete',
 }
 
 describe('createReviewApiClient', () => {
@@ -91,6 +141,117 @@ describe('createReviewApiClient', () => {
 
 		await client.getHealth()
 		expect(String(fetch.mock.calls[0][0])).toBe('https://review.example.test/gateway/api/health')
+	})
+
+	it('loads Note options and publishes an idempotent JSON request', async () => {
+		const responses = [
+			jsonResponse({ data: noteOptions }),
+			jsonResponse({ data: publicationResult }),
+		]
+		const fetch = vi.fn<typeof globalThis.fetch>(async () => responses.shift()!)
+		const client = createReviewApiClient({ baseUrl: '/api', fetch })
+		const signal = new AbortController().signal
+
+		await expect(client.getNoteOptions(201, 301, signal)).resolves.toEqual(noteOptions)
+		await expect(
+			client.publishReview(201, 301, publicationId, publicationRequest, signal)
+		).resolves.toEqual(publicationResult)
+
+		expect(fetch).toHaveBeenNthCalledWith(
+			1,
+			'/api/review/playlists/201/versions/301/note-options',
+			expect.objectContaining({ method: 'GET', signal })
+		)
+		expect(fetch).toHaveBeenNthCalledWith(
+			2,
+			`/api/review/playlists/201/versions/301/publications/${publicationId}`,
+			expect.objectContaining({
+				body: JSON.stringify(publicationRequest),
+				method: 'PUT',
+				signal,
+			})
+		)
+		expect(new Headers(fetch.mock.calls[1][1]?.headers)).toEqual(
+			new Headers({ Accept: 'application/json', 'Content-Type': 'application/json' })
+		)
+	})
+
+	it('rejects an invalid publication id and a mismatched publication result', async () => {
+		const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+			jsonResponse({ data: { ...publicationResult, publicationId: crypto.randomUUID() } })
+		)
+		const client = createReviewApiClient({ baseUrl: '/api', fetch })
+
+		await expect(
+			client.publishReview(201, 301, 'not-a-publication-id', publicationRequest)
+		).rejects.toMatchObject({ code: 'INVALID_REQUEST', status: 0 })
+		expect(fetch).not.toHaveBeenCalled()
+
+		await expect(
+			client.publishReview(201, 301, publicationId, publicationRequest)
+		).rejects.toMatchObject({ code: 'INVALID_RESPONSE', status: 200 })
+	})
+
+	it.each([
+		[
+			'Note subject',
+			(result: ReviewPublicationResult): void => void (result.note.subject = 'Other subject'),
+		],
+		[
+			'Note content',
+			(result: ReviewPublicationResult): void => void (result.note.content = 'Other content'),
+		],
+		[
+			'attachment filename',
+			(result: ReviewPublicationResult): void =>
+				void (result.attachment.fileName = 'other.annotated.png'),
+		],
+		[
+			'attachment content type',
+			(result: ReviewPublicationResult): void =>
+				void (result.attachment.contentType = 'image/jpeg'),
+		],
+		[
+			'attachment size',
+			(result: ReviewPublicationResult): void => void (result.attachment.sizeBytes = 6),
+		],
+	] as const)(
+		'rejects a success whose %s is not bound to the frozen request',
+		async (_label, mutate) => {
+			const mismatched = structuredClone(publicationResult)
+			mutate(mismatched)
+			const client = createReviewApiClient({
+				baseUrl: '/api',
+				fetch: vi.fn(async () => jsonResponse({ data: mismatched })),
+			})
+
+			await expect(
+				client.publishReview(201, 301, publicationId, publicationRequest)
+			).rejects.toMatchObject({ code: 'INVALID_RESPONSE', status: 200 })
+		}
+	)
+
+	it('computes only canonical base64 decoded lengths', () => {
+		expect(decodedCanonicalBase64Length('aGVsbG8=')).toBe(5)
+		expect(decodedCanonicalBase64Length('cG5n')).toBe(3)
+		expect(decodedCanonicalBase64Length('aGVsbG9=')).toBeNull()
+		expect(decodedCanonicalBase64Length('AA=A')).toBeNull()
+		expect(decodedCanonicalBase64Length('')).toBeNull()
+	})
+
+	it('rejects duplicate Note recipients from the gateway', async () => {
+		const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+			jsonResponse({ data: { ...noteOptions, recipients: [reviewer, reviewer] } }, 200, {
+				'X-Request-Id': 'duplicate-recipients',
+			})
+		)
+		const client = createReviewApiClient({ baseUrl: '/api', fetch })
+
+		await expect(client.getNoteOptions(201, 301)).rejects.toMatchObject({
+			code: 'INVALID_RESPONSE',
+			requestId: 'duplicate-recipients',
+			status: 200,
+		})
 	})
 
 	it('resolves protected media routes through the configured API base URL', async () => {
@@ -182,6 +343,80 @@ describe('createReviewApiClient', () => {
 			retryable: true,
 			status: 503,
 		})
+	})
+
+	it('preserves a publication uncertainty context from an indeterminate PUT', async () => {
+		const publication = {
+			attachmentId: 901,
+			links: noteOptions.links,
+			noteId: 801,
+			publicationId,
+			stage: 'attachment-completion' as const,
+		}
+		const client = createReviewApiClient({
+			baseUrl: '/api',
+			fetch: vi.fn(async () =>
+				jsonResponse(
+					{
+						error: {
+							code: 'PUBLICATION_INDETERMINATE',
+							message: 'Attachment completion is uncertain.',
+							publication,
+							requestId: 'request-uncertain',
+							retryable: false,
+						},
+					},
+					502
+				)
+			),
+		})
+
+		await expect(
+			client.publishReview(201, 301, publicationId, publicationRequest)
+		).rejects.toMatchObject({
+			code: 'PUBLICATION_INDETERMINATE',
+			publication,
+			requestId: 'request-uncertain',
+		})
+	})
+
+	it.each([
+		{
+			links: noteOptions.links,
+			noteId: 801,
+			publicationId: '22222222-2222-4222-8222-222222222222',
+			stage: 'note-created' as const,
+		},
+		{
+			links: {
+				...noteOptions.links,
+				version: { ...noteOptions.links.version, id: 302 },
+			},
+			noteId: 801,
+			publicationId,
+			stage: 'attachment-completion' as const,
+		},
+	])('rejects uncertainty context not bound to the PUT path', async (publication) => {
+		const client = createReviewApiClient({
+			baseUrl: '/api',
+			fetch: vi.fn(async () =>
+				jsonResponse(
+					{
+						error: {
+							code: 'PUBLICATION_INDETERMINATE',
+							message: 'Publication outcome is uncertain.',
+							publication,
+							retryable: false,
+						},
+					},
+					502
+				)
+			),
+		})
+
+		await expect(
+			client.publishReview(201, 301, publicationId, publicationRequest)
+		).rejects.toMatchObject({ code: 'INVALID_RESPONSE', status: 502 })
 	})
 
 	it('rejects a non-error payload on a failed HTTP status', async () => {

@@ -1,11 +1,23 @@
-import type { ReviewImageMedia } from '@tldraw/shotgrid-review-contracts'
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+import type {
+	ReviewImageMedia,
+	ReviewPublicationErrorContext,
+	ReviewPublicationResult,
+	ReviewUser,
+} from '@tldraw/shotgrid-review-contracts'
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	type ComponentProps,
+} from 'react'
 import {
 	DefaultToolbar,
 	SVGContainer,
 	Tldraw,
 	ToolbarItem,
-	Box,
 	getSnapshot,
 	loadSnapshot,
 	track,
@@ -16,7 +28,6 @@ import {
 	type TLUiOverrides,
 } from 'tldraw'
 import {
-	getReviewExportOptions,
 	getReviewImageIds,
 	disableReviewExternalContent,
 	installReviewImage,
@@ -35,15 +46,59 @@ import {
 	type ReviewAnnotationContext,
 	type ReviewAnnotationSource,
 } from './reviewAnnotationSnapshot'
+import { type ReviewApiClient, ReviewApiClientError } from './reviewApiClient'
 import {
 	decodeReviewImageDimensions,
 	digestReviewImage,
 	fetchReviewImage,
 	resolveReviewImageDimensions,
 } from './reviewImage'
+import {
+	createReviewPublicationId,
+	prepareReviewPublication,
+	renderReviewPng,
+	sanitizeReviewFileNameBase,
+	type PreparedReviewPublication,
+} from './reviewPublication'
+import {
+	ReviewPublicationPanel,
+	type ReviewNoteOptionsState,
+	type ReviewPublicationFormValue,
+	type ReviewPublicationViewState,
+} from './ReviewPublicationPanel'
+import {
+	createStoredReviewPublication,
+	reviewPublicationStore as defaultReviewPublicationStore,
+	type ReviewPublicationStore,
+} from './reviewPublicationStore'
 
 const REVIEW_EDITOR_OPTIONS = { maxPages: 1, selectLockedShapes: false } as const
 const REVIEW_TOOLS = new Set(['arrow', 'draw', 'rectangle', 'review-marker', 'select', 'text'])
+const SAFE_PRE_MUTATION_PUBLICATION_ERRORS = new Set([
+	'AUTHENTICATION_REQUIRED',
+	'CONFIGURATION_ERROR',
+	'INVALID_REQUEST',
+	'INVALID_SHOTGRID_PATH',
+	'NOT_FOUND',
+	'PERMISSION_DENIED',
+	'SHOTGRID_AUTH_FAILED',
+	'SHOTGRID_PERMISSION_DENIED',
+])
+
+export const SERVICE_PUBLICATION_DISABLED_MESSAGE =
+	'Publishing requires SHOTGRID_SUDO_AS_LOGIN to resolve a human reviewer. Service identities can browse, annotate, and export only.'
+
+export type ReviewPublicationAccess =
+	| { status: 'enabled' }
+	| { message: string; status: 'disabled' }
+
+export function reviewPublicationAccessForReviewerKind(
+	kind: ReviewUser['kind']
+): ReviewPublicationAccess {
+	return kind === 'human'
+		? { status: 'enabled' }
+		: { message: SERVICE_PUBLICATION_DISABLED_MESSAGE, status: 'disabled' }
+}
 
 const reviewUiOverrides: TLUiOverrides = {
 	tools(editor, tools) {
@@ -62,11 +117,15 @@ const reviewUiOverrides: TLUiOverrides = {
 }
 
 export interface ReviewAnnotationEditorProps {
+	api: ReviewApiClient
 	documentKey: string
 	licenseKey?: string
 	media: ReviewImageMedia
 	persistenceKey?: string
+	playlistId: number
 	projectId: number
+	publicationAccess: ReviewPublicationAccess
+	publicationStore?: ReviewPublicationStore
 	reviewScope: string
 	versionId: number
 	versionName: string
@@ -81,6 +140,12 @@ type OperationState =
 	| { status: 'idle' }
 	| { label: string; status: 'working' }
 	| { message: string; status: 'error' | 'success' }
+
+interface PublicationContext {
+	active: boolean
+	generation: number
+	storageKey: string
+}
 
 export function ReviewImageCanvas(props: ReviewAnnotationEditorProps) {
 	const [attempt, setAttempt] = useState(0)
@@ -166,11 +231,15 @@ export function ReviewImageCanvas(props: ReviewAnnotationEditorProps) {
 }
 
 function ReadyReviewAnnotationEditor({
+	api,
 	documentKey,
 	image,
 	licenseKey,
 	persistenceKey,
+	playlistId,
 	projectId,
+	publicationAccess,
+	publicationStore = defaultReviewPublicationStore,
 	refreshWarning,
 	reviewScope,
 	versionName,
@@ -178,8 +247,23 @@ function ReadyReviewAnnotationEditor({
 	const [editor, setEditor] = useState<Editor | null>(null)
 	const [installation, setInstallation] = useState<OperationState>({ status: 'idle' })
 	const [operation, setOperation] = useState<OperationState>({ status: 'idle' })
+	const [noteOptionsAttempt, setNoteOptionsAttempt] = useState(0)
+	const [noteOptions, setNoteOptions] = useState<ReviewNoteOptionsState>({ status: 'loading' })
+	const [publication, setPublication] = useState<ReviewPublicationViewState>({
+		label: 'Checking for a saved publication',
+		status: 'restoring',
+	})
 	const operationInFlightRef = useRef(false)
+	const pendingPublicationRef = useRef<PreparedReviewPublication | null>(null)
+	const publicationGenerationRef = useRef(0)
+	const senderClaimIdRef = useRef<string | null>(null)
+	const sharedRetryRef = useRef(false)
 	const protectionRef = useRef<null | (() => void)>(null)
+	const publicationStorageKey = `${documentKey}:publication:playlist-${playlistId}:version-${image.versionId}`
+	const publicationContextRef = useRef<PublicationContext | null>(null)
+	const readonlyRestoreRef = useRef<null | (() => void)>(null)
+	const noteOptionsRef = useRef(noteOptions)
+	noteOptionsRef.current = noteOptions
 	const review = useMemo<ReviewAnnotationContext>(
 		() => ({ projectId, scope: reviewScope, versionId: image.versionId }),
 		[image.versionId, projectId, reviewScope]
@@ -197,6 +281,103 @@ function ReadyReviewAnnotationEditor({
 		disableReviewExternalContent(mountedEditor)
 		setEditor(mountedEditor)
 	}, [])
+
+	useLayoutEffect(() => {
+		const context: PublicationContext = {
+			active: true,
+			generation: (publicationContextRef.current?.generation ?? 0) + 1,
+			storageKey: publicationStorageKey,
+		}
+		publicationContextRef.current = context
+		operationInFlightRef.current = false
+		publicationGenerationRef.current = 0
+		senderClaimIdRef.current = null
+		sharedRetryRef.current = false
+		return () => {
+			context.active = false
+			readonlyRestoreRef.current?.()
+			readonlyRestoreRef.current = null
+		}
+	}, [publicationStorageKey])
+
+	useEffect(() => {
+		let cancelled = false
+		pendingPublicationRef.current = null
+		publicationGenerationRef.current = 0
+		senderClaimIdRef.current = null
+		sharedRetryRef.current = false
+		if (publicationAccess.status === 'disabled') {
+			setPublication({ status: 'idle' })
+			return
+		}
+		setPublication({ label: 'Checking for a saved publication', status: 'restoring' })
+		void publicationStore
+			.get(publicationStorageKey)
+			.then((stored) => {
+				if (cancelled) return
+				if (!stored) {
+					setPublication({ status: 'idle' })
+					return
+				}
+				publicationGenerationRef.current = stored.generation
+				if (stored.status === 'idle') {
+					setPublication({ status: 'idle' })
+					return
+				}
+				if (stored.status === 'completed') {
+					pendingPublicationRef.current = null
+					setPublication({ result: stored.result, status: 'success' })
+					return
+				}
+				pendingPublicationRef.current = stored.prepared
+				sharedRetryRef.current = stored.status === 'pending' && stored.claim !== null
+				const draft = publicationDraftFromPrepared(stored.prepared)
+				if (stored.status === 'indeterminate') {
+					setPublication({
+						draft,
+						message: indeterminatePublicationMessage(stored.requestId, stored.uncertainty),
+						publicationId: stored.prepared.publicationId,
+						status: 'indeterminate',
+						uncertainty: stored.uncertainty ?? undefined,
+					})
+					return
+				}
+				setPublication({
+					draft,
+					message: `A saved publication is ready to resume. Publication ${stored.prepared.publicationId}.`,
+					publicationId: stored.prepared.publicationId,
+					retryReady: true,
+					status: 'error',
+				})
+			})
+			.catch((error) => {
+				if (cancelled) return
+				setPublication({
+					message: `Publishing is blocked because saved publication state could not be checked. ${editorErrorMessage(error)}`,
+					status: 'blocked',
+				})
+			})
+		return () => {
+			cancelled = true
+		}
+	}, [publicationAccess.status, publicationStorageKey, publicationStore])
+
+	useEffect(() => {
+		if (publicationAccess.status === 'disabled') return
+		const controller = new AbortController()
+		setNoteOptions({ status: 'loading' })
+		void api
+			.getNoteOptions(playlistId, image.versionId, controller.signal)
+			.then((options) => {
+				if (!controller.signal.aborted) setNoteOptions({ options, status: 'ready' })
+			})
+			.catch((error) => {
+				if (!controller.signal.aborted) {
+					setNoteOptions({ message: publicationErrorMessage(error), status: 'error' })
+				}
+			})
+		return () => controller.abort()
+	}, [api, image.versionId, noteOptionsAttempt, playlistId, publicationAccess.status])
 
 	useEffect(() => {
 		if (!editor) return
@@ -230,7 +411,7 @@ function ReadyReviewAnnotationEditor({
 			const serialized = serializeReviewAnnotationSnapshot(envelope)
 			downloadBlob(
 				new Blob([serialized], { type: 'application/json' }),
-				`${fileNameBase(versionName)}.review.json`
+				`${sanitizeReviewFileNameBase(versionName)}.review.json`
 			)
 			setOperation({ message: 'Editable snapshot saved.', status: 'success' })
 		} catch (error) {
@@ -279,37 +460,8 @@ function ReadyReviewAnnotationEditor({
 		operationInFlightRef.current = true
 		setOperation({ label: 'Rendering full-resolution PNG', status: 'working' })
 		try {
-			const { assetId, shapeId } = getReviewImageIds(image.versionId)
-			assertReviewAnnotationRecords(getSnapshot(editor.store), {
-				sourceAssetId: assetId,
-				sourceShapeId: shapeId,
-			})
-			const asset = editor.getAsset(assetId)
-			const shape = editor.getShape(shapeId)
-			if (asset?.type !== 'image' || shape?.type !== 'image' || !shape.isLocked) {
-				throw new Error('The protected source image is missing from this review.')
-			}
-			if (!asset.props.src || !/^(asset:|data:image\/)/.test(asset.props.src)) {
-				throw new Error('The source image is not stored locally and cannot be exported safely.')
-			}
-			const resolvedSource = await editor.resolveAssetUrl(assetId, {
-				shouldResolveToOriginal: true,
-			})
-			if (!resolvedSource || !/^(blob:|data:image\/)/.test(resolvedSource)) {
-				throw new Error('The local source image could not be resolved for export.')
-			}
-
-			const bounds = new Box(0, 0, image.width, image.height)
-			const { blob } = await editor.toImage(
-				[...editor.getCurrentPageShapeIds()],
-				getReviewExportOptions(bounds)
-			)
-			if (blob.type !== 'image/png') throw new Error('The editor did not produce a PNG image.')
-			const exported = await decodeReviewImageDimensions(blob)
-			if (exported.width !== image.width || exported.height !== image.height) {
-				throw new Error('The exported PNG does not match the source image resolution.')
-			}
-			downloadBlob(blob, `${fileNameBase(versionName)}.annotated.png`)
+			const blob = await renderReviewPng(editor, image)
+			downloadBlob(blob, `${sanitizeReviewFileNameBase(versionName)}.annotated.png`)
 			setOperation({ message: 'Flattened PNG exported.', status: 'success' })
 		} catch (error) {
 			setOperation({ message: editorErrorMessage(error), status: 'error' })
@@ -318,9 +470,399 @@ function ReadyReviewAnnotationEditor({
 		}
 	}, [editor, image, installation.status, versionName])
 
+	const publishReview = useCallback(
+		async (draft: ReviewPublicationFormValue) => {
+			const context = publicationContextRef.current
+			if (
+				!editor ||
+				!context ||
+				publicationAccess.status === 'disabled' ||
+				!isCurrentPublicationContext(publicationContextRef.current, context) ||
+				installation.status !== 'idle' ||
+				operationInFlightRef.current
+			) {
+				return
+			}
+			operationInFlightRef.current = true
+			const attemptGeneration = publicationGenerationRef.current
+			let prepared = pendingPublicationRef.current
+			const existingSenderClaimId = senderClaimIdRef.current
+			let restoreEditing: null | (() => void) = null
+			try {
+				if (!prepared) {
+					try {
+						const wasReadonly = editor.getInstanceState().isReadonly
+						editor.updateInstanceState({ isReadonly: true })
+						let restored = false
+						restoreEditing = () => {
+							if (restored) return
+							restored = true
+							editor.updateInstanceState({ isReadonly: wasReadonly })
+							if (readonlyRestoreRef.current === restoreEditing) {
+								readonlyRestoreRef.current = null
+							}
+						}
+						readonlyRestoreRef.current = restoreEditing
+						setPublication({ label: 'Rendering full-resolution PNG', status: 'working' })
+						const png = await renderReviewPng(editor, image)
+						if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+						prepared = await prepareReviewPublication({
+							content: draft.content,
+							fileName: `${sanitizeReviewFileNameBase(versionName)}.annotated.png`,
+							generation: attemptGeneration,
+							png,
+							recipientIds: draft.recipientIds,
+							subject: draft.subject,
+						})
+						if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+						setPublication({ label: 'Saving a durable retry payload', status: 'working' })
+						const candidate = prepared
+						const stored = await publicationStore.addIfAbsent(
+							createStoredReviewPublication({
+								documentKey: context.storageKey,
+								prepared,
+								status: 'pending',
+							})
+						)
+						if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+						if (stored.record.status === 'completed') {
+							publicationGenerationRef.current = stored.record.generation
+							pendingPublicationRef.current = null
+							senderClaimIdRef.current = null
+							sharedRetryRef.current = false
+							setPublication({ result: stored.record.result, status: 'success' })
+							return
+						}
+						if (stored.record.status === 'idle' || stored.record.generation !== attemptGeneration) {
+							publicationGenerationRef.current = stored.record.generation
+							pendingPublicationRef.current = null
+							senderClaimIdRef.current = null
+							sharedRetryRef.current = false
+							setPublication({
+								message:
+									'Another tab advanced this review to a newer publication attempt. Reload the review before publishing.',
+								status: 'blocked',
+							})
+							return
+						}
+						prepared = stored.record.prepared
+						pendingPublicationRef.current = prepared
+						sharedRetryRef.current = stored.record.sharedRetry || stored.record.claim !== null
+						if (stored.record.status === 'indeterminate') {
+							setPublication({
+								draft: publicationDraftFromPrepared(prepared),
+								message: indeterminatePublicationMessage(
+									stored.record.requestId,
+									stored.record.uncertainty
+								),
+								publicationId: prepared.publicationId,
+								status: 'indeterminate',
+								uncertainty: stored.record.uncertainty ?? undefined,
+							})
+							return
+						}
+						if (
+							!stored.created &&
+							(stored.record.prepared.publicationId !== candidate.publicationId ||
+								stored.record.prepared.fingerprint !== candidate.fingerprint)
+						) {
+							setPublication({
+								draft: publicationDraftFromPrepared(prepared),
+								message: `Another tab saved publication ${prepared.publicationId} with frozen Note values. Review those locked values, then choose Retry publish to confirm sending that publication.`,
+								publicationId: prepared.publicationId,
+								retryReady: true,
+								status: 'error',
+							})
+							return
+						}
+					} catch (error) {
+						throw new Error(
+							`The publication could not be saved safely, so nothing was sent. ${editorErrorMessage(error)}`
+						)
+					} finally {
+						restoreEditing?.()
+						restoreEditing = null
+					}
+				}
+				if (!prepared || !isCurrentPublicationContext(publicationContextRef.current, context)) {
+					return
+				}
+				const claimId = existingSenderClaimId ?? createReviewPublicationId()
+				const claim = await publicationStore.claimForSend(
+					context.storageKey,
+					prepared.publicationId,
+					prepared.generation,
+					claimId,
+					sharedRetryRef.current
+				)
+				if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+				if (claim.status === 'completed') {
+					if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+						publicationGenerationRef.current = claim.record.generation
+						pendingPublicationRef.current = null
+						senderClaimIdRef.current = null
+						sharedRetryRef.current = false
+						setPublication({ result: claim.record.result, status: 'success' })
+					}
+					return
+				}
+				if (claim.status === 'busy') {
+					if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+						sharedRetryRef.current = true
+						setPublication({
+							draft: publicationDraftFromPrepared(prepared),
+							message:
+								'Another tab owns this saved publication send. Its claim does not expire automatically; check ShotGrid or return to the original tab before retrying.',
+							publicationId: prepared.publicationId,
+							retryReady: true,
+							status: 'error',
+						})
+					}
+					return
+				}
+				if (claim.status === 'conflict') {
+					if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+						if (claim.record) publicationGenerationRef.current = claim.record.generation
+						pendingPublicationRef.current = null
+						senderClaimIdRef.current = null
+						sharedRetryRef.current = false
+						setPublication({
+							message:
+								'Another tab advanced or replaced this publication attempt. Reload the review before publishing.',
+							status: 'blocked',
+						})
+					}
+					return
+				}
+				if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+					senderClaimIdRef.current = claimId
+					sharedRetryRef.current = claim.record.sharedRetry
+				}
+				if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+					setPublication({ label: 'Publishing Note and attachment', status: 'working' })
+				}
+				let result: ReviewPublicationResult
+				try {
+					result = await api.publishReview(
+						playlistId,
+						image.versionId,
+						prepared.publicationId,
+						prepared.request
+					)
+				} catch (error) {
+					const message = publicationErrorMessage(error)
+					const preparedDraft = publicationDraftFromPrepared(prepared)
+					if (
+						error instanceof ReviewApiClientError &&
+						(error.code === 'PUBLICATION_INDETERMINATE' || error.code === 'PUBLICATION_CONFLICT')
+					) {
+						try {
+							const stored = await publicationStore.markIndeterminate(
+								context.storageKey,
+								prepared.publicationId,
+								prepared.generation,
+								claimId,
+								error.requestId,
+								error.publication
+							)
+							if (stored.status === 'completed') {
+								if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+									publicationGenerationRef.current = stored.generation
+									pendingPublicationRef.current = null
+									senderClaimIdRef.current = null
+									sharedRetryRef.current = false
+									setPublication({ result: stored.result, status: 'success' })
+								}
+								return
+							}
+						} catch (storageError) {
+							if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+								setPublication({
+									message: `${message} Publishing is locked, and the indeterminate state could not be saved. Do not refresh; check ShotGrid using publication ${prepared.publicationId}. ${editorErrorMessage(storageError)}`,
+									status: 'blocked',
+								})
+							}
+							return
+						}
+						if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+							senderClaimIdRef.current = null
+							sharedRetryRef.current = false
+							setPublication({
+								draft: preparedDraft,
+								message: `${message} Check ShotGrid for the Note and attachment before starting another publication.`,
+								publicationId: prepared.publicationId,
+								status: 'indeterminate',
+								uncertainty: error.publication,
+							})
+						}
+						return
+					}
+					const retryReady =
+						!(error instanceof ReviewApiClientError) ||
+						error.retryable ||
+						!isSafePreMutationPublicationError(error.code)
+					if (retryReady) {
+						if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+							setPublication({
+								draft: preparedDraft,
+								message: `${message} Retrying will reuse the same publication and PNG.`,
+								publicationId: prepared.publicationId,
+								retryReady: true,
+								status: 'error',
+							})
+						}
+						return
+					}
+					try {
+						const finished = await publicationStore.finishSafeFailure(
+							context.storageKey,
+							prepared.publicationId,
+							prepared.generation,
+							claimId
+						)
+						if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+						if (finished.status === 'completed') {
+							publicationGenerationRef.current = finished.record.generation
+							pendingPublicationRef.current = null
+							senderClaimIdRef.current = null
+							sharedRetryRef.current = false
+							setPublication({ result: finished.record.result, status: 'success' })
+							return
+						}
+						if (finished.status === 'conflict') {
+							setPublication({
+								message: `${message} Another tab changed the saved publication, so publishing is blocked until this review is reloaded.`,
+								status: 'blocked',
+							})
+							return
+						}
+						publicationGenerationRef.current = finished.record.generation
+						pendingPublicationRef.current = null
+						senderClaimIdRef.current = null
+						sharedRetryRef.current = false
+						setPublication({
+							allowedRecipientIds: allowedPublicationRecipientIds(noteOptionsRef.current),
+							message,
+							retryReady: false,
+							status: 'error',
+						})
+					} catch (storageError) {
+						if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+							setPublication({
+								message: `${message} A new publication is blocked until the saved retry payload can be removed. ${editorErrorMessage(storageError)}`,
+								status: 'blocked',
+							})
+						}
+					}
+					return
+				}
+
+				let warning: string | undefined
+				let completedResult = result
+				try {
+					const completed = await publicationStore.markCompleted(
+						context.storageKey,
+						prepared.publicationId,
+						prepared.generation,
+						claimId,
+						result
+					)
+					completedResult = completed.result
+					if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+						publicationGenerationRef.current = completed.generation
+						pendingPublicationRef.current = null
+						senderClaimIdRef.current = null
+						sharedRetryRef.current = false
+					}
+				} catch (error) {
+					warning = `The completed publication could not be recorded locally. Do not publish again until this review is reloaded and checked in ShotGrid. ${editorErrorMessage(error)}`
+				}
+				if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+					setPublication({ result: completedResult, status: 'success', warning })
+				}
+			} catch (error) {
+				if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+					setPublication({
+						message: editorErrorMessage(error),
+						retryReady: false,
+						status: 'error',
+					})
+				}
+			} finally {
+				if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+					operationInFlightRef.current = false
+				}
+			}
+		},
+		[
+			api,
+			editor,
+			image,
+			installation.status,
+			playlistId,
+			publicationAccess.status,
+			publicationStore,
+			versionName,
+		]
+	)
+
+	const startAnotherPublication = useCallback(async () => {
+		const context = publicationContextRef.current
+		if (
+			!context ||
+			publicationAccess.status === 'disabled' ||
+			!isCurrentPublicationContext(publicationContextRef.current, context) ||
+			operationInFlightRef.current
+		) {
+			return
+		}
+		const expectedGeneration = publicationGenerationRef.current
+		operationInFlightRef.current = true
+		setPublication({ label: 'Starting a new publication attempt', status: 'working' })
+		try {
+			const record = await publicationStore.startNextAttempt(context.storageKey, expectedGeneration)
+			if (!isCurrentPublicationContext(publicationContextRef.current, context)) return
+			publicationGenerationRef.current = record.generation
+			pendingPublicationRef.current = null
+			senderClaimIdRef.current = null
+			sharedRetryRef.current = false
+			if (record.status === 'idle' && record.generation === expectedGeneration + 1) {
+				setPublication({ status: 'idle' })
+				return
+			}
+			if (record.status === 'completed') {
+				setPublication({
+					result: record.result,
+					status: 'success',
+					warning: 'Another tab still owns the completed publication state.',
+				})
+				return
+			}
+			setPublication({
+				message:
+					'Another tab changed this publication attempt. Reload the review before starting another Note.',
+				status: 'blocked',
+			})
+		} catch (error) {
+			if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+				setPublication({
+					message: `A new publication attempt could not be started safely. ${editorErrorMessage(error)}`,
+					status: 'blocked',
+				})
+			}
+		} finally {
+			if (isCurrentPublicationContext(publicationContextRef.current, context)) {
+				operationInFlightRef.current = false
+			}
+		}
+	}, [publicationAccess.status, publicationStore])
+
 	const imageShapeId = getReviewImageIds(image.versionId).shapeId
 	const editorActionsDisabled =
-		!editor || installation.status !== 'idle' || operation.status === 'working'
+		!editor ||
+		installation.status !== 'idle' ||
+		operation.status === 'working' ||
+		publication.status === 'working'
 	const visibleOperation = useMemo<OperationState>(
 		() =>
 			installation.status !== 'idle'
@@ -340,31 +882,39 @@ function ReadyReviewAnnotationEditor({
 			MainMenu: null,
 			PageMenu: null,
 			QuickActions: null,
-			SharePanel: () => (
-				<ReviewEditorActions
-					disabled={editorActionsDisabled}
-					onExport={() => void exportPng()}
-					onOpen={(file) => void openEditable(file)}
-					onSave={saveEditable}
-					operation={visibleOperation}
-				/>
-			),
+			SharePanel: null,
 			Toolbar: FocusedReviewToolbar,
 		}),
-		[editorActionsDisabled, exportPng, imageShapeId, openEditable, saveEditable, visibleOperation]
+		[imageShapeId]
 	)
 
 	return (
-		<Tldraw
-			components={components}
-			key={documentKey}
-			licenseKey={licenseKey}
-			onMount={handleMount}
-			options={REVIEW_EDITOR_OPTIONS}
-			overrides={reviewUiOverrides}
-			{...(persistenceKey ? { persistenceKey } : {})}
-			tools={[ReviewMarkerTool]}
-		/>
+		<div className="review-image-editor">
+			<Tldraw
+				components={components}
+				key={documentKey}
+				licenseKey={licenseKey}
+				onMount={handleMount}
+				options={REVIEW_EDITOR_OPTIONS}
+				overrides={reviewUiOverrides}
+				{...(persistenceKey ? { persistenceKey } : {})}
+				tools={[ReviewMarkerTool]}
+			/>
+			<ReviewEditorActions
+				defaultSubject={`Review: ${versionName}`}
+				disabled={editorActionsDisabled}
+				noteOptions={noteOptions}
+				onExport={() => void exportPng()}
+				onOpen={(file) => void openEditable(file)}
+				onPublish={(draft) => void publishReview(draft)}
+				onRetryNoteOptions={() => setNoteOptionsAttempt((value) => value + 1)}
+				onSave={saveEditable}
+				onStartAnother={() => void startAnotherPublication()}
+				operation={visibleOperation}
+				publicationAccess={publicationAccess}
+				publication={publication}
+			/>
+		</div>
 	)
 }
 
@@ -382,17 +932,31 @@ function FocusedReviewToolbar(props: ComponentProps<typeof DefaultToolbar>) {
 }
 
 function ReviewEditorActions({
+	defaultSubject,
 	disabled,
+	noteOptions,
 	onExport,
 	onOpen,
+	onPublish,
+	onRetryNoteOptions,
 	onSave,
+	onStartAnother,
 	operation,
+	publicationAccess,
+	publication,
 }: {
+	defaultSubject: string
 	disabled: boolean
+	noteOptions: ReviewNoteOptionsState
 	onExport(): void
 	onOpen(file: File): void
+	onPublish(value: ReviewPublicationFormValue): void
+	onRetryNoteOptions(): void
 	onSave(): void
+	onStartAnother(): void
 	operation: OperationState
+	publicationAccess: ReviewPublicationAccess
+	publication: ReviewPublicationViewState
 }) {
 	const inputRef = useRef<HTMLInputElement>(null)
 	return (
@@ -420,6 +984,22 @@ function ReviewEditorActions({
 					type="file"
 				/>
 			</div>
+			{publicationAccess.status === 'disabled' ? (
+				<div className="review-publication__disabled" role="note">
+					<strong>Publishing unavailable</strong>
+					<span>{publicationAccess.message}</span>
+				</div>
+			) : (
+				<ReviewPublicationPanel
+					defaultSubject={defaultSubject}
+					disabled={disabled}
+					noteOptions={noteOptions}
+					onPublish={onPublish}
+					onRetryOptions={onRetryNoteOptions}
+					onStartAnother={onStartAnother}
+					publication={publication}
+				/>
+			)}
 			{operation.status === 'working' ? (
 				<span aria-live="polite">{operation.label}…</span>
 			) : operation.status === 'error' ? (
@@ -501,14 +1081,18 @@ function downloadBlob(blob: Blob, fileName: string) {
 	setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
-function fileNameBase(value: string) {
-	const normalized = value
-		.normalize('NFKC')
-		.replace(/[<>:"/\\|?*]/g, '-')
-		.replace(/\p{Cc}/gu, '-')
-		.replace(/[. ]+$/g, '')
-		.slice(0, 96)
-	return normalized || 'shotgrid-review'
+function isCurrentPublicationContext(
+	current: PublicationContext | null,
+	expected: PublicationContext
+) {
+	return expected.active && current === expected
+}
+
+function allowedPublicationRecipientIds(noteOptions: ReviewNoteOptionsState) {
+	if (noteOptions.status !== 'ready') return []
+	return noteOptions.options.recipients.flatMap((recipient) =>
+		recipient.kind === 'human' && recipient.id !== null ? [recipient.id] : []
+	)
 }
 
 function imageErrorMessage(error: unknown) {
@@ -529,4 +1113,41 @@ function sameReviewImage(left: LoadedReviewImage, right: LoadedReviewImage) {
 
 function editorErrorMessage(error: unknown) {
 	return error instanceof Error ? error.message : 'The review operation could not be completed.'
+}
+
+function publicationErrorMessage(error: unknown) {
+	if (error instanceof ReviewApiClientError) {
+		return error.requestId ? `${error.message} Request ${error.requestId}.` : error.message
+	}
+	return editorErrorMessage(error)
+}
+
+function publicationDraftFromPrepared(
+	prepared: PreparedReviewPublication
+): ReviewPublicationFormValue {
+	return {
+		content: prepared.request.content,
+		recipientIds: prepared.request.recipientIds.slice(),
+		subject: prepared.request.subject,
+	}
+}
+
+function indeterminatePublicationMessage(
+	requestId: string | null,
+	uncertainty: ReviewPublicationErrorContext | null
+) {
+	const request = requestId ? ` Request ${requestId}.` : ''
+	const known =
+		uncertainty?.stage === 'attachment-completion'
+			? uncertainty.attachmentId
+				? ` Note #${uncertainty.noteId} and Attachment #${uncertainty.attachmentId} are known; check whether Attachment completion finished.`
+				: ` Note #${uncertainty.noteId} is known; check whether Attachment completion finished.`
+			: uncertainty?.stage === 'note-created'
+				? ` Note #${uncertainty.noteId} is known; check its Attachment state.`
+				: ' The Note creation outcome is not known.'
+	return `This publication has an indeterminate outcome.${request}${known} Check ShotGrid before starting another publication.`
+}
+
+function isSafePreMutationPublicationError(code: string) {
+	return SAFE_PRE_MUTATION_PUBLICATION_ERRORS.has(code)
 }

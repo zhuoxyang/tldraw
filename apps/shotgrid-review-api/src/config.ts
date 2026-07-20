@@ -1,10 +1,21 @@
+import { isAbsolute, resolve } from 'node:path'
 import { ReviewGatewayError } from './errors'
+import {
+	DEFAULT_REVIEW_PUBLICATION_MAX_RECORD_BYTES,
+	minimumReviewPublicationJournalBytes,
+} from './http/ReviewPublicationStore'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 5431
 const DEFAULT_ALLOWED_ORIGIN = 'http://127.0.0.1:5430'
 const DEFAULT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RETRIES = 2
+const DEFAULT_PUBLICATION_MAX_JOURNAL_BYTES = 4 * 1024 * 1024
+const DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT = 10_000
+const MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES = Math.max(
+	1024 * 1024,
+	minimumReviewPublicationJournalBytes(DEFAULT_REVIEW_PUBLICATION_MAX_RECORD_BYTES)
+)
 
 export interface ShotGridConnectionConfig {
 	siteUrl: string
@@ -30,6 +41,9 @@ export type GatewayConfig = GatewayConfigBase &
 		  }
 		| {
 				mode: 'shotgrid'
+				publicationMaxJournalBytes: number
+				publicationMaxJournalCount: number
+				publicationStoreDir: string
 				shotgrid: ShotGridConnectionConfig
 				trustedProxyToken: string
 		  }
@@ -116,6 +130,17 @@ function parseSiteUrl(rawValue: string): string {
 	return url.origin
 }
 
+function parsePublicationStoreDirectory(rawValue: string) {
+	const value = rawValue.trim()
+	if (!isAbsolute(value) || /\p{Cc}/u.test(value)) {
+		throw configurationError(
+			'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
+			'must be an absolute filesystem path'
+		)
+	}
+	return resolve(value)
+}
+
 export function parseGatewayConfig(environment: GatewayEnvironment = process.env): GatewayConfig {
 	const rawMode = environment.SHOTGRID_GATEWAY_MODE?.trim() || 'mock'
 	if (rawMode !== 'mock' && rawMode !== 'shotgrid') {
@@ -135,6 +160,23 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const scriptName = readRequired(environment, 'SHOTGRID_SCRIPT_NAME').trim()
 	const scriptKey = readRequired(environment, 'SHOTGRID_SCRIPT_KEY')
 	const trustedProxyToken = readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN').trim()
+	const publicationStoreDir = parsePublicationStoreDirectory(
+		readRequired(environment, 'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR')
+	)
+	const publicationMaxJournalBytes = parseInteger(
+		environment,
+		'SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES',
+		DEFAULT_PUBLICATION_MAX_JOURNAL_BYTES,
+		MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES,
+		16 * 1024 * 1024
+	)
+	const publicationMaxJournalCount = parseInteger(
+		environment,
+		'SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS',
+		DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT,
+		1,
+		1_000_000
+	)
 	if (trustedProxyToken.length < 32 || /\p{Cc}/u.test(trustedProxyToken)) {
 		throw configurationError(
 			'REVIEW_API_TRUSTED_PROXY_TOKEN',
@@ -148,6 +190,9 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		host,
 		port,
 		allowedOrigin,
+		publicationMaxJournalBytes,
+		publicationMaxJournalCount,
+		publicationStoreDir,
 		trustedProxyToken,
 		shotgrid: {
 			siteUrl: parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL')),

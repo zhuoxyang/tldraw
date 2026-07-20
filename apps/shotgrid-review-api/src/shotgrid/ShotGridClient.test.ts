@@ -188,6 +188,35 @@ describe('ShotGridClient', () => {
 		expect(resourceTokens).toEqual(['Bearer old-token', 'Bearer new-token'])
 	})
 
+	test('does not replay a non-idempotent POST after a 401 response', async () => {
+		let authenticationCalls = 0
+		let resourceCalls = 0
+		const fetch = asFetch(async (input) => {
+			if (requestUrl(input) === AUTH_URL) {
+				authenticationCalls += 1
+				return tokenResponse('mutation-token')
+			}
+
+			resourceCalls += 1
+			return jsonResponse({ error: 'expired' }, 401)
+		})
+		const client = new ShotGridClient(connectionConfig({ maxRetries: 3 }), { fetch })
+
+		await expect(
+			client.request('/entity/notes', {
+				body: { subject: 'Review note' },
+				method: 'POST',
+			})
+		).rejects.toMatchObject({
+			code: 'SHOTGRID_AUTH_FAILED',
+			retryable: false,
+			status: 502,
+			upstreamStatus: 401,
+		})
+		expect(authenticationCalls).toBe(1)
+		expect(resourceCalls).toBe(1)
+	})
+
 	test('does not evict a newer token when a late 401 rejects an older token', async () => {
 		let authenticationCalls = 0
 		let oldTokenCalls = 0

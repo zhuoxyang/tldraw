@@ -148,10 +148,12 @@ export class ShotGridClient {
 			}
 			const { bodyText, response } = attempt
 
-			if (response.status === 401 && !authenticationReplayed) {
+			if (response.status === 401) {
 				this.invalidateTokenIfUsed(token.accessToken)
-				authenticationReplayed = true
-				continue
+				if (idempotent && !authenticationReplayed) {
+					authenticationReplayed = true
+					continue
+				}
 			}
 
 			if (

@@ -1,13 +1,19 @@
 import {
 	type ReviewHealth,
+	type ReviewNoteOptions,
 	type ReviewPlaylist,
 	type ReviewProject,
+	type ReviewPublicationErrorContext,
+	type ReviewPublicationRequest,
+	type ReviewPublicationResult,
 	type ReviewUser,
 	type ReviewVersion,
 	isReviewApiErrorEnvelope,
 	isReviewHealth,
+	isReviewNoteOptions,
 	isReviewPlaylist,
 	isReviewProject,
+	isReviewPublicationResult,
 	isReviewUser,
 	isReviewVersion,
 } from '@tldraw/shotgrid-review-contracts'
@@ -27,10 +33,22 @@ const MAX_RESPONSE_ITEMS = 10_000
 export interface ReviewApiClient {
 	getCurrentReviewer(signal?: AbortSignal): Promise<ReviewUser>
 	getHealth(signal?: AbortSignal): Promise<ReviewHealth>
+	getNoteOptions(
+		playlistId: number,
+		versionId: number,
+		signal?: AbortSignal
+	): Promise<ReviewNoteOptions>
 	getVersion(playlistId: number, versionId: number, signal?: AbortSignal): Promise<ReviewVersion>
 	listPlaylists(projectId: number, signal?: AbortSignal): Promise<ReviewPlaylist[]>
 	listProjects(signal?: AbortSignal): Promise<ReviewProject[]>
 	listVersions(playlistId: number, signal?: AbortSignal): Promise<ReviewVersion[]>
+	publishReview(
+		playlistId: number,
+		versionId: number,
+		publicationId: string,
+		request: ReviewPublicationRequest,
+		signal?: AbortSignal
+	): Promise<ReviewPublicationResult>
 }
 
 export interface CreateReviewApiClientOptions {
@@ -41,6 +59,7 @@ export interface CreateReviewApiClientOptions {
 interface ReviewApiClientErrorOptions {
 	code: string
 	message: string
+	publication?: ReviewPublicationErrorContext
 	requestId?: string
 	retryable: boolean
 	status: number
@@ -48,6 +67,7 @@ interface ReviewApiClientErrorOptions {
 
 export class ReviewApiClientError extends Error {
 	readonly code: string
+	readonly publication?: ReviewPublicationErrorContext
 	readonly requestId?: string
 	readonly retryable: boolean
 	readonly status: number
@@ -56,6 +76,7 @@ export class ReviewApiClientError extends Error {
 		super(options.message)
 		this.name = 'ReviewApiClientError'
 		this.code = options.code
+		this.publication = options.publication
 		this.requestId = options.requestId
 		this.retryable = options.retryable
 		this.status = options.status
@@ -68,13 +89,25 @@ export function createReviewApiClient({
 }: CreateReviewApiClientOptions): ReviewApiClient {
 	const normalizedBaseUrl = normalizeBaseUrl(baseUrl)
 
-	async function request(path: string, signal?: AbortSignal): Promise<ParsedReviewApiResponse> {
+	async function request(
+		path: string,
+		options: {
+			body?: string
+			method?: 'GET' | 'PUT'
+			signal?: AbortSignal
+		} = {}
+	): Promise<ParsedReviewApiResponse> {
+		const { body, method = 'GET', signal } = options
 		let response: Response
 		try {
 			response = await fetchImplementation(`${normalizedBaseUrl}${path}`, {
+				body,
 				cache: 'no-store',
-				headers: { Accept: 'application/json' },
-				method: 'GET',
+				headers: {
+					Accept: 'application/json',
+					...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+				},
+				method,
 				redirect: 'error',
 				signal,
 			})
@@ -96,6 +129,7 @@ export function createReviewApiClient({
 			throw new ReviewApiClientError({
 				code: payload.error.code,
 				message: payload.error.message,
+				publication: payload.error.publication,
 				requestId: payload.error.requestId ?? requestId,
 				retryable: payload.error.retryable,
 				status: response.status,
@@ -117,22 +151,43 @@ export function createReviewApiClient({
 
 	return {
 		async getCurrentReviewer(signal) {
-			return unwrapData(await request('/review/me', signal), isReviewUser)
+			return unwrapData(await request('/review/me', { signal }), isReviewUser)
 		},
 
 		async getHealth(signal) {
-			const response = await request('/health', signal)
+			const response = await request('/health', { signal })
 			if (!isReviewHealth(response.payload)) {
 				throw invalidResponseError(response.status, response.requestId)
 			}
 			return response.payload
 		},
 
+		async getNoteOptions(playlistId, versionId, signal) {
+			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
+			const validVersionId = requirePositiveId(versionId, 'versionId')
+			const response = await request(
+				`/review/playlists/${validPlaylistId}/versions/${validVersionId}/note-options`,
+				{ signal }
+			)
+			const options = unwrapData(response, isReviewNoteOptions)
+			const recipientIds = options.recipients.map((recipient) => recipient.id)
+			if (
+				options.links.version.id !== validVersionId ||
+				recipientIds.length > MAX_RESPONSE_ITEMS ||
+				new Set(recipientIds).size !== recipientIds.length
+			) {
+				throw invalidResponseError(response.status, response.requestId)
+			}
+			return options
+		},
+
 		async getVersion(playlistId, versionId, signal) {
 			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
 			const validVersionId = requirePositiveId(versionId, 'versionId')
 			const version = unwrapData(
-				await request(`/review/playlists/${validPlaylistId}/versions/${validVersionId}`, signal),
+				await request(`/review/playlists/${validPlaylistId}/versions/${validVersionId}`, {
+					signal,
+				}),
 				isReviewVersion
 			)
 			return resolveReviewVersionMediaUrls(version, normalizedBaseUrl)
@@ -141,24 +196,95 @@ export function createReviewApiClient({
 		async listPlaylists(projectId, signal) {
 			const validProjectId = requirePositiveId(projectId, 'projectId')
 			return unwrapDataArray(
-				await request(`/review/projects/${validProjectId}/playlists`, signal),
+				await request(`/review/projects/${validProjectId}/playlists`, { signal }),
 				isReviewPlaylist
 			)
 		},
 
 		async listProjects(signal) {
-			return unwrapDataArray(await request('/review/projects', signal), isReviewProject)
+			return unwrapDataArray(await request('/review/projects', { signal }), isReviewProject)
 		},
 
 		async listVersions(playlistId, signal) {
 			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
 			const versions = unwrapDataArray(
-				await request(`/review/playlists/${validPlaylistId}/versions`, signal),
+				await request(`/review/playlists/${validPlaylistId}/versions`, { signal }),
 				isReviewVersion
 			)
 			return versions.map((version) => resolveReviewVersionMediaUrls(version, normalizedBaseUrl))
 		},
+
+		async publishReview(playlistId, versionId, publicationId, publication, signal) {
+			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
+			const validVersionId = requirePositiveId(versionId, 'versionId')
+			const validPublicationId = requirePublicationId(publicationId)
+			let body: string
+			try {
+				body = JSON.stringify(publication)
+			} catch {
+				throw invalidRequestError('publication request must be JSON serializable')
+			}
+			let response: ParsedReviewApiResponse
+			try {
+				response = await request(
+					`/review/playlists/${validPlaylistId}/versions/${validVersionId}/publications/${validPublicationId}`,
+					{ body, method: 'PUT', signal }
+				)
+			} catch (error) {
+				if (
+					error instanceof ReviewApiClientError &&
+					error.publication &&
+					(error.publication.publicationId !== validPublicationId ||
+						(error.publication.stage !== 'note-creation' &&
+							error.publication.links.version.id !== validVersionId))
+				) {
+					throw invalidResponseError(error.status, error.requestId)
+				}
+				throw error
+			}
+			const result = unwrapData(response, isReviewPublicationResult)
+			const decodedAttachmentSize = decodedCanonicalBase64Length(
+				publication.attachment.contentBase64
+			)
+			if (
+				result.publicationId !== validPublicationId ||
+				result.note.versionId !== validVersionId ||
+				result.links.version.id !== validVersionId ||
+				result.note.subject !== publication.subject ||
+				result.note.content !== publication.content ||
+				result.attachment.fileName !== publication.attachment.fileName ||
+				result.attachment.contentType !== publication.attachment.contentType ||
+				decodedAttachmentSize === null ||
+				result.attachment.sizeBytes !== decodedAttachmentSize
+			) {
+				throw invalidResponseError(response.status, response.requestId)
+			}
+			return result
+		},
 	}
+}
+
+export function decodedCanonicalBase64Length(value: string): number | null {
+	if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+		return null
+	}
+	const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+	if (padding === 2 && (base64CharacterValue(value[value.length - 3]) & 0x0f) !== 0) {
+		return null
+	}
+	if (padding === 1 && (base64CharacterValue(value[value.length - 2]) & 0x03) !== 0) {
+		return null
+	}
+	const decodedLength = (value.length / 4) * 3 - padding
+	return decodedLength > 0 ? decodedLength : null
+}
+
+function base64CharacterValue(character: string) {
+	const codePoint = character.charCodeAt(0)
+	if (codePoint >= 65 && codePoint <= 90) return codePoint - 65
+	if (codePoint >= 97 && codePoint <= 122) return codePoint - 71
+	if (codePoint >= 48 && codePoint <= 57) return codePoint + 4
+	return character === '+' ? 62 : 63
 }
 
 function resolveReviewVersionMediaUrls(version: ReviewVersion, baseUrl: string): ReviewVersion {
@@ -219,6 +345,13 @@ function isLoopbackHostname(hostname: string) {
 function requirePositiveId(value: number, field: string) {
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw invalidRequestError(`${field} must be a positive safe integer`)
+	}
+	return value
+}
+
+function requirePublicationId(value: string) {
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+		throw invalidRequestError('publicationId must be a canonical UUID v4')
 	}
 	return value
 }

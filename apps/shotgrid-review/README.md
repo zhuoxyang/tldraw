@@ -39,3 +39,10 @@ ShotGrid builds must set `VITE_REVIEW_STORAGE_NAMESPACE` to a stable, non-secret
 identifier (for example `studio-sandbox`). Canvas persistence keys also include the API scope,
 gateway mode, and reviewer kind. If the gateway exposes only a shared ShotGrid service identity,
 the canvas remains session-only to avoid loading another reviewer's local annotations.
+
+Browser publication requires a human reviewer identity. In live ShotGrid mode, configure
+`SHOTGRID_SUDO_AS_LOGIN` so the gateway resolves the authenticated request to that human reviewer.
+When `/api/review/me` returns a service identity, the app deliberately disables publication: it
+does not open publication IndexedDB state, load Note options, or send publication requests. The
+service identity may still browse, annotate, save/open editable snapshots, and export PNGs. Do not
+replace this boundary with a session nonce or an in-memory publication fallback.
