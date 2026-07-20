@@ -30043,6 +30043,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"shotgrid-review@workspace:apps/shotgrid-review":
+  version: 0.0.0-use.local
+  resolution: "shotgrid-review@workspace:apps/shotgrid-review"
+  dependencies:
+    "@types/node": "npm:^22.15.31"
+    "@types/react": "npm:^19.2.7"
+    "@types/react-dom": "npm:^19.2.3"
+    "@vitejs/plugin-react": "npm:^6.0.1"
+    react: "npm:^19.2.1"
+    react-dom: "npm:^19.2.1"
+    tldraw: "workspace:*"
+    typescript: "npm:^5.8.3"
+    vite: "npm:^8.0.16"
+    vitest: "npm:^4.1.7"
+  languageName: unknown
+  linkType: soft
+
 "side-channel-list@npm:^1.0.0":
   version: 1.0.0
   resolution: "side-channel-list@npm:1.0.0"
