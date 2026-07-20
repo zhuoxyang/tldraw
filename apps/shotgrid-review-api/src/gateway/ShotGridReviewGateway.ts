@@ -36,6 +36,12 @@ interface ShotGridRecordResponse {
 	data: ShotGridEntity
 }
 
+interface ShotGridRelationship {
+	id: number
+	name?: string
+	type: string
+}
+
 interface UploadTicket {
 	data: {
 		multipart_upload: boolean
@@ -66,6 +72,9 @@ interface ShotGridReviewGatewayOptions {
 
 const SEARCH_PAGE_SIZE = 500
 const MAX_SEARCH_PAGES = 100
+const MAX_SEARCH_ENTITIES = 10_000
+const MAX_SEARCH_AGGREGATE_BYTES = 32 * 1024 * 1024
+const MAX_UPLOAD_RESPONSE_BODY_BYTES = 64 * 1024
 
 export class ShotGridReviewGateway implements ReviewGateway {
 	private readonly fetch: FetchImplementation
@@ -83,7 +92,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
 		const version = await this.readEntity('versions', request.versionId, 'Version', ['project'])
 		const versionProject = readRelationship(version.relationships, 'project')
-		if (!versionProject) throw invalidShotGridResponse()
+		if (!versionProject || versionProject.type !== 'Project') throw invalidShotGridResponse()
 		if (versionProject.id !== request.projectId) {
 			throw new ReviewGatewayError({
 				code: 'INVALID_REQUEST',
@@ -196,7 +205,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			const project = readRelationship(entity.relationships, 'project')
 			const createdBy = readRelationship(entity.relationships, 'created_by')
 			const submittedBy = readRelationship(entity.relationships, 'user')
-			if (!project) throw invalidShotGridResponse()
+			if (!project || project.type !== 'Project') throw invalidShotGridResponse()
 			return {
 				createdAt: readString(entity.attributes, 'created_at'),
 				createdBy: createdBy ? mapRelationshipUser(createdBy) : null,
@@ -286,6 +295,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		sort?: string
 	): Promise<ShotGridEntity[]> {
 		const entities: ShotGridEntity[] = []
+		let aggregateBytes = 0
 		for (let pageNumber = 1; pageNumber <= MAX_SEARCH_PAGES; pageNumber++) {
 			const response = await this.client.request<ShotGridListResponse>(
 				`/entity/${entity}/_search`,
@@ -302,9 +312,20 @@ export class ShotGridReviewGateway implements ReviewGateway {
 					},
 				}
 			)
-			if (!response || !Array.isArray(response.data)) throw invalidShotGridResponse()
-			entities.push(...response.data.map((item) => requireEntity(item)))
+			if (!response || !Array.isArray(response.data) || response.data.length > SEARCH_PAGE_SIZE) {
+				throw invalidShotGridResponse()
+			}
+			for (const item of response.data) {
+				const entity = requireEntity(item)
+				aggregateBytes += estimateEntityJsonBytes(entity)
+				if (entities.length >= MAX_SEARCH_ENTITIES || aggregateBytes > MAX_SEARCH_AGGREGATE_BYTES) {
+					throw invalidShotGridResponse()
+				}
+				entities.push(entity)
+			}
+
 			if (!readNextLink(response)) return entities
+			if (entities.length >= MAX_SEARCH_ENTITIES) throw invalidShotGridResponse()
 		}
 		throw invalidShotGridResponse()
 	}
@@ -371,11 +392,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 				})
 			}
 			if (response.status === 204 || response.headers.get('content-length') === '0') return {}
-			try {
-				return (await response.json()) as UploadResponse
-			} catch {
-				return {}
-			}
+			return await this.readUploadResponse(response)
 		} catch (error) {
 			if (error instanceof ReviewGatewayError) throw error
 			throw new ReviewGatewayError({
@@ -386,6 +403,49 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		} finally {
 			clearTimeout(timeout)
 		}
+	}
+
+	private async readUploadResponse(response: Response): Promise<UploadResponse> {
+		if (!response.body) return {}
+
+		const reader = response.body.getReader()
+		const chunks: Buffer[] = []
+		let byteLength = 0
+		try {
+			for (;;) {
+				const { done, value } = await reader.read()
+				if (done) break
+
+				byteLength += value.byteLength
+				if (byteLength > MAX_UPLOAD_RESPONSE_BODY_BYTES) {
+					try {
+						await reader.cancel()
+					} catch {
+						// Preserve the invalid-response classification that caused cancellation.
+					}
+					throw invalidShotGridResponse()
+				}
+				chunks.push(Buffer.from(value))
+			}
+		} finally {
+			reader.releaseLock()
+		}
+
+		try {
+			return JSON.parse(Buffer.concat(chunks, byteLength).toString('utf8')) as UploadResponse
+		} catch {
+			return {}
+		}
+	}
+}
+
+function estimateEntityJsonBytes(entity: ShotGridEntity) {
+	try {
+		const serialized = JSON.stringify(entity)
+		if (serialized === undefined) throw new Error('Entity is not JSON serializable')
+		return Buffer.byteLength(serialized, 'utf8') + 1
+	} catch {
+		throw invalidShotGridResponse()
 	}
 }
 
@@ -453,19 +513,20 @@ function mapUser(entity: ShotGridEntity): ReviewUser {
 	}
 }
 
-function mapRelationshipUser(relationship: { id: number; name?: string }): ReviewUser {
+function mapRelationshipUser(relationship: ShotGridRelationship): ReviewUser {
+	if (relationship.type !== 'HumanUser' && relationship.type !== 'ApiUser') {
+		throw invalidShotGridResponse()
+	}
 	return {
 		avatarUrl: null,
 		id: relationship.id,
-		kind: 'human',
+		kind: relationship.type === 'ApiUser' ? 'service' : 'human',
 		login: null,
 		name: relationship.name || `User ${relationship.id}`,
 	}
 }
 
-function mapOptionalRelationshipUser(
-	relationship: { id: number; name?: string } | null
-): ReviewUser | null {
+function mapOptionalRelationshipUser(relationship: ShotGridRelationship | null): ReviewUser | null {
 	return relationship ? mapRelationshipUser(relationship) : null
 }
 
@@ -541,14 +602,23 @@ function readNullableUrl(source: Record<string, unknown> | undefined, key: strin
 function readRelationship(
 	relationships: Record<string, unknown> | undefined,
 	key: string
-): { id: number; name?: string } | null {
+): ShotGridRelationship | null {
 	const raw = relationships?.[key]
 	const record = readRecord(raw)
 	const value = readRecord(record?.data) ?? record
-	if (!value || !Number.isSafeInteger(value.id) || Number(value.id) <= 0) return null
+	if (
+		!value ||
+		!Number.isSafeInteger(value.id) ||
+		Number(value.id) <= 0 ||
+		typeof value.type !== 'string' ||
+		value.type.length === 0
+	) {
+		return null
+	}
 	return {
 		id: Number(value.id),
 		...(typeof value.name === 'string' ? { name: value.name } : undefined),
+		type: value.type,
 	}
 }
 

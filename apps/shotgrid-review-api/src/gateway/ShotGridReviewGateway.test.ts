@@ -66,9 +66,9 @@ describe('ShotGridReviewGateway', () => {
 						},
 						id: 301,
 						relationships: {
-							created_by: { data: { id: 10, name: 'Publish Bot' } },
-							project: { data: { id: 101, name: 'Northstar' } },
-							user: { data: { id: 11, name: 'Mei Chen' } },
+							created_by: { data: { id: 10, name: 'Publish Bot', type: 'ApiUser' } },
+							project: { data: { id: 101, name: 'Northstar', type: 'Project' } },
+							user: { data: { id: 11, name: 'Mei Chen', type: 'HumanUser' } },
 						},
 						type: 'Version',
 					},
@@ -100,7 +100,7 @@ describe('ShotGridReviewGateway', () => {
 				createdBy: {
 					avatarUrl: null,
 					id: 10,
-					kind: 'human',
+					kind: 'service',
 					login: null,
 					name: 'Publish Bot',
 				},
@@ -173,6 +173,51 @@ describe('ShotGridReviewGateway', () => {
 		})
 	})
 
+	test('rejects search pagination that exceeds the aggregate entity limit', async () => {
+		let pageNumber = 0
+		const request = vi.fn(async () => {
+			pageNumber += 1
+			return {
+				data: Array.from({ length: 500 }, (_, index) => ({
+					attributes: { name: `Project ${pageNumber}-${index}` },
+					id: (pageNumber - 1) * 500 + index + 1,
+					type: 'Project',
+				})),
+				links: { next: `page-${pageNumber + 1}` },
+			}
+		})
+		const gateway = makeGateway(request)
+
+		await expect(gateway.listProjects()).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		expect(request).toHaveBeenCalledTimes(20)
+	})
+
+	test('rejects search pagination that exceeds the aggregate byte limit', async () => {
+		const largeName = 'x'.repeat(1024 * 1024)
+		let pageNumber = 0
+		const request = vi.fn(async () => {
+			pageNumber += 1
+			return {
+				data: Array.from({ length: 8 }, (_, index) => ({
+					attributes: { name: largeName },
+					id: (pageNumber - 1) * 8 + index + 1,
+					type: 'Project',
+				})),
+				links: { next: `page-${pageNumber + 1}` },
+			}
+		})
+		const gateway = makeGateway(request)
+
+		await expect(gateway.listProjects()).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+		expect(request).toHaveBeenCalledTimes(4)
+	})
+
 	test('keeps script identity server-side and maps an optional sudo reviewer', async () => {
 		const serviceRequest = vi.fn()
 		const serviceGateway = makeGateway(serviceRequest)
@@ -207,13 +252,61 @@ describe('ShotGridReviewGateway', () => {
 		})
 	})
 
+	test('maps an ApiUser note creator to a service identity', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({
+				data: {
+					id: 301,
+					relationships: {
+						project: { data: { id: 101, name: 'Northstar', type: 'Project' } },
+					},
+					type: 'Version',
+				},
+			})
+			.mockResolvedValueOnce({
+				data: {
+					attributes: {
+						content: 'Reduce the rim light',
+						created_at: '2026-07-20T00:00:00Z',
+						subject: 'Lighting note',
+					},
+					id: 401,
+					relationships: {
+						created_by: { data: { id: 10, name: 'Publish Bot', type: 'ApiUser' } },
+					},
+					type: 'Note',
+				},
+			})
+		const gateway = makeGateway(request)
+
+		await expect(
+			gateway.createNote({
+				content: 'Reduce the rim light',
+				frame: 1042,
+				projectId: 101,
+				subject: 'Lighting note',
+				versionId: 301,
+			})
+		).resolves.toMatchObject({
+			createdBy: {
+				id: 10,
+				kind: 'service',
+				login: null,
+				name: 'Publish Bot',
+			},
+		})
+	})
+
 	test('does not mark note or status mutations as retryable', async () => {
 		const request = vi
 			.fn()
 			.mockResolvedValueOnce({
 				data: {
 					id: 301,
-					relationships: { project: { data: { id: 101, name: 'Northstar' } } },
+					relationships: {
+						project: { data: { id: 101, name: 'Northstar', type: 'Project' } },
+					},
 					type: 'Version',
 				},
 			})
@@ -260,7 +353,9 @@ describe('ShotGridReviewGateway', () => {
 		const request = vi.fn().mockResolvedValue({
 			data: {
 				id: 301,
-				relationships: { project: { data: { id: 999, name: 'Another project' } } },
+				relationships: {
+					project: { data: { id: 999, name: 'Another project', type: 'Project' } },
+				},
 				type: 'Version',
 			},
 		})
@@ -322,6 +417,49 @@ describe('ShotGridReviewGateway', () => {
 		expect(uploadInit?.redirect).toBe('error')
 		expect(request.mock.calls[1][0]).toBe('/entity/notes/401/_upload')
 		expect(request.mock.calls[1][1]).not.toHaveProperty('idempotent')
+	})
+
+	test('rejects and cancels an oversized upload response body', async () => {
+		const request = vi.fn().mockResolvedValue({
+			data: {
+				multipart_upload: false,
+				original_filename: 'annotation.png',
+				storage_service: 'sg',
+				timestamp: '2026-07-20T00:00:00Z',
+				upload_id: null,
+				upload_type: 'Attachment',
+			},
+			links: {
+				complete_upload: '/api/v1.1/entity/notes/401/_upload',
+				upload: 'https://studio.example.com/api/v1.1/entity/notes/401/_upload?signature=safe',
+			},
+		})
+		const cancel = vi.fn()
+		const uploadFetch = vi.fn<typeof fetch>(
+			async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						cancel,
+						start(controller) {
+							controller.enqueue(new Uint8Array(64 * 1024))
+							controller.enqueue(new Uint8Array(1))
+						},
+					}),
+					{ status: 200 }
+				)
+		)
+		const gateway = makeGateway(request, config, uploadFetch)
+
+		await expect(
+			gateway.uploadAttachment({
+				contentBase64: Buffer.from('png-bytes').toString('base64'),
+				contentType: 'image/png',
+				fileName: 'annotation.png',
+				noteId: 401,
+			})
+		).rejects.toMatchObject({ code: 'SHOTGRID_INVALID_RESPONSE', status: 502 })
+		expect(cancel).toHaveBeenCalledOnce()
+		expect(request).toHaveBeenCalledOnce()
 	})
 
 	test('accepts a presigned regional S3 upload endpoint', async () => {

@@ -21,6 +21,8 @@ const reviewer: ReviewUser = {
 	name: 'Local Reviewer',
 }
 
+const DEFAULT_RETAINED_NOTE_ID_LIMIT = 10_000
+
 const projects: ReviewProject[] = [
 	{ id: 101, name: 'Project Northstar', statusCode: 'act', thumbnailUrl: null },
 	{ id: 102, name: 'Project Sundial', statusCode: 'act', thumbnailUrl: null },
@@ -140,7 +142,14 @@ const initialVersions: ReviewVersion[] = [
 export class MockReviewGateway implements ReviewGateway {
 	private nextAttachmentId = 501
 	private nextNoteId = 401
+	private readonly retainedNoteIds = new Set<number>()
 	private readonly versions = initialVersions.map((version) => ({ ...version }))
+
+	constructor(private readonly retainedNoteIdLimit = DEFAULT_RETAINED_NOTE_ID_LIMIT) {
+		if (!Number.isSafeInteger(retainedNoteIdLimit) || retainedNoteIdLimit <= 0) {
+			throw new RangeError('retainedNoteIdLimit must be a positive integer')
+		}
+	}
 
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
 		const version = this.requireVersion(request.versionId)
@@ -152,7 +161,7 @@ export class MockReviewGateway implements ReviewGateway {
 			})
 		}
 
-		return {
+		const note: ReviewNote = {
 			content: request.content,
 			createdAt: new Date(0).toISOString(),
 			createdBy: reviewer,
@@ -162,6 +171,8 @@ export class MockReviewGateway implements ReviewGateway {
 			subject: request.subject,
 			versionId: request.versionId,
 		}
+		this.retainNoteId(note.id)
+		return note
 	}
 
 	async getCurrentReviewer() {
@@ -193,6 +204,7 @@ export class MockReviewGateway implements ReviewGateway {
 	}
 
 	async uploadAttachment(request: UploadReviewAttachmentRequest): Promise<ReviewAttachmentResult> {
+		this.requireNote(request.noteId)
 		return {
 			contentType: request.contentType,
 			fileName: request.fileName,
@@ -200,6 +212,18 @@ export class MockReviewGateway implements ReviewGateway {
 			noteId: request.noteId,
 			sizeBytes: Buffer.byteLength(request.contentBase64, 'base64'),
 		}
+	}
+
+	private requireNote(id: number) {
+		if (!this.retainedNoteIds.has(id)) throw this.notFound('Note')
+	}
+
+	private retainNoteId(id: number) {
+		this.retainedNoteIds.add(id)
+		if (this.retainedNoteIds.size <= this.retainedNoteIdLimit) return
+
+		const oldest = this.retainedNoteIds.values().next()
+		if (!oldest.done) this.retainedNoteIds.delete(oldest.value)
 	}
 
 	private requirePlaylist(id: number) {
