@@ -13,7 +13,10 @@ http {
 	default_type application/octet-stream;
 
 	client_body_temp_path /tmp/client-body;
+	fastcgi_temp_path /tmp/fastcgi;
 	proxy_temp_path /tmp/proxy;
+	scgi_temp_path /tmp/scgi;
+	uwsgi_temp_path /tmp/uwsgi;
 
 	map $http_upgrade $review_connection {
 		default upgrade;
