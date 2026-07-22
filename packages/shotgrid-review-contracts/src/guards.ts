@@ -6,6 +6,7 @@ import {
 	type ReviewCollaborationPresence,
 	type ReviewCollaborationSession,
 	type ReviewChangeEvent,
+	type ReviewChangeNotification,
 	type ReviewDecisionContext,
 	type ReviewDecisionHistoryEntry,
 	type ReviewDecisionOption,
@@ -124,6 +125,11 @@ export function isReviewChangeEvent(value: unknown): value is ReviewChangeEvent 
 		typeof entity.type === 'string' &&
 		REVIEW_CHANGE_ENTITY_TYPES.has(entity.type)
 	)
+}
+
+export function isReviewChangeNotification(value: unknown): value is ReviewChangeNotification {
+	const record = readRecord(value)
+	return record !== null && hasOnlyKeys(record, ['sequence']) && isPositiveId(record.sequence)
 }
 
 export function isReviewCollaborationSession(value: unknown): value is ReviewCollaborationSession {

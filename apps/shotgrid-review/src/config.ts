@@ -1,4 +1,4 @@
-import { assertNoPublicShotGridEnvironment } from './publicEnvPolicy'
+import { assertAllowedPublicEnvironment, assertShotGridApiBaseUrl } from './publicEnvPolicy'
 
 export type ReviewDataMode = 'mock' | 'shotgrid'
 
@@ -17,7 +17,7 @@ function readString(environment: ReviewRuntimeEnvironment, key: string) {
 }
 
 export function parseReviewConfig(environment: ReviewRuntimeEnvironment): ReviewRuntimeConfig {
-	assertNoPublicShotGridEnvironment(environment)
+	assertAllowedPublicEnvironment(environment)
 
 	const requestedMode = readString(environment, 'VITE_REVIEW_DATA_MODE') || 'mock'
 	if (requestedMode !== 'mock' && requestedMode !== 'shotgrid') {
@@ -33,9 +33,13 @@ export function parseReviewConfig(environment: ReviewRuntimeEnvironment): Review
 	if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(storageNamespace)) {
 		throw new Error('VITE_REVIEW_STORAGE_NAMESPACE contains unsupported characters')
 	}
+	const apiBaseUrl = readString(environment, 'VITE_REVIEW_API_BASE_URL') || '/api'
+	if (requestedMode === 'shotgrid') {
+		assertShotGridApiBaseUrl(apiBaseUrl)
+	}
 
 	return Object.freeze({
-		apiBaseUrl: readString(environment, 'VITE_REVIEW_API_BASE_URL') || '/api',
+		apiBaseUrl,
 		dataMode: requestedMode,
 		storageNamespace,
 		tldrawLicenseKey,

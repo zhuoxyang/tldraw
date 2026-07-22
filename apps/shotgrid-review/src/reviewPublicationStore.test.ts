@@ -182,6 +182,31 @@ describe('review publication storage records', () => {
 })
 
 describe('IndexedDB review publication store', () => {
+	it('explicitly clears publication payloads across every local review namespace', async () => {
+		const indexedDb = new IDBFactory()
+		const store = createIndexedDbReviewPublicationStore(indexedDb)
+		const anotherDocumentKey = 'another-namespace:user-7:playlist-202:version-302'
+		await store.addIfAbsent(
+			createStoredReviewPublication({
+				documentKey,
+				prepared: preparedFor(),
+				status: 'pending',
+			})
+		)
+		await store.addIfAbsent(
+			createStoredReviewPublication({
+				documentKey: anotherDocumentKey,
+				prepared: preparedFor(0, secondPublicationId),
+				status: 'pending',
+			})
+		)
+
+		await store.clearAll()
+
+		await expect(store.get(documentKey)).resolves.toBeNull()
+		await expect(store.get(anotherDocumentKey)).resolves.toBeNull()
+	})
+
 	it('atomically elects one payload writer and recovers that payload in another store', async () => {
 		const indexedDb = new IDBFactory()
 		const firstStore = createIndexedDbReviewPublicationStore(indexedDb)

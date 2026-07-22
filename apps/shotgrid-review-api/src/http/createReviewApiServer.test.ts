@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import { deflateSync } from 'node:zlib'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { InMemoryReviewAuditStore } from '../audit/ReviewAuditStore'
 import type { ReviewVersion } from '../contracts'
 import { ReviewGatewayError } from '../errors'
 import type { ReviewGateway } from '../gateway/ReviewGateway'
@@ -16,6 +17,7 @@ const PNG_BYTES = makeTestPng()
 const PNG_SHA256 = createHash('sha256').update(PNG_BYTES).digest('hex')
 const PUBLICATION_ID = '018f3f72-1d6b-4c51-8f4b-a12c9d2e3478'
 const TRUSTED_PROXY_TOKEN = 'test-trusted-proxy-token-with-32-characters'
+const FIXED_ACTOR_SUBJECT = 'oidc:test:reviewer-123'
 const PUBLICATION_LINKS = {
 	entity: { id: 501, name: 'shot_010', type: 'Shot' },
 	project: { id: 101, name: 'Project', type: 'Project' },
@@ -435,12 +437,12 @@ describe('createReviewApiServer', () => {
 			`${baseUrl}/api/review/projects`,
 			200,
 			{ data: [{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null }] },
-			{ headers: { 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN } }
+			{ headers: trustedProxyHeaders() }
 		)
 		expect(logger.error).not.toHaveBeenCalled()
 	})
 
-	test('binds a trusted proxy request to the configured sudo login', async () => {
+	test('binds a trusted proxy request to the configured fixed subject', async () => {
 		const gateway = makeGateway()
 		const baseUrl = await start(gateway, undefined, {
 			mode: 'shotgrid',
@@ -451,7 +453,7 @@ describe('createReviewApiServer', () => {
 		const invalidIdentityHeaders: HeadersInit[] = [
 			{ 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN },
 			{
-				'X-Review-Authenticated-Login': 'another-reviewer@example.test',
+				'X-Review-Authenticated-Subject': 'oidc:test:another-reviewer',
 				'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
 			},
 		]
@@ -467,21 +469,11 @@ describe('createReviewApiServer', () => {
 			`${baseUrl}/api/review/projects`,
 			200,
 			{ data: [{ id: 101, name: 'Project', statusCode: 'act', thumbnailUrl: null }] },
-			{
-				headers: {
-					'X-Review-Authenticated-Login': 'reviewer@example.test',
-					'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
-				},
-			}
+			{ headers: trustedProxyHeaders() }
 		)
 		const noteOptions = await fetch(
 			`${baseUrl}/api/review/playlists/201/versions/301/note-options`,
-			{
-				headers: {
-					'X-Review-Authenticated-Login': 'reviewer@example.test',
-					'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
-				},
-			}
+			{ headers: trustedProxyHeaders() }
 		)
 		expect(noteOptions.status).toBe(200)
 		await noteOptions.json()
@@ -499,7 +491,7 @@ describe('createReviewApiServer', () => {
 			publicationStore,
 			trustedProxyToken: TRUSTED_PROXY_TOKEN,
 		})
-		const headers = { 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN }
+		const headers = trustedProxyHeaders()
 
 		const noteOptions = await fetch(
 			`${baseUrl}/api/review/playlists/201/versions/301/note-options`,
@@ -553,10 +545,7 @@ describe('createReviewApiServer', () => {
 			sudoAsLogin: 'reviewer@example.test',
 			trustedProxyToken: TRUSTED_PROXY_TOKEN,
 		})
-		const headers = {
-			'X-Review-Authenticated-Login': 'reviewer@example.test',
-			'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
-		}
+		const headers = trustedProxyHeaders()
 
 		const context = await fetch(
 			`${baseUrl}/api/review/playlists/201/versions/301/decision-context`,
@@ -619,6 +608,206 @@ describe('createReviewApiServer', () => {
 		expect(await response.json()).toMatchObject({
 			error: { code: 'DECISION_CONFLICT', retryable: false },
 		})
+	})
+
+	test('fails closed before review mutations when the audit intent cannot be persisted', async () => {
+		const auditStore = {
+			begin: vi.fn(async () => {
+				throw new Error('audit store unavailable')
+			}),
+			finish: vi.fn(async () => {}),
+		}
+		const gateway = makeGateway()
+		const logger = { error: vi.fn() }
+		const baseUrl = await start(gateway, logger, {
+			auditStore,
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+		const headers = { ...trustedProxyHeaders(), 'Content-Type': 'application/json' }
+
+		const decision = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
+			headers,
+			method: 'PUT',
+		})
+		const publication = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/publications/${PUBLICATION_ID}`,
+			{
+				body: JSON.stringify(publicationRequest()),
+				headers,
+				method: 'PUT',
+			}
+		)
+
+		expect(decision.status).toBe(500)
+		expect(await decision.json()).toMatchObject({ error: { code: 'INTERNAL_ERROR' } })
+		expect(publication.status).toBe(500)
+		expect(await publication.json()).toMatchObject({ error: { code: 'INTERNAL_ERROR' } })
+		expect(auditStore.begin).toHaveBeenCalledTimes(2)
+		expect(auditStore.finish).not.toHaveBeenCalled()
+		expect(gateway.updateVersionDecision).not.toHaveBeenCalled()
+		expect(gateway.createPublicationNote).not.toHaveBeenCalled()
+		expect(gateway.uploadAttachment).not.toHaveBeenCalled()
+	})
+
+	test('audits a successful decision with opaque bounded metadata only', async () => {
+		const auditStore = new InMemoryReviewAuditStore()
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway, undefined, {
+			auditStore,
+			decisions: [{ key: 'approve', label: 'Approve', statusCode: 'apr' }],
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
+			headers: { ...trustedProxyHeaders(), 'Content-Type': 'application/json' },
+			method: 'PUT',
+		})
+
+		expect(response.status).toBe(200)
+		await response.json()
+		const entries = auditStore.getEntries()
+		expect(entries).toHaveLength(2)
+		expect(entries[0]).toMatchObject({
+			action: 'decision',
+			decisionStatus: null,
+			effectiveActor: { id: 7, kind: 'human' },
+			entryKind: 'attempt',
+			outcome: null,
+			playlistId: 201,
+			principalId: expectedPrincipalId(),
+			projectId: 101,
+			requestId: 'test-request-id',
+			versionId: 301,
+		})
+		expect(entries[1]).toMatchObject({
+			action: 'decision',
+			decisionStatus: 'apr',
+			effectiveActor: { id: 7, kind: 'human' },
+			entryKind: 'outcome',
+			errorCode: null,
+			outcome: 'succeeded',
+			playlistId: 201,
+			principalId: expectedPrincipalId(),
+			projectId: 101,
+			requestId: 'test-request-id',
+			resultAttachmentId: null,
+			resultNoteId: null,
+			versionId: 301,
+		})
+		expect(entries[1].attemptId).toBe(entries[0].attemptId)
+
+		const serialized = JSON.stringify(entries)
+		expect(serialized).not.toContain(FIXED_ACTOR_SUBJECT)
+		expect(serialized).not.toContain(TRUSTED_PROXY_TOKEN)
+		expect(serialized).not.toContain('decisionKey')
+		expect(serialized).not.toContain('expectedStatusCode')
+		expect(serialized).not.toContain('approve')
+	})
+
+	test('audits an indeterminate decision outcome and its stable error code', async () => {
+		const auditStore = new InMemoryReviewAuditStore()
+		const gateway = makeGateway({
+			updateVersionDecision: vi.fn<ReviewGateway['updateVersionDecision']>(async (request) => ({
+				changed: true,
+				decisionKey: request.decision.key,
+				playlistId: request.playlistId,
+				previousStatusCode: request.expectedStatusCode,
+				reviewer: await makeGateway().getCurrentReviewer(),
+				statusCode: 'unexpected',
+				updatedAt: '2026-07-20T00:00:00Z',
+				versionId: request.versionId,
+			})),
+		})
+		const baseUrl = await start(gateway, undefined, {
+			auditStore,
+			decisions: [{ key: 'approve', label: 'Approve', statusCode: 'apr' }],
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+		const response = await fetch(`${baseUrl}/api/review/playlists/201/versions/301/decision`, {
+			body: JSON.stringify({ decisionKey: 'approve', expectedStatusCode: 'rev' }),
+			headers: { ...trustedProxyHeaders(), 'Content-Type': 'application/json' },
+			method: 'PUT',
+		})
+
+		expect(response.status).toBe(502)
+		expect(await response.json()).toMatchObject({
+			error: { code: 'DECISION_INDETERMINATE', retryable: false },
+		})
+		expect(auditStore.getEntries()).toHaveLength(2)
+		expect(auditStore.getEntries()[1]).toMatchObject({
+			action: 'decision',
+			decisionStatus: null,
+			entryKind: 'outcome',
+			errorCode: 'DECISION_INDETERMINATE',
+			outcome: 'indeterminate',
+			resultAttachmentId: null,
+			resultNoteId: null,
+		})
+	})
+
+	test('audits successful publication identifiers without review content or credentials', async () => {
+		const auditStore = new InMemoryReviewAuditStore()
+		const gateway = makeGateway()
+		const baseUrl = await start(gateway, undefined, {
+			auditStore,
+			mode: 'shotgrid',
+			sudoAsLogin: 'reviewer@example.test',
+			trustedProxyToken: TRUSTED_PROXY_TOKEN,
+		})
+		const ticket = 'super-secret-socket-ticket'
+		const response = await fetch(
+			`${baseUrl}/api/review/playlists/201/versions/301/publications/${PUBLICATION_ID}`,
+			{
+				body: JSON.stringify(publicationRequest()),
+				headers: {
+					...trustedProxyHeaders(),
+					'Content-Type': 'application/json',
+					'X-Review-Socket-Ticket': ticket,
+				},
+				method: 'PUT',
+			}
+		)
+
+		expect(response.status).toBe(200)
+		await response.json()
+		const entries = auditStore.getEntries()
+		expect(entries).toHaveLength(2)
+		expect(entries[0]).toMatchObject({
+			action: 'publication',
+			effectiveActor: { id: 7, kind: 'human' },
+			entryKind: 'attempt',
+			playlistId: 201,
+			principalId: expectedPrincipalId(),
+			projectId: 101,
+			requestId: 'test-request-id',
+			versionId: 301,
+		})
+		expect(entries[1]).toMatchObject({
+			action: 'publication',
+			decisionStatus: null,
+			entryKind: 'outcome',
+			errorCode: null,
+			outcome: 'succeeded',
+			resultAttachmentId: 501,
+			resultNoteId: 401,
+		})
+		expect(entries[1].attemptId).toBe(entries[0].attemptId)
+
+		const serialized = JSON.stringify(entries)
+		expect(serialized).not.toContain('Move the highlight left')
+		expect(serialized).not.toContain('Lighting note')
+		expect(serialized).not.toContain(PNG_BYTES.toString('base64'))
+		expect(serialized).not.toContain(PNG_SHA256)
+		expect(serialized).not.toContain(TRUSTED_PROXY_TOKEN)
+		expect(serialized).not.toContain(ticket)
+		expect(serialized).not.toContain('contentBase64')
 	})
 
 	test('does not require proxy headers in local mock mode', async () => {
@@ -807,11 +996,7 @@ describe('createReviewApiServer', () => {
 		for (const baseUrl of [firstBaseUrl, secondBaseUrl]) {
 			const response = await fetch(`${baseUrl}${path}`, {
 				body: JSON.stringify(publicationRequest()),
-				headers: {
-					'Content-Type': 'application/json',
-					'X-Review-Authenticated-Login': 'reviewer@example.test',
-					'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
-				},
+				headers: { ...trustedProxyHeaders(), 'Content-Type': 'application/json' },
 				method: 'PUT',
 			})
 			expect(response.status).toBe(200)
@@ -1412,7 +1597,9 @@ async function start(
 	logger?: ReviewApiServerOptions['logger'],
 	options: Pick<
 		ReviewApiServerOptions,
+		| 'auditStore'
 		| 'decisions'
+		| 'fixedActorSubject'
 		| 'mode'
 		| 'publicationDeploymentScope'
 		| 'publicationStore'
@@ -1425,6 +1612,7 @@ async function start(
 ) {
 	const server = createReviewApiServer({
 		allowedOrigin: 'http://127.0.0.1:5430',
+		auditStore: options.auditStore ?? new InMemoryReviewAuditStore(),
 		...(options.decisions === undefined ? undefined : { decisions: options.decisions }),
 		gateway,
 		logger,
@@ -1433,6 +1621,7 @@ async function start(
 		requestId: () => 'test-request-id',
 		...(options.mode === 'shotgrid'
 			? {
+					fixedActorSubject: options.fixedActorSubject ?? FIXED_ACTOR_SUBJECT,
 					publicationDeploymentScope:
 						options.publicationDeploymentScope ?? 'https://studio.example.test',
 					serviceActorName: 'review-gateway',
@@ -1450,6 +1639,20 @@ async function start(
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
 	const { port } = server.address() as AddressInfo
 	return `http://127.0.0.1:${port}`
+}
+
+function trustedProxyHeaders() {
+	return {
+		'X-Review-Authenticated-Subject': FIXED_ACTOR_SUBJECT,
+		'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
+	}
+}
+
+function expectedPrincipalId() {
+	return `p1_${createHash('sha256')
+		.update('shotgrid-review-principal-v1\0', 'utf8')
+		.update(FIXED_ACTOR_SUBJECT, 'utf8')
+		.digest('base64url')}`
 }
 
 async function expectJson(url: string, status: number, expected: unknown, init?: RequestInit) {

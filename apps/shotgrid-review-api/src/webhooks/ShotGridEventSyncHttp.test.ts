@@ -4,8 +4,9 @@ import { request, type OutgoingHttpHeaders, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ReviewChangeEvent } from '@tldraw/shotgrid-review-contracts'
+import type { ReviewChangeNotification } from '@tldraw/shotgrid-review-contracts'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { InMemoryReviewAuditStore } from '../audit/ReviewAuditStore'
 import { MockReviewGateway } from '../gateway/MockReviewGateway'
 import { createReviewApiServer } from '../http/createReviewApiServer'
 import { InMemoryReviewPublicationStore } from '../http/ReviewPublicationStore'
@@ -20,6 +21,7 @@ const EVENT_SYNC_SECRET = 'event-sync-http-test-secret-with-32-characters'
 const SITE_URL = 'https://studio.example.test'
 const TEMP_DIRECTORY_PREFIX = join(tmpdir(), 'tldraw-shotgrid-event-sync-http-')
 const TRUSTED_PROXY_TOKEN = 'event-sync-http-test-proxy-token-with-32-characters'
+const FIXED_ACTOR_SUBJECT = 'oidc:test:event-sync-reviewer'
 const WEBHOOK_ID = '11111111-1111-4111-8111-111111111111'
 
 interface Harness {
@@ -190,19 +192,19 @@ describe('ShotGrid event sync HTTP transport', () => {
 		expect(replayResponse.status).toBe(200)
 		expect(replayResponse.headers.get('content-type')).toBe('text/event-stream; charset=utf-8')
 		const replay = new SseReader(requireBody(replayResponse))
-		expect(await replay.next()).toMatchObject({ sequence: 1, sourceEventId: '11777.3065.50' })
+		expect(await replay.next()).toEqual({ sequence: 1 })
 
 		expect(
 			(await postWebhook(harness, makeWebhookBody([makeEvent(51)]), deliveryId(51))).status
 		).toBe(202)
-		expect(await replay.next()).toMatchObject({ sequence: 2, sourceEventId: '11777.3065.51' })
+		expect(await replay.next()).toEqual({ sequence: 2 })
 
 		const resumedResponse = await fetch(`${harness.baseUrl}/api/review/changes`, {
 			headers: { ...trustedProxyHeaders(), 'Last-Event-ID': '1' },
 		})
 		expect(resumedResponse.status).toBe(200)
 		const resumed = new SseReader(requireBody(resumedResponse))
-		expect(await resumed.next()).toMatchObject({ sequence: 2, sourceEventId: '11777.3065.51' })
+		expect(await resumed.next()).toEqual({ sequence: 2 })
 
 		const invalidCursor = await fetch(`${harness.baseUrl}/api/review/changes`, {
 			headers: { ...trustedProxyHeaders(), 'Last-Event-ID': '-1' },
@@ -230,8 +232,10 @@ async function startHarness(
 	})
 	const server = createReviewApiServer({
 		allowedOrigin: ALLOWED_ORIGIN,
+		auditStore: new InMemoryReviewAuditStore(),
 		eventSync: service,
 		gateway: new MockReviewGateway(),
+		fixedActorSubject: FIXED_ACTOR_SUBJECT,
 		logger: { error: vi.fn() },
 		mode: 'shotgrid',
 		publicationDeploymentScope: SITE_URL,
@@ -296,7 +300,10 @@ function sign(body: Buffer) {
 }
 
 function trustedProxyHeaders() {
-	return { 'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN }
+	return {
+		'X-Review-Authenticated-Subject': FIXED_ACTOR_SUBJECT,
+		'X-Review-Proxy-Token': TRUSTED_PROXY_TOKEN,
+	}
 }
 
 async function postWebhook(
@@ -370,7 +377,7 @@ class SseReader {
 		this.reader = body.getReader()
 	}
 
-	async next(): Promise<ReviewChangeEvent> {
+	async next(): Promise<ReviewChangeNotification> {
 		for (;;) {
 			const boundary = this.buffer.indexOf('\n\n')
 			if (boundary !== -1) {
@@ -381,7 +388,7 @@ class SseReader {
 					.split('\n')
 					.find((line) => line.startsWith('data: '))
 					?.slice('data: '.length)
-				if (data) return JSON.parse(data) as ReviewChangeEvent
+				if (data) return JSON.parse(data) as ReviewChangeNotification
 				continue
 			}
 

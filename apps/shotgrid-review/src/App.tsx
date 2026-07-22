@@ -1,5 +1,5 @@
 import type { ReviewMedia, ReviewVersion } from '@tldraw/shotgrid-review-contracts'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import 'tldraw/tldraw.css'
 import { reviewConfig } from './config'
 import { createReviewApiClient } from './reviewApiClient'
@@ -7,6 +7,7 @@ import type { ReviewBrowserLoadResult, ReadyReviewBrowser } from './reviewBrowse
 import { ReviewCollaborationCanvas } from './ReviewCollaborationCanvas'
 import { ReviewDecisionPanel, reviewDecisionAccessForReviewerKind } from './ReviewDecisionPanel'
 import { ReviewImageCanvas, reviewPublicationAccessForReviewerKind } from './ReviewImageCanvas'
+import { ReviewLocalDataControl } from './ReviewLocalDataControl'
 import { ReviewVideoCanvas } from './ReviewVideoCanvas'
 import { useReviewBrowser } from './useReviewBrowser'
 
@@ -14,9 +15,11 @@ const reviewApi = createReviewApiClient({ baseUrl: reviewConfig.apiBaseUrl })
 
 function ReviewHeader({
 	changeStreamStatus,
+	onLocalDataCleared,
 	state,
 }: {
 	changeStreamStatus: ReturnType<typeof useReviewBrowser>['changeStreamStatus']
+	onLocalDataCleared(): void
 	state?: ReviewBrowserLoadResult
 }) {
 	const changeStreamLive = changeStreamStatus === 'live'
@@ -45,6 +48,7 @@ function ReviewHeader({
 					<span className="mode-badge">Connecting</span>
 				)}
 				<span className="reviewer">{state?.reviewer.name ?? 'Reviewer pending'}</span>
+				<ReviewLocalDataControl onCleared={onLocalDataCleared} />
 			</div>
 		</header>
 	)
@@ -417,6 +421,7 @@ function formatVideoMetadata(media: Extract<ReviewMedia, { kind: 'video' }>) {
 }
 
 function App() {
+	const [localDataRevision, setLocalDataRevision] = useState(0)
 	const {
 		changeStreamStatus,
 		externalChangeRevision,
@@ -434,7 +439,11 @@ function App() {
 
 	return (
 		<div className="review-app">
-			<ReviewHeader changeStreamStatus={changeStreamStatus} state={loadedState} />
+			<ReviewHeader
+				changeStreamStatus={changeStreamStatus}
+				onLocalDataCleared={() => setLocalDataRevision((revision) => revision + 1)}
+				state={loadedState}
+			/>
 			{state.status === 'loading' ? (
 				<ReviewMessage busy title="Loading review workspace">
 					Fetching your permitted ShotGrid projects, Playlists, and Versions.
@@ -459,6 +468,7 @@ function App() {
 					refreshError={refreshError}
 					refreshing={refreshing}
 					state={state}
+					key={`local-data-${localDataRevision}`}
 				/>
 			)}
 		</div>

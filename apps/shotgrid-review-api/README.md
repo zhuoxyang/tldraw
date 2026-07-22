@@ -16,6 +16,10 @@ SHOTGRID_SITE_URL=https://studio.shotgrid.autodesk.com
 SHOTGRID_SCRIPT_NAME=review_gateway
 SHOTGRID_SCRIPT_KEY=...
 REVIEW_API_TRUSTED_PROXY_TOKEN=... # at least 32 random characters
+REVIEW_FIXED_ACTOR_SUBJECT=oidc:studio:pilot-reviewer # exact subject injected by the trusted proxy
+SHOTGRID_REVIEW_PROJECT_IDS=123,456 # explicit review allowlist; no wildcard
+SHOTGRID_REVIEW_AUDIT_STORE_DIR=/var/lib/shotgrid-review-audit
+SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES=100000 # optional; each completed mutation uses two entries
 SHOTGRID_REVIEW_PUBLICATION_STORE_DIR=/var/lib/shotgrid-review-publications
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS=10000 # optional
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES=4194304 # optional; minimum 1048576
@@ -42,15 +46,35 @@ not expose enough container timing information to prove that a movie is CFR. Thi
 assertion for all review movies, so mixed CFR/VFR sources must remain `unknown` until the pipeline
 can provide a trustworthy per-Version classification.
 
-Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browser configuration and the review application rejects `VITE_SHOTGRID_*` values at build time.
+Never prefix ShotGrid credentials with `VITE_`. Vite variables are public browser configuration. The
+review application permits only `VITE_REVIEW_API_BASE_URL`, `VITE_REVIEW_DATA_MODE`,
+`VITE_REVIEW_STORAGE_NAMESPACE`, and `VITE_TLDRAW_LICENSE_KEY`; it rejects every other `VITE_*`
+name, including an empty one. In ShotGrid mode the API base URL must be a same-origin,
+root-relative path such as `/api`.
 
-In ShotGrid mode, deploy this service behind a trusted reverse proxy. The proxy must authenticate and authorize every user and action, strip any browser-supplied `X-Review-Proxy-Token` and `X-Review-Authenticated-Login` headers, then inject the server-only proxy token. When `SHOTGRID_SUDO_AS_LOGIN` is configured, the proxy must also inject that exact login so the authenticated identity is bound to ShotGrid impersonation. The proxy token must never be sent to browser code or exposed through CORS.
+In ShotGrid mode, deploy this service behind a trusted reverse proxy. The current security boundary
+deliberately accepts one fixed pilot principal, not arbitrary authenticated users. On every review
+HTTP request, SSE connection, and WebSocket Upgrade, the proxy must:
+
+1. authenticate the upstream session;
+2. remove any browser-supplied `X-Review-Proxy-Token` and
+   `X-Review-Authenticated-Subject` headers; and
+3. inject the server-only proxy token plus an `X-Review-Authenticated-Subject` value exactly equal
+   to `REVIEW_FIXED_ACTOR_SUBJECT`.
+
+The API requires both values and derives a stable opaque principal id from the subject; it does not
+persist or return the raw subject. The token and injected subject must never be sent to browser
+code, exposed through CORS, accepted from an untrusted hop, or written to access logs.
+`SHOTGRID_SUDO_AS_LOGIN` separately chooses the effective ShotGrid human actor for review
+mutations. Operations must ensure that the fixed subject and sudo login belong to the same approved
+pilot operator; the service cannot prove that relationship itself.
 
 The same proxy must serve the browser application and `/api` under one origin and forward WebSocket
 Upgrade requests for `/api/review/sync/*` to this Node process without rewriting the path or query.
-The API rejects a WebSocket whose `Origin` does not exactly match `REVIEW_APP_ORIGIN`. Do not expose
-the Node port as a second browser origin, terminate a sync connection as ordinary HTTP, or log its
-short-lived one-use ticket query value.
+The API rejects a WebSocket whose `Origin` does not exactly match `REVIEW_APP_ORIGIN`, and applies
+the same token-plus-subject check used by review HTTP routes. Do not expose the Node port as a
+second browser origin, terminate a sync connection as ordinary HTTP, or log its short-lived
+one-use ticket query value.
 
 The ShotGrid callback is the separate public `POST /api/webhooks/shotgrid` endpoint. Do not put the
 trusted browser-proxy token in ShotGrid. Preserve the request body bytes and the single
@@ -70,7 +94,17 @@ without mappings so a script identity can remain browse-only; decision routes th
 `Version.sg_status_list` schema and requires the field to be a visible, editable status list. Every
 configured code must be valid and not hidden for that Project.
 
-Project and entity authorization remains the reverse proxy's responsibility until the permission hardening work in issue #12 is complete.
+`SHOTGRID_REVIEW_PROJECT_IDS` is the API's mandatory live review boundary. Project listing is
+filtered to those ids, and every Project → Playlist → Version read or mutation revalidates the
+relationships and allowed Project before returning data or dispatching a ShotGrid side effect.
+Out-of-scope or mismatched entities fail as not found. `SHOTGRID_WEBHOOK_PROJECT_IDS` must be a
+subset of the review allowlist or the service refuses to start; a correctly signed event outside
+the webhook subset is acknowledged as ignored.
+
+Project images and HumanUser avatars remain upstream URLs that may be signed or session-bearing.
+The live API therefore returns `null` for Project thumbnail and User avatar URLs. Version media is
+the only exception and crosses the browser boundary through the separately authorized same-origin
+image/video proxy routes described below.
 
 ## ShotGrid change synchronization
 
@@ -88,14 +122,21 @@ dead-letter state for repeated failures. Payload `old_value` and `new_value` are
 current data: every accepted event is only a project-scoped invalidation. This makes duplicate,
 late, and out-of-order delivery safe because browsers reread current authoritative ShotGrid state.
 
-The browser consumes the protected `GET /api/review/changes` server-sent event stream. Its local
-monotonic sequence supports `Last-Event-ID` replay; bursts are coalesced for 250 ms and then the
-current Project → Playlist → Version hierarchy is reread. Decision context and Note recipient
-options refresh as well, without remounting the collaborative tldraw canvas. A visible badge shows
-whether live updates are connected or reconnecting. `GET /api/review/event-sync-status`, protected
-by the same trusted proxy policy as other review routes, reports bounded queue depth/bytes, oldest
-lag, duplicate/ignored/failure counters, the latest stream sequence, and connected clients. The
-ordinary health endpoint returns `503` if the durable worker is stopped, faulted, or at capacity.
+The browser consumes the protected `GET /api/review/changes` server-sent event stream. The wire
+payload is deliberately only `{"sequence": number}`: Project ids, entity types, entity ids, event
+ids, and operation metadata stay server-side. Its local monotonic sequence supports
+`Last-Event-ID` replay; bursts are coalesced for 250 ms and then the current Project → Playlist →
+Version hierarchy is reread. Decision context and Note recipient options refresh as well, without
+remounting an authorized collaborative tldraw canvas. A permission or not-found response clears the
+previously loaded review state so revoked media and annotations do not remain displayed. Each SSE
+connection has a five-minute authorization lease and then closes; the browser reconnects through
+the trusted proxy and is authenticated again. A visible badge shows whether live updates are
+connected or reconnecting.
+
+`GET /api/review/event-sync-status`, protected by the same trusted proxy policy as other review
+routes, reports bounded queue depth/bytes, oldest lag, duplicate/ignored/failure counters, the
+latest stream sequence, and connected clients. The ordinary health endpoint returns `503` if the
+durable worker is stopped, faulted, or at capacity.
 
 Create separate ShotGrid webhooks per entity type because the current ShotGrid REST API supports
 one entity type per webhook. Put every resulting UUID in `SHOTGRID_WEBHOOK_IDS`; all review hooks
@@ -131,24 +172,37 @@ review context and make external changes observable but do not display external 
 Adding a bounded paginated Notes panel is a separate product capability, not something webhook
 delivery alone can provide.
 
-Production mapping from the proxy-authenticated person to a distinct ShotGrid human reviewer is
-still tracked by issue #2. Until that trusted-proxy identity mapping is deployed, configuring one
-`SHOTGRID_SUDO_AS_LOGIN` does not prove true per-person identity for a multi-user rollout. The sync
-service binds each connection to the reviewer returned by the gateway: a human reviewer receives
-editor access, while a shared ShotGrid service identity receives viewer access and cannot create,
-change, or delete shared annotations.
+This release is a single-fixed-principal pilot only. `REVIEW_FIXED_ACTOR_SUBJECT` plus one
+`SHOTGRID_SUDO_AS_LOGIN` does not provide per-person attribution, organization SSO, group/project
+entitlements, or immediate session revocation for a multi-user rollout. The sync service still
+binds each connection to the reviewer returned by the gateway: a human reviewer receives editor
+access, while a ShotGrid service identity receives viewer access and cannot create, change, or
+delete shared annotations. Keep the deployment limited to the one approved pilot operator until
+the external identity requirements in **Production gates** are complete.
 
 ## Collaborative review storage and deployment
 
 `POST /api/review/playlists/:playlistId/versions/:versionId/collaboration-session` verifies the
-Playlist/Version relationship and returns a short-lived, one-use WebSocket ticket. The browser then
-connects to the returned `/api/review/sync/*` path. Never cache, replay, persist, or place these
-tickets in application logs.
+Project/Playlist/Version relationship and returns a short-lived, one-use WebSocket ticket bound to
+the fixed opaque proxy principal. The browser then connects to the returned `/api/review/sync/*`
+path. Before upgrading, the API requires that same principal and rereads the Version, reviewer,
+Project allowlist, room, media, and permission state. A ticket presented by another principal is
+rejected, and an accepted socket is closed after a five-minute authorization lease so reconnecting
+must pass the boundary again. Never cache, replay, persist, or place tickets in application logs.
 
 Each review room is stored as SQLite state below `SHOTGRID_REVIEW_SYNC_STORE_DIR`. The synchronized
 records contain tldraw document state and annotations only. ShotGrid media bytes, source asset bytes,
 and media URLs remain local to each browser and are not written to the sync database. Apply the same
 access control, backup, retention, disk-space, and inode monitoring used for other review metadata.
+
+In live mode, sync, event, and audit SQLite stores require absolute filesystem paths. On POSIX the
+final store directory must be a physical directory owned by the service account with mode `0700`;
+database files and any journal/WAL/SHM sidecars must be regular files owned by that account with
+mode `0600`. Startup and subsequent store access fail closed for a symlink, a non-directory/non-file
+entry, the wrong owner, or group/world access. All durable store configuration rejects filesystem
+roots, network-share paths, and whitespace-padded paths. On Windows, POSIX mode bits are not an ACL
+check: grant only the API service account access through NTFS permissions and use a dedicated local
+volume.
 
 The current SQLite room owner is deliberately a single Node process. Run exactly one API process or
 replica for a deployment, mount the sync store on a durable persistent volume with exclusive
@@ -173,7 +227,60 @@ frames, and to at most 1,024 chunks. The WebSocket transport also rejects any in
 1 MiB. Keep reverse-proxy limits compatible with these bounds; malformed, oversized, or unbounded
 chunk sequences are disconnected instead of being buffered by the room process.
 
-### Operational verification
+## Mutation audit log
+
+Live decision and publication mutations use the append-only SQLite database
+`SHOTGRID_REVIEW_AUDIT_STORE_DIR/review-audit.sqlite`. Before dispatching an external mutation, the
+API rereads the Version and effective reviewer and durably appends an `attempt` (intent) row. If
+that append fails or the store has no reserved capacity, the ShotGrid mutation is not started.
+After the call, a second `outcome` row records `succeeded`, `failed`, or `indeterminate`. A safe
+idempotent no-op is `succeeded`, an authoritative upstream rejection is `failed`, and only an
+unknown dispatch/result is `indeterminate`. Every
+attempt and outcome has a monotonic sequence, timestamp, attempt/request id, opaque proxy
+principal, effective actor kind/id, action, Project/Playlist/Version ids, and only the bounded
+result fields needed for reconciliation: API error code, decision status, Note id, and Attachment
+id.
+
+The schema intentionally cannot store request bodies, Note subject/content, annotation PNG bytes,
+media or avatar URLs, script/OAuth credentials, proxy or webhook secrets, raw authenticated
+subjects, cookies, or WebSocket tickets. Unknown fields are rejected. SQLite uses full synchronous
+commits and rollback-journal mode, and database triggers reject updates and deletes. Protect and
+back up this store as security/audit metadata; it is not replaced by the recent ShotGrid Version
+activity shown in the browser.
+
+`SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES` defaults to 100,000 and may be set from 2 to 10,000,000. A
+normally completed mutation consumes two rows. Capacity accounting reserves an outcome row for
+every open attempt before admitting another intent, so a full store rejects a new mutation before
+its side effect while existing attempts can still finish. This limit is a safety boundary, not a
+retention mechanism. Monitor row count, disk space, filesystem errors, and open attempts; do not
+delete rows, edit the database, or rotate it underneath a running API process.
+
+An `attempt` with no matching `outcome` is a manual reconciliation signal, commonly caused by a
+process/storage failure after intent or after an uncertain upstream dispatch. Correlate its request
+id, timestamp, actor, and entity ids with the publication journal and authoritative ShotGrid Note,
+Attachment, Version status, and activity data. Treat uncertain dispatch as indeterminate and never
+automatically replay it. Preserve the database and the incident disposition together until an
+approved retention and archival procedure exists.
+
+## Production gates
+
+The implemented controls support one fixed-principal, one-process pilot. They do not close these
+external deployment decisions:
+
+- **Organization identity:** multi-user release requires the organization's SSO/session boundary,
+  a trusted subject-to-ShotGrid-user mapping, per-user project entitlements, offboarding and group
+  synchronization, and a measured revocation SLA. A shared fixed subject or sudo login must not be
+  presented as per-person attribution.
+- **Retention and legal policy:** owners must approve retention, legal hold, backup, archival,
+  access review, and deletion rules for audit, publication, event, and annotation stores plus
+  browser-local review data. Until then, preserve records and keep the pilot's scope/capacity
+  bounded rather than inventing an automatic purge.
+- **Multi-instance operation:** this version has no distributed room ownership, webhook/SSE fanout,
+  principal revocation channel, or fencing for SQLite owners. Run exactly one API process with
+  exclusive durable stores. Horizontal scaling requires a different coordination and persistence
+  design.
+
+## Operational verification
 
 Perform these checks in a staging deployment before enabling reviewers:
 
@@ -181,10 +288,10 @@ Perform these checks in a staging deployment before enabling reviewers:
    Confirm `GET /api/health` returns `{"mode":"shotgrid","status":"ok"}` (or `mock` in a local
    smoke test). This endpoint proves only that the process is serving requests; it does not probe
    SQLite durability or an upgraded WebSocket.
-2. Through the public same-origin proxy, open the same canonical review URL in two separately
-   authenticated browser sessions. Confirm the WebSocket upgrades successfully and a human
-   reviewer's annotation appears in the second session without a refresh. Confirm a service
-   reviewer is visibly read-only and cannot create, change, or delete that annotation.
+2. Through the public same-origin proxy, open the same canonical review URL in two browser sessions
+   routed under the one configured fixed pilot subject. Confirm the WebSocket upgrades successfully
+   and a human reviewer's annotation appears in the second session without a refresh. Confirm a
+   service reviewer is visibly read-only and cannot create, change, or delete that annotation.
 3. Exercise the configured session and active-room ceilings in staging. Confirm excess connections
    fail closed as collaboration unavailable, existing rooms remain usable, and proxy/API metrics
    expose the rejection without recording ticket query values.
@@ -196,6 +303,16 @@ Perform these checks in a staging deployment before enabling reviewers:
    durable volume, restore the same secret from the secret manager, start one replica, repeat the
    two-browser check, and inspect logs for SQLite or schema errors. Never copy or restore a live
    database underneath a running room owner.
+6. Attempt a Project id outside `SHOTGRID_REVIEW_PROJECT_IDS` and a mismatched
+   Project/Playlist/Version deep link. Confirm neither returns review data. Confirm startup rejects
+   a webhook Project allowlist that is not a subset of the review allowlist.
+7. Confirm a forged proxy token or subject is rejected on HTTP, SSE, and WebSocket Upgrade. Leave
+   SSE and WebSocket connections open past five minutes and confirm each reconnects through the
+   proxy and reauthorizes without losing the durable annotation document.
+8. Perform one decision and one publication, then inspect the audit database through a read-only
+   operational export. Confirm each has an intent and outcome, expected ids/status, and no request
+   body, Note text, PNG, URL, secret, raw subject, or ticket. Exercise the capacity alert and manual
+   open-attempt reconciliation runbook before enabling pilot traffic.
 
 The publication store directory is required in ShotGrid mode. It contains no annotation image
 bytes or credentials; it persists publication fingerprints, Note subjects and content, derived

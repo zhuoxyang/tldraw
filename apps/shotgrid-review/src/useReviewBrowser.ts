@@ -163,8 +163,9 @@ export function useReviewBrowser(api: ReviewApiClient) {
 			} catch (error) {
 				if (controller.signal.aborted || !active || isAbortError(error)) return
 				const displayError = toReviewBrowserDisplayError(error)
-				if (displayError.kind === 'not-found') {
+				if (displayError.kind === 'not-found' || displayError.kind === 'permission') {
 					hasLoadedStateRef.current = false
+					setRefreshError(null)
 					setState({ error: displayError, status: 'error' })
 				} else {
 					setRefreshError(displayError)
@@ -259,7 +260,14 @@ export function useReviewBrowser(api: ReviewApiClient) {
 			})
 			.catch((error: unknown) => {
 				if (!controller.signal.aborted && !isAbortError(error)) {
-					setRefreshError(toReviewBrowserDisplayError(error))
+					const displayError = toReviewBrowserDisplayError(error)
+					if (displayError.kind === 'not-found' || displayError.kind === 'permission') {
+						hasLoadedStateRef.current = false
+						setRefreshError(null)
+						setState({ error: displayError, status: 'error' })
+					} else {
+						setRefreshError(displayError)
+					}
 				}
 			})
 			.finally(() => {

@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, parse, resolve } from 'node:path'
 import { isReviewDecisionOption, type ReviewDecisionOption } from './contracts'
 import { ReviewGatewayError } from './errors'
 import {
@@ -20,6 +20,7 @@ const DEFAULT_MOCK_DECISIONS: ReviewDecisionOption[] = [
 ]
 const DEFAULT_PUBLICATION_MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 const DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT = 10_000
+const DEFAULT_AUDIT_MAX_ENTRIES = 100_000
 const DEFAULT_COLLABORATION_MAX_ROOMS = 100
 const DEFAULT_COLLABORATION_MAX_SESSIONS_PER_ROOM = 16
 const DEFAULT_MOCK_COLLABORATION_SECRET = 'local-development-only-review-sync-secret'
@@ -52,6 +53,7 @@ export interface ShotGridEventSyncConfig {
 }
 
 interface GatewayConfigBase {
+	allowedProjectIds: number[]
 	host: string
 	port: number
 	allowedOrigin: string
@@ -71,7 +73,10 @@ export type GatewayConfig = GatewayConfigBase &
 				trustedProxyToken?: never
 		  }
 		| {
+				auditMaxEntries: number
+				auditStoreDir: string
 				mode: 'shotgrid'
+				fixedActorSubject: string
 				publicationMaxJournalBytes: number
 				publicationMaxJournalCount: number
 				publicationStoreDir: string
@@ -174,10 +179,17 @@ function parseSiteUrl(rawValue: string): string {
 
 function parseAbsoluteStoreDirectory(rawValue: string, variableName: string) {
 	const value = rawValue.trim()
-	if (!isAbsolute(value) || /\p{Cc}/u.test(value)) {
-		throw configurationError(variableName, 'must be an absolute filesystem path')
+	const resolved = resolve(value)
+	if (
+		value !== rawValue ||
+		!isAbsolute(value) ||
+		/^[\\/]{2}/.test(value) ||
+		/\p{Cc}/u.test(value) ||
+		resolved === parse(resolved).root
+	) {
+		throw configurationError(variableName, 'must be an absolute local non-root filesystem path')
 	}
-	return resolve(value)
+	return resolved
 }
 
 function parseWebhookSecret(rawValue: string, variableName: string) {
@@ -208,7 +220,7 @@ function parseWebhookIds(rawValue: string) {
 	return values.sort()
 }
 
-function parseWebhookProjectIds(rawValue: string) {
+function parseProjectIds(rawValue: string, variableName: string) {
 	const parts = rawValue.split(',').map((part) => part.trim())
 	if (
 		parts.length === 0 ||
@@ -216,18 +228,35 @@ function parseWebhookProjectIds(rawValue: string) {
 		parts.some((part) => !/^[1-9]\d*$/.test(part))
 	) {
 		throw configurationError(
-			'SHOTGRID_WEBHOOK_PROJECT_IDS',
+			variableName,
 			'must be a comma-separated list of positive ShotGrid project ids'
 		)
 	}
 	const ids = parts.map(Number)
 	if (ids.some((id) => !Number.isSafeInteger(id)) || new Set(ids).size !== ids.length) {
-		throw configurationError(
-			'SHOTGRID_WEBHOOK_PROJECT_IDS',
-			'must contain unique positive safe integers'
-		)
+		throw configurationError(variableName, 'must contain unique positive safe integers')
 	}
 	return ids
+}
+
+function parseBoundedPlainValue(
+	rawValue: string,
+	variableName: string,
+	options: { maximumLength: number; minimumLength?: number } = { maximumLength: 255 }
+) {
+	const minimumLength = options.minimumLength ?? 1
+	if (
+		rawValue.length < minimumLength ||
+		rawValue.length > options.maximumLength ||
+		rawValue.trim() !== rawValue ||
+		/\p{Cc}/u.test(rawValue)
+	) {
+		throw configurationError(
+			variableName,
+			`must contain from ${minimumLength} to ${options.maximumLength} plain characters`
+		)
+	}
+	return rawValue
 }
 
 function parseDecisionOptions(
@@ -299,6 +328,20 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const maxRetries = parseInteger(environment, 'SHOTGRID_MAX_RETRIES', DEFAULT_MAX_RETRIES, 0, 10)
 
 	if (rawMode === 'mock') {
+		const allowedProjectIds = parseProjectIds(
+			environment.SHOTGRID_REVIEW_PROJECT_IDS || '101,102',
+			'SHOTGRID_REVIEW_PROJECT_IDS'
+		)
+		const eventAllowedProjectIds = parseProjectIds(
+			environment.SHOTGRID_WEBHOOK_PROJECT_IDS || '101,102',
+			'SHOTGRID_WEBHOOK_PROJECT_IDS'
+		)
+		if (eventAllowedProjectIds.some((projectId) => !allowedProjectIds.includes(projectId))) {
+			throw configurationError(
+				'SHOTGRID_WEBHOOK_PROJECT_IDS',
+				'must be a subset of SHOTGRID_REVIEW_PROJECT_IDS'
+			)
+		}
 		const collaborationSecret =
 			environment.REVIEW_SYNC_SECRET?.trim() || DEFAULT_MOCK_COLLABORATION_SECRET
 		if (collaborationSecret.length < 32 || /\p{Cc}/u.test(collaborationSecret)) {
@@ -306,6 +349,7 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		}
 		return {
 			mode: rawMode,
+			allowedProjectIds,
 			host,
 			port,
 			allowedOrigin,
@@ -321,9 +365,7 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 				defaultDecisions: DEFAULT_MOCK_DECISIONS,
 			}),
 			eventSync: {
-				allowedProjectIds: parseWebhookProjectIds(
-					environment.SHOTGRID_WEBHOOK_PROJECT_IDS || '101,102'
-				),
+				allowedProjectIds: eventAllowedProjectIds,
 				secret: parseWebhookSecret(
 					environment.SHOTGRID_WEBHOOK_SECRET || DEFAULT_MOCK_WEBHOOK_SECRET,
 					'SHOTGRID_WEBHOOK_SECRET'
@@ -339,10 +381,30 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		}
 	}
 
-	const scriptName = readRequired(environment, 'SHOTGRID_SCRIPT_NAME').trim()
-	const scriptKey = readRequired(environment, 'SHOTGRID_SCRIPT_KEY')
-	const trustedProxyToken = readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN').trim()
-	const collaborationSecret = readRequired(environment, 'REVIEW_SYNC_SECRET').trim()
+	const scriptName = parseBoundedPlainValue(
+		readRequired(environment, 'SHOTGRID_SCRIPT_NAME'),
+		'SHOTGRID_SCRIPT_NAME'
+	)
+	const scriptKey = parseBoundedPlainValue(
+		readRequired(environment, 'SHOTGRID_SCRIPT_KEY'),
+		'SHOTGRID_SCRIPT_KEY',
+		{ maximumLength: 1024 }
+	)
+	const trustedProxyToken = parseBoundedPlainValue(
+		readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN'),
+		'REVIEW_API_TRUSTED_PROXY_TOKEN',
+		{ maximumLength: 1024, minimumLength: 32 }
+	)
+	const collaborationSecret = parseBoundedPlainValue(
+		readRequired(environment, 'REVIEW_SYNC_SECRET'),
+		'REVIEW_SYNC_SECRET',
+		{ maximumLength: 1024, minimumLength: 32 }
+	)
+	const fixedActorSubject = parseBoundedPlainValue(
+		readRequired(environment, 'REVIEW_FIXED_ACTOR_SUBJECT'),
+		'REVIEW_FIXED_ACTOR_SUBJECT',
+		{ maximumLength: 512 }
+	)
 	const collaborationStoreDir = parseAbsoluteStoreDirectory(
 		readRequired(environment, 'SHOTGRID_REVIEW_SYNC_STORE_DIR'),
 		'SHOTGRID_REVIEW_SYNC_STORE_DIR'
@@ -352,9 +414,18 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR'
 	)
 	const shotgridSiteUrl = parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL'))
+	const allowedProjectIds = parseProjectIds(
+		readRequired(environment, 'SHOTGRID_REVIEW_PROJECT_IDS'),
+		'SHOTGRID_REVIEW_PROJECT_IDS'
+	)
+	const auditStoreDir = parseAbsoluteStoreDirectory(
+		readRequired(environment, 'SHOTGRID_REVIEW_AUDIT_STORE_DIR'),
+		'SHOTGRID_REVIEW_AUDIT_STORE_DIR'
+	)
 	const eventSync: ShotGridEventSyncConfig = {
-		allowedProjectIds: parseWebhookProjectIds(
-			readRequired(environment, 'SHOTGRID_WEBHOOK_PROJECT_IDS')
+		allowedProjectIds: parseProjectIds(
+			readRequired(environment, 'SHOTGRID_WEBHOOK_PROJECT_IDS'),
+			'SHOTGRID_WEBHOOK_PROJECT_IDS'
 		),
 		secret: parseWebhookSecret(
 			readRequired(environment, 'SHOTGRID_WEBHOOK_SECRET'),
@@ -366,6 +437,12 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 			'SHOTGRID_REVIEW_EVENT_STORE_DIR'
 		),
 		webhookIds: parseWebhookIds(readRequired(environment, 'SHOTGRID_WEBHOOK_IDS')),
+	}
+	if (eventSync.allowedProjectIds.some((projectId) => !allowedProjectIds.includes(projectId))) {
+		throw configurationError(
+			'SHOTGRID_WEBHOOK_PROJECT_IDS',
+			'must be a subset of SHOTGRID_REVIEW_PROJECT_IDS'
+		)
 	}
 	const publicationMaxJournalBytes = parseInteger(
 		environment,
@@ -381,20 +458,27 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		1,
 		1_000_000
 	)
-	if (trustedProxyToken.length < 32 || /\p{Cc}/u.test(trustedProxyToken)) {
-		throw configurationError(
-			'REVIEW_API_TRUSTED_PROXY_TOKEN',
-			'must contain at least 32 characters'
-		)
-	}
-	if (collaborationSecret.length < 32 || /\p{Cc}/u.test(collaborationSecret)) {
-		throw configurationError('REVIEW_SYNC_SECRET', 'must contain at least 32 characters')
-	}
-	const sudoAsLogin = environment.SHOTGRID_SUDO_AS_LOGIN?.trim() || undefined
+	const auditMaxEntries = parseInteger(
+		environment,
+		'SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES',
+		DEFAULT_AUDIT_MAX_ENTRIES,
+		2,
+		10_000_000
+	)
+	const rawSudoAsLogin = environment.SHOTGRID_SUDO_AS_LOGIN
+	const sudoAsLogin = rawSudoAsLogin
+		? parseBoundedPlainValue(rawSudoAsLogin, 'SHOTGRID_SUDO_AS_LOGIN', {
+				maximumLength: 255,
+			})
+		: undefined
 	const decisions = parseDecisionOptions(environment, { defaultDecisions: [] })
 
 	return {
+		auditMaxEntries,
+		auditStoreDir,
 		mode: rawMode,
+		allowedProjectIds,
+		fixedActorSubject,
 		host,
 		port,
 		allowedOrigin,

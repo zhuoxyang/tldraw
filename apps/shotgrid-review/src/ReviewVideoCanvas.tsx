@@ -36,6 +36,7 @@ import {
 	normalizeReviewAnnotationTarget,
 	type ReviewAnnotationTarget,
 } from './reviewAnnotationTarget'
+import { downloadReviewBlob } from './reviewBlobDownload'
 import { sanitizeReviewFileNameBase } from './reviewPublication'
 import { renderReviewVideoFramePng, seekReviewVideoFrame } from './reviewVideoFrame'
 import {
@@ -691,7 +692,7 @@ export function ReviewVideoCanvas({
 			if (controller.signal.aborted || !mountedRef.current) return
 			syncPlayhead(rendered.mediaTimeSeconds, metadata.timing)
 			const targetLabel = reviewVideoExportTargetLabel(metadata.timing, rendered.mediaTimeSeconds)
-			downloadBlob(
+			downloadReviewBlob(
 				rendered.blob,
 				`${sanitizeReviewFileNameBase(versionName)}.${targetLabel}.annotated.png`
 			)
@@ -723,7 +724,7 @@ export function ReviewVideoCanvas({
 				source: snapshotSource,
 			})
 			const serialized = serializeReviewVideoSnapshot(envelope)
-			downloadBlob(
+			downloadReviewBlob(
 				new Blob([serialized], { type: 'application/json' }),
 				`${sanitizeReviewFileNameBase(versionName)}.video-review.json`
 			)
@@ -1428,16 +1429,6 @@ function sameReadyVideoMetadata(left: ReadyVideoMetadata, right: ReadyVideoMetad
 		left.timing.lastFrame === right.timing.lastFrame &&
 		left.timing.nominalFrameRate === right.timing.nominalFrameRate
 	)
-}
-
-function downloadBlob(blob: Blob, fileName: string) {
-	const url = URL.createObjectURL(blob)
-	const anchor = document.createElement('a')
-	anchor.download = fileName
-	anchor.href = url
-	anchor.rel = 'noopener'
-	anchor.click()
-	setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 function videoErrorMessage(error: unknown) {

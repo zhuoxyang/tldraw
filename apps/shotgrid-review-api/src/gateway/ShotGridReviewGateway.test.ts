@@ -99,7 +99,7 @@ describe('ShotGridReviewGateway', () => {
 				id: 101,
 				name: 'Northstar',
 				statusCode: 'act',
-				thumbnailUrl: 'https://media.example.com/project.jpg',
+				thumbnailUrl: null,
 			},
 		])
 		await expect(gateway.listPlaylists(101)).resolves.toEqual([
@@ -173,6 +173,96 @@ describe('ShotGridReviewGateway', () => {
 		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_task')
 		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_first_frame')
 		expect(request.mock.calls[4][1]?.query?.fields).toContain('sg_last_frame')
+	})
+
+	test('filters projects and rejects a disallowed project before an upstream lookup', async () => {
+		const request = vi.fn().mockResolvedValueOnce({
+			data: [
+				{
+					attributes: { image: 'https://signed.example/one', name: 'One' },
+					id: 101,
+					type: 'Project',
+				},
+				{
+					attributes: { image: 'https://signed.example/two', name: 'Two' },
+					id: 202,
+					type: 'Project',
+				},
+			],
+		})
+		const gateway = makeGateway(request, config, undefined, { allowedProjectIds: [101] })
+
+		await expect(gateway.listProjects()).resolves.toEqual([
+			{ id: 101, name: 'One', statusCode: null, thumbnailUrl: null },
+		])
+		await expect(gateway.listPlaylists(202)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+		expect(request).toHaveBeenCalledOnce()
+	})
+
+	test('rejects a Playlist outside the project allowlist before reading its Version', async () => {
+		const request = vi.fn().mockResolvedValueOnce({
+			data: {
+				id: 201,
+				relationships: { project: { data: { id: 202, type: 'Project' } } },
+				type: 'Playlist',
+			},
+		})
+		const gateway = makeGateway(request, config, undefined, { allowedProjectIds: [101] })
+
+		await expect(gateway.getVersion(201, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
+		expect(request).toHaveBeenCalledOnce()
+	})
+
+	test('rejects a Playlist search result whose Project differs from the authorized query', async () => {
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({ data: { id: 101, type: 'Project' } })
+			.mockResolvedValueOnce({
+				data: [
+					{
+						attributes: { code: 'Wrong project' },
+						id: 201,
+						relationships: {
+							project: { data: { id: 202, type: 'Project' } },
+							versions: { data: [] },
+						},
+						type: 'Playlist',
+					},
+				],
+			})
+		const gateway = makeGateway(request, config, undefined, { allowedProjectIds: [101] })
+
+		await expect(gateway.listPlaylists(101)).rejects.toMatchObject({
+			code: 'SHOTGRID_INVALID_RESPONSE',
+			status: 502,
+		})
+	})
+
+	test('rejects a Version whose Project differs from its authorized Playlist', async () => {
+		const version = makeVersionResponse('https://media.example/review.mp4')
+		version.data.relationships.project.data.id = 202
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce({
+				data: {
+					id: 201,
+					relationships: { project: { data: { id: 101, type: 'Project' } } },
+					type: 'Playlist',
+				},
+			})
+			.mockResolvedValueOnce(version)
+		const gateway = makeGateway(request, config, undefined, { allowedProjectIds: [101] })
+
+		await expect(gateway.getVersion(201, 301)).rejects.toMatchObject({
+			code: 'NOT_FOUND',
+			status: 404,
+		})
 	})
 
 	test('re-reads a selected version to refresh Attachment identity and map standard context', async () => {
@@ -2391,7 +2481,11 @@ function makeGateway(
 	request: ReturnType<typeof vi.fn>,
 	connectionConfig = config,
 	uploadFetch?: typeof fetch,
-	options: { maxVideoResponseBytes?: number; videoTransferTimeoutMs?: number } = {}
+	options: {
+		allowedProjectIds?: readonly number[]
+		maxVideoResponseBytes?: number
+		videoTransferTimeoutMs?: number
+	} = {}
 ) {
 	const client = { request } as unknown as Pick<ShotGridClient, 'request'>
 	return new ShotGridReviewGateway(client, connectionConfig, {
