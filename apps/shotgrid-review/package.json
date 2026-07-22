@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "vite --host 127.0.0.1 --port 5430",
 		"build": "yarn run -T tsgo --build tsconfig.json && vite build",
+		"e2e": "playwright test --config=e2e/playwright.config.ts",
 		"lint": "yarn run -T tsx ../../internal/scripts/lint.ts",
 		"test": "yarn run -T vitest run"
 	},
@@ -17,6 +18,7 @@
 		"tldraw": "workspace:*"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.61.0",
 		"@types/node": "^22.15.31",
 		"@types/react": "^19.2.7",
 		"@types/react-dom": "^19.2.3",

@@ -24,6 +24,7 @@ const DEFAULT_AUDIT_MAX_ENTRIES = 100_000
 const DEFAULT_COLLABORATION_MAX_ROOMS = 100
 const DEFAULT_COLLABORATION_MAX_SESSIONS_PER_ROOM = 16
 const DEFAULT_MOCK_COLLABORATION_SECRET = 'local-development-only-review-sync-secret'
+const DEFAULT_MOCK_METRICS_TOKEN = 'local-development-only-review-metrics-token'
 const DEFAULT_MOCK_WEBHOOK_SECRET = 'local-development-only-shotgrid-webhook-secret'
 const DEFAULT_MOCK_WEBHOOK_ID = '00000000-0000-4000-8000-000000000011'
 const DEFAULT_MOCK_WEBHOOK_SITE_URL = 'https://mock.shotgrid.invalid'
@@ -63,6 +64,7 @@ interface GatewayConfigBase {
 	collaborationStoreDir: string
 	decisions: ReviewDecisionOption[]
 	eventSync: ShotGridEventSyncConfig
+	metricsToken: string
 }
 
 export type GatewayConfig = GatewayConfigBase &
@@ -378,6 +380,11 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 				),
 				webhookIds: parseWebhookIds(environment.SHOTGRID_WEBHOOK_IDS || DEFAULT_MOCK_WEBHOOK_ID),
 			},
+			metricsToken: parseBoundedPlainValue(
+				environment.REVIEW_METRICS_TOKEN || DEFAULT_MOCK_METRICS_TOKEN,
+				'REVIEW_METRICS_TOKEN',
+				{ maximumLength: 1024, minimumLength: 32 }
+			),
 		}
 	}
 
@@ -393,6 +400,11 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 	const trustedProxyToken = parseBoundedPlainValue(
 		readRequired(environment, 'REVIEW_API_TRUSTED_PROXY_TOKEN'),
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
+		{ maximumLength: 1024, minimumLength: 32 }
+	)
+	const metricsToken = parseBoundedPlainValue(
+		readRequired(environment, 'REVIEW_METRICS_TOKEN'),
+		'REVIEW_METRICS_TOKEN',
 		{ maximumLength: 1024, minimumLength: 32 }
 	)
 	const collaborationSecret = parseBoundedPlainValue(
@@ -488,6 +500,7 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		collaborationStoreDir,
 		decisions,
 		eventSync,
+		metricsToken,
 		publicationMaxJournalBytes,
 		publicationMaxJournalCount,
 		publicationStoreDir,

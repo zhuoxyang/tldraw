@@ -21,6 +21,7 @@ const EVENT_SYNC_SECRET = 'event-sync-http-test-secret-with-32-characters'
 const SITE_URL = 'https://studio.example.test'
 const TEMP_DIRECTORY_PREFIX = join(tmpdir(), 'tldraw-shotgrid-event-sync-http-')
 const TRUSTED_PROXY_TOKEN = 'event-sync-http-test-proxy-token-with-32-characters'
+const METRICS_TOKEN = 'event-sync-http-test-metrics-token-with-32-characters'
 const FIXED_ACTOR_SUBJECT = 'oidc:test:event-sync-reviewer'
 const WEBHOOK_ID = '11111111-1111-4111-8111-111111111111'
 
@@ -237,6 +238,7 @@ async function startHarness(
 		gateway: new MockReviewGateway(),
 		fixedActorSubject: FIXED_ACTOR_SUBJECT,
 		logger: { error: vi.fn() },
+		metricsToken: METRICS_TOKEN,
 		mode: 'shotgrid',
 		publicationDeploymentScope: SITE_URL,
 		publicationStore: new InMemoryReviewPublicationStore(),

@@ -1,0 +1,286 @@
+name: shotgrid-review-pilot
+
+x-snapshot-tool: &snapshot-tool
+  build:
+    context: ../../..
+    dockerfile: apps/shotgrid-review/deploy/Dockerfile
+    target: api
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+  image: ${REVIEW_API_IMAGE:-shotgrid-review-api:pilot}
+  user: '10001:10001'
+  entrypoint: ['/usr/local/bin/review-snapshot-entrypoint']
+  cap_drop: [ALL]
+  network_mode: none
+  pids_limit: 64
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+
+services:
+  data-init:
+    image: ${ALPINE_IMAGE:-alpine:3.21}
+    user: '0:0'
+    entrypoint: ['/bin/sh', '-eu', '-c']
+    command:
+      - |
+        mkdir -p \
+          /var/lib/shotgrid-review/audit \
+          /var/lib/shotgrid-review/events \
+          /var/lib/shotgrid-review/publications \
+          /var/lib/shotgrid-review/sync
+        chown 10001:10001 /var/lib
+        chown -R 10001:10001 /var/lib/shotgrid-review
+        chmod 0700 \
+          /var/lib \
+          /var/lib/shotgrid-review \
+          /var/lib/shotgrid-review/audit \
+          /var/lib/shotgrid-review/events \
+          /var/lib/shotgrid-review/publications \
+          /var/lib/shotgrid-review/sync
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - review-data:/var/lib
+
+  api:
+    container_name: shotgrid-review-api
+    build:
+      context: ../../..
+      dockerfile: apps/shotgrid-review/deploy/Dockerfile
+      target: api
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+    image: ${REVIEW_API_IMAGE:-shotgrid-review-api:pilot}
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    cap_drop: [ALL]
+    environment:
+      NODE_ENV: production
+      REVIEW_API_HOST: 0.0.0.0
+      REVIEW_API_PORT: '5431'
+      REVIEW_APP_ORIGIN: ${REVIEW_APP_ORIGIN:?Set the public HTTPS review origin}
+      REVIEW_FIXED_ACTOR_SUBJECT: ${REVIEW_FIXED_ACTOR_SUBJECT:?Set the approved fixed pilot subject}
+      SHOTGRID_GATEWAY_MODE: shotgrid
+      SHOTGRID_MAX_RETRIES: ${SHOTGRID_MAX_RETRIES:-2}
+      SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES: ${SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES:-100000}
+      SHOTGRID_REVIEW_AUDIT_STORE_DIR: /var/lib/shotgrid-review/audit
+      SHOTGRID_REVIEW_DECISIONS_JSON: ${SHOTGRID_REVIEW_DECISIONS_JSON:?Set the approved decision mappings}
+      SHOTGRID_REVIEW_EVENT_STORE_DIR: /var/lib/shotgrid-review/events
+      SHOTGRID_REVIEW_PROJECT_IDS: ${SHOTGRID_REVIEW_PROJECT_IDS:?Set the pilot project allowlist}
+      SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS: ${SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS:-10000}
+      SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES: ${SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES:-4194304}
+      SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: /var/lib/shotgrid-review/publications
+      SHOTGRID_REVIEW_SYNC_MAX_ROOMS: ${SHOTGRID_REVIEW_SYNC_MAX_ROOMS:-100}
+      SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM: ${SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM:-16}
+      SHOTGRID_REVIEW_SYNC_STORE_DIR: /var/lib/shotgrid-review/sync
+      SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE: ${SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE:-unknown}
+      SHOTGRID_SCRIPT_NAME: ${SHOTGRID_SCRIPT_NAME:?Set the dedicated ShotGrid script name}
+      SHOTGRID_SITE_URL: ${SHOTGRID_SITE_URL:?Set the canonical ShotGrid HTTPS origin}
+      SHOTGRID_SUDO_AS_LOGIN: ${SHOTGRID_SUDO_AS_LOGIN:?Set the approved pilot operator login}
+      SHOTGRID_TIMEOUT_MS: ${SHOTGRID_TIMEOUT_MS:-10000}
+      SHOTGRID_WEBHOOK_IDS: ${SHOTGRID_WEBHOOK_IDS:?Set the ShotGrid webhook UUID allowlist}
+      SHOTGRID_WEBHOOK_PROJECT_IDS: ${SHOTGRID_WEBHOOK_PROJECT_IDS:?Set the webhook project allowlist}
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:5431/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    init: true
+    networks: [review-backend]
+    pids_limit: 256
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - source: review-metrics-token
+        target: review_metrics_token
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: review-proxy-token
+        target: review_proxy_token
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: review-sync-secret
+        target: review_sync_secret
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: shotgrid-script-key
+        target: shotgrid_script_key
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: shotgrid-webhook-secret
+        target: shotgrid_webhook_secret
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+    stop_grace_period: 45s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - review-data:/var/lib
+
+  gateway:
+    container_name: shotgrid-review-gateway
+    build:
+      context: ../../..
+      dockerfile: apps/shotgrid-review/deploy/Dockerfile
+      target: gateway
+      args:
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginxinc/nginx-unprivileged:stable-alpine}
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+        VITE_REVIEW_STORAGE_NAMESPACE: ${VITE_REVIEW_STORAGE_NAMESPACE:?Set a stable non-secret browser storage namespace}
+        VITE_TLDRAW_LICENSE_KEY: ${VITE_TLDRAW_LICENSE_KEY:?Set the approved tldraw production license key}
+    image: ${REVIEW_GATEWAY_IMAGE:-shotgrid-review-gateway:pilot}
+    depends_on:
+      api:
+        condition: service_healthy
+    cap_drop: [ALL]
+    environment:
+      REVIEW_FIXED_ACTOR_SUBJECT: ${REVIEW_FIXED_ACTOR_SUBJECT:?Set the approved fixed pilot subject}
+      REVIEW_FORWARD_AUTH_UPSTREAM: ${REVIEW_FORWARD_AUTH_UPSTREAM:?Set the forward-auth verification URL}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -T 5 -O /dev/null http://127.0.0.1:8080/api/health || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+    init: true
+    networks: [review-backend]
+    pids_limit: 128
+    ports:
+      - ${REVIEW_BIND_ADDRESS:-127.0.0.1}:${REVIEW_PORT:-8080}:8080
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - source: review-proxy-token
+        target: review_proxy_token
+        uid: '101'
+        gid: '101'
+        mode: 0400
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0700
+
+  # Offline backup sequence:
+  #   docker compose stop gateway api
+  #   docker compose --profile backup run --rm --build snapshot-backup backup --source /var/lib/shotgrid-review --snapshot /var/backups/shotgrid-review/<snapshot-name> --confirm-api-stopped
+  #   docker compose --profile backup run --rm snapshot-verify verify --snapshot /var/backups/shotgrid-review/<snapshot-name>
+  snapshot-backup-init:
+    profiles: [backup]
+    image: ${ALPINE_IMAGE:-alpine:3.21}
+    user: '0:0'
+    entrypoint: ['/bin/sh', '-eu', '-c']
+    command:
+      - |
+        mkdir -p /var/backups/shotgrid-review
+        chown 10001:10001 /var/backups /var/backups/shotgrid-review
+        chmod 0700 /var/backups /var/backups/shotgrid-review
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - review-backups:/var/backups
+
+  snapshot-backup:
+    <<: *snapshot-tool
+    profiles: [backup]
+    depends_on:
+      snapshot-backup-init:
+        condition: service_completed_successfully
+    volumes:
+      - review-data:/var/lib:ro
+      - review-backups:/var/backups
+
+  snapshot-verify:
+    <<: *snapshot-tool
+    profiles: [backup]
+    depends_on:
+      snapshot-backup-init:
+        condition: service_completed_successfully
+    volumes:
+      - review-backups:/var/backups:ro
+
+  # Offline restore sequence (REVIEW_RESTORE_VOLUME must name a new volume):
+  #   docker compose stop gateway api
+  #   docker compose --profile restore run --rm --build snapshot-restore restore --snapshot /var/backups/shotgrid-review/<snapshot-name> --target /var/lib/shotgrid-review --confirm-api-stopped
+  # Promote only after verification by setting REVIEW_DATA_VOLUME to the same new restore volume.
+  snapshot-restore-init:
+    profiles: [restore]
+    image: ${ALPINE_IMAGE:-alpine:3.21}
+    user: '0:0'
+    entrypoint: ['/bin/sh', '-eu', '-c']
+    command:
+      - |
+        test ! -e /var/lib/shotgrid-review
+        chown 10001:10001 /var/lib
+        chmod 0700 /var/lib
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - review-restore-data:/var/lib
+
+  snapshot-restore:
+    <<: *snapshot-tool
+    profiles: [restore]
+    depends_on:
+      snapshot-restore-init:
+        condition: service_completed_successfully
+    volumes:
+      - review-backups:/var/backups:ro
+      - review-restore-data:/var/lib
+
+networks:
+  review-backend:
+    name: ${REVIEW_NETWORK_NAME:-shotgrid-review-backend}
+
+volumes:
+  review-data:
+    name: ${REVIEW_DATA_VOLUME:-shotgrid-review-data}
+  review-backups:
+    name: ${REVIEW_BACKUP_VOLUME:-shotgrid-review-backups}
+  review-restore-data:
+    name: ${REVIEW_RESTORE_VOLUME:-shotgrid-review-restore-staging}
+
+secrets:
+  review-metrics-token:
+    environment: REVIEW_METRICS_TOKEN
+  review-proxy-token:
+    environment: REVIEW_API_TRUSTED_PROXY_TOKEN
+  review-sync-secret:
+    environment: REVIEW_SYNC_SECRET
+  shotgrid-script-key:
+    environment: SHOTGRID_SCRIPT_KEY
+  shotgrid-webhook-secret:
+    environment: SHOTGRID_WEBHOOK_SECRET

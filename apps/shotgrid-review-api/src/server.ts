@@ -9,10 +9,12 @@ import {
 	FileReviewPublicationStore,
 	InMemoryReviewPublicationStore,
 } from './http/ReviewPublicationStore'
+import { JsonReviewLogger } from './observability/ReviewObservability'
 import { ShotGridClient } from './shotgrid/ShotGridClient'
 import { ShotGridEventSyncService } from './webhooks/ShotGridEventSyncService'
 
 const config = parseGatewayConfig()
+const logger = new JsonReviewLogger()
 let gateway: ReviewGateway
 const auditStore =
 	config.mode === 'shotgrid'
@@ -55,8 +57,20 @@ const server = createReviewApiServer({
 	decisions: config.decisions,
 	eventSync,
 	gateway,
+	logger,
+	metricsToken: config.metricsToken,
 	mode: config.mode,
 	publicationStore,
+	...(config.mode === 'shotgrid'
+		? {
+				storeDirectories: {
+					audit: config.auditStoreDir,
+					events: config.eventSync.storeDir,
+					publications: config.publicationStoreDir,
+					sync: config.collaborationStoreDir,
+				},
+			}
+		: undefined),
 	...(config.mode === 'shotgrid'
 		? {
 				fixedActorSubject: config.fixedActorSubject,
@@ -71,19 +85,18 @@ const server = createReviewApiServer({
 })
 
 server.listen(config.port, config.host, () => {
-	process.stdout.write(
-		`ShotGrid review API listening on http://${config.host}:${config.port} (${config.mode} mode)\n`
-	)
+	logger.lifecycle('server_listening', { mode: config.mode, port: config.port })
 })
 
 function requestShutdown(signal: 'SIGINT' | 'SIGTERM') {
-	process.stdout.write(`ShotGrid review API received ${signal}; closing active review rooms\n`)
+	logger.lifecycle('shutdown_requested', { mode: config.mode, port: config.port, signal })
 	server.close((error) => {
 		if (!error) {
 			if (auditStore instanceof SqliteReviewAuditStore) auditStore.close()
+			logger.lifecycle('shutdown_complete', { mode: config.mode, port: config.port, signal })
 			return
 		}
-		process.stderr.write('ShotGrid review API could not shut down cleanly\n')
+		logger.lifecycle('shutdown_failed', { mode: config.mode, port: config.port, signal })
 		process.exitCode = 1
 	})
 }

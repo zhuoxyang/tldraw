@@ -127,6 +127,7 @@ export interface ReviewAnnotationEditorProps {
 	externalChangeRevision?: number
 	licenseKey?: string
 	media: ReviewImageMedia
+	onEditorMount?(editor: Editor): void
 	persistenceKey?: string
 	playlistId: number
 	projectId: number
@@ -245,6 +246,7 @@ function ReadyReviewAnnotationEditor({
 	externalChangeRevision = 0,
 	image,
 	licenseKey,
+	onEditorMount,
 	persistenceKey,
 	playlistId,
 	projectId,
@@ -291,10 +293,14 @@ function ReadyReviewAnnotationEditor({
 		}),
 		[image]
 	)
-	const handleMount = useCallback((mountedEditor: Editor) => {
-		disableReviewExternalContent(mountedEditor)
-		setEditor(mountedEditor)
-	}, [])
+	const handleMount = useCallback(
+		(mountedEditor: Editor) => {
+			disableReviewExternalContent(mountedEditor)
+			setEditor(mountedEditor)
+			onEditorMount?.(mountedEditor)
+		},
+		[onEditorMount]
+	)
 
 	useEffect(() => {
 		if (!editor) return

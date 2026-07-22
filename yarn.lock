@@ -30076,6 +30076,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "shotgrid-review@workspace:apps/shotgrid-review"
   dependencies:
+    "@playwright/test": "npm:^1.61.0"
     "@tldraw/shotgrid-review-contracts": "workspace:*"
     "@tldraw/sync": "workspace:*"
     "@types/node": "npm:^22.15.31"

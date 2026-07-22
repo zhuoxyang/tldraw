@@ -23,6 +23,7 @@ const LIVE_ENVIRONMENT = {
 	SHOTGRID_WEBHOOK_SECRET: 'shotgrid-webhook-secret-with-32-characters',
 	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
 	REVIEW_FIXED_ACTOR_SUBJECT: 'oidc:studio:reviewer-123',
+	REVIEW_METRICS_TOKEN: 'metrics-token-with-at-least-32-characters',
 	REVIEW_SYNC_SECRET: 'review-sync-secret-with-at-least-32-characters',
 } as const
 
@@ -62,6 +63,7 @@ describe('parseGatewayConfig', () => {
 					statusCode: 'rev',
 				},
 			],
+			metricsToken: 'local-development-only-review-metrics-token',
 			eventSync: {
 				allowedProjectIds: [101, 102],
 				secret: 'local-development-only-shotgrid-webhook-secret',
@@ -97,6 +99,7 @@ describe('parseGatewayConfig', () => {
 			collaborationSecret: 'review-sync-secret-with-at-least-32-characters',
 			collaborationStoreDir: SYNC_STORE_DIR,
 			decisions: [],
+			metricsToken: 'metrics-token-with-at-least-32-characters',
 			eventSync: {
 				allowedProjectIds: [101, 202],
 				secret: 'shotgrid-webhook-secret-with-32-characters',
@@ -194,6 +197,7 @@ describe('parseGatewayConfig', () => {
 		['SHOTGRID_REVIEW_SYNC_MAX_ROOMS', '1001'],
 		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '0'],
 		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '101'],
+		['REVIEW_METRICS_TOKEN', 'short'],
 		['SHOTGRID_WEBHOOK_PROJECT_IDS', '0'],
 		['SHOTGRID_WEBHOOK_PROJECT_IDS', '1,1'],
 		['SHOTGRID_REVIEW_PROJECT_IDS', '1,1'],
@@ -237,6 +241,7 @@ describe('parseGatewayConfig', () => {
 		'SHOTGRID_WEBHOOK_SECRET',
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
 		'REVIEW_FIXED_ACTOR_SUBJECT',
+		'REVIEW_METRICS_TOKEN',
 		'REVIEW_SYNC_SECRET',
 	])('requires %s in ShotGrid mode', (name) => {
 		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
@@ -252,6 +257,7 @@ describe('parseGatewayConfig', () => {
 	it.each([
 		['REVIEW_FIXED_ACTOR_SUBJECT', ' reviewer-123'],
 		['REVIEW_API_TRUSTED_PROXY_TOKEN', `${'x'.repeat(32)} `],
+		['REVIEW_METRICS_TOKEN', `${'x'.repeat(32)} `],
 		['REVIEW_SYNC_SECRET', `${'x'.repeat(32)}\n`],
 		['SHOTGRID_SCRIPT_KEY', ' private-key'],
 	])('rejects unsafe whitespace in %s', (name, value) => {

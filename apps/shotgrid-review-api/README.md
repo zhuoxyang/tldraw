@@ -17,20 +17,21 @@ SHOTGRID_SCRIPT_NAME=review_gateway
 SHOTGRID_SCRIPT_KEY=...
 REVIEW_API_TRUSTED_PROXY_TOKEN=... # at least 32 random characters
 REVIEW_FIXED_ACTOR_SUBJECT=oidc:studio:pilot-reviewer # exact subject injected by the trusted proxy
+REVIEW_METRICS_TOKEN=... # dedicated scrape token, at least 32 random characters
 SHOTGRID_REVIEW_PROJECT_IDS=123,456 # explicit review allowlist; no wildcard
-SHOTGRID_REVIEW_AUDIT_STORE_DIR=/var/lib/shotgrid-review-audit
+SHOTGRID_REVIEW_AUDIT_STORE_DIR=/var/lib/shotgrid-review/audit
 SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES=100000 # optional; each completed mutation uses two entries
-SHOTGRID_REVIEW_PUBLICATION_STORE_DIR=/var/lib/shotgrid-review-publications
+SHOTGRID_REVIEW_PUBLICATION_STORE_DIR=/var/lib/shotgrid-review/publications
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS=10000 # optional
 SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES=4194304 # optional; minimum 1048576
 REVIEW_SYNC_SECRET=... # at least 32 random characters; back up separately and do not rotate casually
-SHOTGRID_REVIEW_SYNC_STORE_DIR=/var/lib/shotgrid-review-sync
+SHOTGRID_REVIEW_SYNC_STORE_DIR=/var/lib/shotgrid-review/sync
 SHOTGRID_REVIEW_SYNC_MAX_ROOMS=100 # optional; active rooms in this process, maximum 1000
 SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM=16 # optional; maximum 100
 SHOTGRID_WEBHOOK_IDS=uuid-for-project,uuid-for-playlist,uuid-for-version,uuid-for-note # allowlist
 SHOTGRID_WEBHOOK_SECRET=... # dedicated secret, at least 32 characters
 SHOTGRID_WEBHOOK_PROJECT_IDS=123,456 # explicit pilot allowlist; no wildcard
-SHOTGRID_REVIEW_EVENT_STORE_DIR=/var/lib/shotgrid-review-events
+SHOTGRID_REVIEW_EVENT_STORE_DIR=/var/lib/shotgrid-review/events
 SHOTGRID_SUDO_AS_LOGIN=reviewer@example.com # optional
 SHOTGRID_REVIEW_DECISIONS_JSON=[{"key":"approve","label":"Approve","statusCode":"apr"},{"key":"needs-changes","label":"Needs changes","statusCode":"chg"}]
 SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE=unknown # constant, variable, or unknown
@@ -262,6 +263,107 @@ Attachment, Version status, and activity data. Treat uncertain dispatch as indet
 automatically replay it. Preserve the database and the incident disposition together until an
 approved retention and archival procedure exists.
 
+## Observability
+
+`GET /api/health` is the public readiness check used by the browser and container. It returns `503`
+when the durable event worker is stopped, faulted, or at capacity. It is not a dependency probe for
+ShotGrid, a filesystem durability test, or an instruction to restart a process merely because a
+queue is full.
+
+`GET /internal/metrics` exposes Prometheus text only when the request supplies the exact
+`X-Review-Metrics-Token` configured by `REVIEW_METRICS_TOKEN`. Use a separate random value; do not
+reuse the browser proxy, collaboration, webhook, or ShotGrid secret. The pilot gateway deliberately
+returns `404` for `/internal/*`, so a scraper must reach the API on the private container network.
+The metrics use fixed low-cardinality route/store/state labels and include request count/time,
+in-flight work, process memory, collaboration rooms, event queue/readiness/counters, and free
+bytes/inodes for each durable store. They contain no URL, query, entity id, user, subject, ticket,
+media location, request body, or secret.
+
+The production logger writes one JSON object per line. Request records contain only timestamp,
+level, fixed event and route names, method, status, duration, and generated request id. Error records
+add only the normalized API error code. The Nginx pilot gateway likewise logs a fixed route label,
+method, status, and byte count; it never logs URI, query, remote address, or WebSocket ticket.
+Forward-auth and the external HTTPS ingress need an equivalent redaction policy.
+
+[`prometheus-alerts.yml`](../shotgrid-review/deploy/prometheus-alerts.yml) provides example event
+worker, queue lag, webhook signature, API 5xx, disk, inode, and filesystem-stat alerts. Import and
+route them through the organization's monitored Prometheus stack; the Compose bundle does not
+silently deploy a monitoring system or paging destination. Add the platform's ordinary scrape
+`up`/target-missing alert as well.
+
+## Pilot container deployment and recovery
+
+The platform-neutral single-replica bundle lives in
+[`apps/shotgrid-review/deploy`](../shotgrid-review/deploy). It builds a non-root API image and a
+non-root Nginx image that serves the approved-license frontend and same-origin API. The gateway is
+bound to `127.0.0.1` by default, the API has no host port, roots are read-only, capabilities are
+dropped, and durable state is one exclusive volume under `/var/lib/shotgrid-review`. Do not change
+the API to multiple replicas.
+
+Copy `pilot.env.example` outside the checkout and replace every non-secret placeholder. Before each
+Compose command, use the organization secret manager to inject `SHOTGRID_SCRIPT_KEY`,
+`REVIEW_API_TRUSTED_PROXY_TOKEN`, `REVIEW_SYNC_SECRET`, `SHOTGRID_WEBHOOK_SECRET`, and
+`REVIEW_METRICS_TOKEN` into that Compose process. The environment-backed Compose secret sources
+materialize per-service `/run/secrets` mounts with the declared ownership; the values are not
+service environment entries, build arguments, or image layers. Do not use this bundle with
+`docker stack deploy`, which does not support the environment-backed secret source used here.
+
+The tldraw key and storage namespace are the only frontend build arguments. For a real pilot,
+`NODE_IMAGE`, `NGINX_IMAGE`, and `ALPINE_IMAGE` must reference organization-registry images that
+security has approved and pinned by sha256 digest; the tag-based defaults are only for local
+evaluation. Build and start from the repository root:
+
+```sh
+docker compose --env-file /secure/shotgrid-review/pilot.env \
+  --file apps/shotgrid-review/deploy/compose.yaml up --detach --build
+```
+
+The required external HTTPS/SSO ingress must forward to the loopback gateway. Its forward-auth
+endpoint must return 2xx only for the one approved pilot session and 401/403 otherwise. Browser UI,
+HTTP, SSE, and WebSocket review traffic all pass that check; the public ShotGrid webhook bypasses
+interactive SSO and is authenticated only by the dedicated signed-webhook boundary. Never expose
+the loopback port on a non-loopback interface until that topology and host firewall are reviewed.
+
+All four stores use the fixed `audit/`, `events/`, `publications/`, and `sync/` layout so the bundled
+offline tool can snapshot them together. A backup requires a cleanly stopped gateway/API and a
+unique target name, then an independent verification:
+
+Direct CLI invocation must not use bind mounts, junctions, or other physical aliases to make a
+source and target pass textual/canonical tree-separation checks while referring to the same
+storage. The supported production path is the Compose named-volume workflow below; its snapshot
+entrypoint additionally uses POSIX `test -ef` on the mounted data and backup roots before invoking
+the CLI. Do not bypass that check with custom mounts.
+
+```sh
+docker compose --env-file /secure/shotgrid-review/pilot.env \
+  --file apps/shotgrid-review/deploy/compose.yaml stop gateway api
+docker compose --env-file /secure/shotgrid-review/pilot.env \
+  --file apps/shotgrid-review/deploy/compose.yaml --profile backup run --rm --build \
+  snapshot-backup backup --source /var/lib/shotgrid-review \
+  --snapshot /var/backups/shotgrid-review/2026-07-22T130000Z --confirm-api-stopped
+docker compose --env-file /secure/shotgrid-review/pilot.env \
+  --file apps/shotgrid-review/deploy/compose.yaml --profile backup run --rm \
+  snapshot-verify verify --snapshot /var/backups/shotgrid-review/2026-07-22T130000Z
+```
+
+For disaster recovery, set `REVIEW_RESTORE_VOLUME` to a new, empty volume name. Restore into that
+volume while the API remains stopped, then set `REVIEW_DATA_VOLUME` to the same new name and start
+the stack. Keep the old data volume intact until the restored API passes health, opens an existing
+room, and reconciles audit/publication state:
+
+```sh
+docker compose --env-file /secure/shotgrid-review/pilot.env \
+  --file apps/shotgrid-review/deploy/compose.yaml --profile restore run --rm --build \
+  snapshot-restore restore --snapshot /var/backups/shotgrid-review/2026-07-22T130000Z \
+  --target /var/lib/shotgrid-review --confirm-api-stopped
+```
+
+The CLI creates a versioned manifest with file sizes, modes, and SHA-256 digests, rejects links and
+unexpected layout, verifies before restore, and publishes through a sibling staging directory. It
+does not support hot backup, prove that an operator's stop confirmation is true, provide WORM or
+malicious-administrator protection, define retention, or replace Windows ACL controls. Run the
+restore exercise before pilot traffic, not for the first time during an incident.
+
 ## Production gates
 
 The implemented controls support one fixed-principal, one-process pilot. They do not close these
@@ -286,8 +388,8 @@ Perform these checks in a staging deployment before enabling reviewers:
 
 1. Start the single API replica with the production-style origin, durable directory, and secret.
    Confirm `GET /api/health` returns `{"mode":"shotgrid","status":"ok"}` (or `mock` in a local
-   smoke test). This endpoint proves only that the process is serving requests; it does not probe
-   SQLite durability or an upgraded WebSocket.
+   smoke test). This proves that the process is serving and the durable event worker is ready; it
+   does not probe ShotGrid, filesystem durability, or an upgraded WebSocket.
 2. Through the public same-origin proxy, open the same canonical review URL in two browser sessions
    routed under the one configured fixed pilot subject. Confirm the WebSocket upgrades successfully
    and a human reviewer's annotation appears in the second session without a refresh. Confirm a
