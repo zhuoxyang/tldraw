@@ -1,3 +1,4 @@
+import { InMemoryReviewAuditStore, SqliteReviewAuditStore } from './audit/ReviewAuditStore'
 import { ReviewCollaborationService } from './collaboration/ReviewCollaborationService'
 import { parseGatewayConfig } from './config'
 import { MockReviewGateway } from './gateway/MockReviewGateway'
@@ -13,6 +14,10 @@ import { ShotGridEventSyncService } from './webhooks/ShotGridEventSyncService'
 
 const config = parseGatewayConfig()
 let gateway: ReviewGateway
+const auditStore =
+	config.mode === 'shotgrid'
+		? new SqliteReviewAuditStore(config.auditStoreDir, { maxEntries: config.auditMaxEntries })
+		: new InMemoryReviewAuditStore()
 const publicationStore =
 	config.mode === 'shotgrid'
 		? new FileReviewPublicationStore(config.publicationStoreDir, {
@@ -25,7 +30,9 @@ await publicationStore.initialize()
 if (config.mode === 'shotgrid') {
 	if (!config.shotgrid) throw new Error('ShotGrid configuration is unavailable')
 	const client = new ShotGridClient(config.shotgrid)
-	gateway = new ShotGridReviewGateway(client, config.shotgrid)
+	gateway = new ShotGridReviewGateway(client, config.shotgrid, {
+		allowedProjectIds: config.allowedProjectIds,
+	})
 } else {
 	gateway = new MockReviewGateway()
 }
@@ -43,6 +50,7 @@ const eventSync = new ShotGridEventSyncService(config.eventSync)
 
 const server = createReviewApiServer({
 	allowedOrigin: config.allowedOrigin,
+	auditStore,
 	collaboration,
 	decisions: config.decisions,
 	eventSync,
@@ -51,6 +59,7 @@ const server = createReviewApiServer({
 	publicationStore,
 	...(config.mode === 'shotgrid'
 		? {
+				fixedActorSubject: config.fixedActorSubject,
 				publicationDeploymentScope: config.shotgrid.siteUrl,
 				serviceActorName: config.shotgrid.scriptName,
 				...(config.shotgrid?.sudoAsLogin === undefined
@@ -70,7 +79,10 @@ server.listen(config.port, config.host, () => {
 function requestShutdown(signal: 'SIGINT' | 'SIGTERM') {
 	process.stdout.write(`ShotGrid review API received ${signal}; closing active review rooms\n`)
 	server.close((error) => {
-		if (!error) return
+		if (!error) {
+			if (auditStore instanceof SqliteReviewAuditStore) auditStore.close()
+			return
+		}
 		process.stderr.write('ShotGrid review API could not shut down cleanly\n')
 		process.exitCode = 1
 	})

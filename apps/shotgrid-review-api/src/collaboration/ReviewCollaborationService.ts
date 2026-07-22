@@ -1,6 +1,5 @@
 import { createHmac, randomBytes as nodeRandomBytes } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import {
 	createReviewCollaborationPresence,
@@ -23,6 +22,7 @@ import {
 } from '@tldraw/sync-core'
 import { createTLSchema, defaultShapeSchemas, type TLRecord } from '@tldraw/tlschema'
 import { T } from '@tldraw/validate'
+import { prepareSecureSqliteDatabase, prepareSecureStoreDirectory } from '../storage/SecureStore'
 
 const ROOM_ID_PATTERN = /^r1_[A-Za-z0-9_-]{43}$/
 const TICKET_PATTERN = /^[A-Za-z0-9_-]{43}$/
@@ -32,6 +32,8 @@ const DEFAULT_TICKET_TTL_SECONDS = 60
 const MAX_DEPLOYMENT_SCOPE_LENGTH = 256
 const MAX_SESSION_IDENTIFIER_LENGTH = 256
 const MAX_REVIEW_VIDEO_NAME_LENGTH = 255
+const DEFAULT_PRINCIPAL_ID = 'p1_mock-local-reviewer'
+const PRINCIPAL_ID_PATTERN = /^p1_[A-Za-z0-9_-]{1,128}$/
 export const REVIEW_SYNC_MAX_MESSAGE_SIZE_BYTES = 1024 * 1024
 export const REVIEW_SYNC_MAX_MESSAGE_CHUNKS = 1024
 
@@ -93,6 +95,7 @@ export interface ReviewSocketAuthorization {
 	media: { attachmentId: number; kind: 'video' } | { kind: 'image' } | { kind: 'none' }
 	permission: ReviewCollaborationPermission
 	playlistId: number
+	principalId: string
 	presence: ReviewCollaborationPresence
 	projectId: number
 	reservedSourceIds: ReviewReservedSourceIds
@@ -201,18 +204,29 @@ export class ReviewCollaborationService {
 		this.now = options.now ?? Date.now
 		this.randomBytes = options.randomBytes ?? nodeRandomBytes
 		this.secret = options.secret
-		this.storeDir = options.storeDir
 		this.ticketTtlMs = ticketTtlSeconds * 1_000
 
 		this.readNow()
-
-		mkdirSync(this.storeDir, { recursive: true })
+		try {
+			this.storeDir = prepareSecureStoreDirectory(options.storeDir)
+		} catch (error) {
+			throw configurationError('The collaboration store directory is unavailable.', {
+				cause: error,
+			})
+		}
 	}
 
-	async createSession(playlistId: number, versionId: number): Promise<ReviewCollaborationSession> {
+	async createSession(
+		playlistId: number,
+		versionId: number,
+		principalId = DEFAULT_PRINCIPAL_ID
+	): Promise<ReviewCollaborationSession> {
 		this.assertOpen()
 		assertPositiveEntityId(playlistId, 'playlistId')
 		assertPositiveEntityId(versionId, 'versionId')
+		if (!PRINCIPAL_ID_PATTERN.test(principalId)) {
+			throw new ReviewCollaborationError('UNAUTHORIZED', 'The review principal is invalid.')
+		}
 
 		const version = await this.gateway.getVersion(playlistId, versionId)
 		if (
@@ -246,6 +260,7 @@ export class ReviewCollaborationService {
 			media: getMediaIdentity(version),
 			permission,
 			playlistId,
+			principalId,
 			presence,
 			projectId: version.projectId,
 			reservedSourceIds: createReviewReservedSourceIds(versionId),
@@ -262,7 +277,11 @@ export class ReviewCollaborationService {
 		}
 	}
 
-	consumeSocketTicket(roomId: string, ticket: string): ReviewSocketAuthorization {
+	consumeSocketTicket(
+		roomId: string,
+		ticket: string,
+		principalId = DEFAULT_PRINCIPAL_ID
+	): ReviewSocketAuthorization {
 		this.assertOpen()
 		if (!ROOM_ID_PATTERN.test(roomId) || !TICKET_PATTERN.test(ticket)) {
 			throw unauthorizedTicket()
@@ -272,7 +291,12 @@ export class ReviewCollaborationService {
 		this.pruneExpiredAuthorizationState(now)
 		const digest = this.digestTicket(ticket)
 		const pending = this.pendingTickets.get(digest)
-		if (!pending || pending.roomId !== roomId || pending.expiresAt <= now) {
+		if (
+			!pending ||
+			pending.roomId !== roomId ||
+			pending.principalId !== principalId ||
+			pending.expiresAt <= now
+		) {
 			throw unauthorizedTicket()
 		}
 
@@ -282,6 +306,7 @@ export class ReviewCollaborationService {
 			media: Object.freeze({ ...pending.media }),
 			permission: pending.permission,
 			playlistId: pending.playlistId,
+			principalId: pending.principalId,
 			presence: Object.freeze({ ...pending.presence }),
 			projectId: pending.projectId,
 			reservedSourceIds: Object.freeze({ ...pending.reservedSourceIds }),
@@ -290,6 +315,35 @@ export class ReviewCollaborationService {
 		}) satisfies ReviewSocketAuthorization
 		this.issuedAuthorizations.set(authorization, pending.expiresAt)
 		return authorization
+	}
+
+	async reauthorizeSocket(authorization: ReviewSocketAuthorization): Promise<void> {
+		this.assertOpen()
+		if (!PRINCIPAL_ID_PATTERN.test(authorization.principalId)) throw unauthorizedTicket()
+		let version: ReviewVersion
+		let reviewer: ReviewUser
+		try {
+			;[version, reviewer] = await Promise.all([
+				this.gateway.getVersion(authorization.playlistId, authorization.versionId),
+				this.gateway.getCurrentReviewer(),
+			])
+		} catch {
+			throw unauthorizedTicket()
+		}
+		const presence = createReviewCollaborationPresence(reviewer)
+		const permission: ReviewCollaborationPermission =
+			reviewer.kind === 'human' ? 'editor' : 'viewer'
+		if (
+			version.projectId !== authorization.projectId ||
+			version.playlistId !== authorization.playlistId ||
+			version.id !== authorization.versionId ||
+			this.createRoomId(version) !== authorization.roomId ||
+			JSON.stringify(getMediaIdentity(version)) !== JSON.stringify(authorization.media) ||
+			permission !== authorization.permission ||
+			presence.userId !== authorization.presence.userId
+		) {
+			throw unauthorizedTicket()
+		}
 	}
 
 	connectSocket(
@@ -304,6 +358,7 @@ export class ReviewCollaborationService {
 		}
 		if (
 			!ROOM_ID_PATTERN.test(authorization.roomId) ||
+			!PRINCIPAL_ID_PATTERN.test(authorization.principalId) ||
 			!isBoundedPlainString(sessionId, MAX_SESSION_IDENTIFIER_LENGTH) ||
 			!isBoundedPlainString(storeId, MAX_SESSION_IDENTIFIER_LENGTH)
 		) {
@@ -456,9 +511,16 @@ export class ReviewCollaborationService {
 		if (!ROOM_ID_PATTERN.test(roomId)) {
 			throw new ReviewCollaborationError('INVALID_REQUEST', 'The collaboration room id is invalid.')
 		}
-		const database = new DatabaseSync(join(this.storeDir, `${roomId}.sqlite`))
+		let secureDatabase: ReturnType<typeof prepareSecureSqliteDatabase>
+		try {
+			secureDatabase = prepareSecureSqliteDatabase(this.storeDir, `${roomId}.sqlite`)
+		} catch (error) {
+			throw configurationError('The collaboration store is unavailable.', { cause: error })
+		}
+		const database = new DatabaseSync(secureDatabase.path)
 		let room: TLSocketRoom<TLRecord, ReviewSocketSessionMeta> | undefined
 		try {
+			secureDatabase.hardenFiles()
 			database.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;')
 			const sql = new NodeSqliteWrapper(database)
 			const isInitialized = SQLiteSyncStorage.hasBeenInitialized(sql)
@@ -493,6 +555,7 @@ export class ReviewCollaborationService {
 				schema: reviewSyncSchema,
 				storage,
 			})
+			secureDatabase.hardenFiles()
 			const activeRoom = { closed: false, database, room, roomId }
 			this.activeRooms.set(roomId, activeRoom)
 			return activeRoom
@@ -730,8 +793,8 @@ function unauthorizedTicket() {
 	)
 }
 
-function configurationError(message: string) {
-	return new ReviewCollaborationError('CONFIGURATION_ERROR', message)
+function configurationError(message: string, options?: ErrorOptions) {
+	return new ReviewCollaborationError('CONFIGURATION_ERROR', message, options)
 }
 
 function readPositiveLimit(value: number | undefined, fallback: number, label: string) {

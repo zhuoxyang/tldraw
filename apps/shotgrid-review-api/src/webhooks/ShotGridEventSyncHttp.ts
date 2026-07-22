@@ -8,12 +8,26 @@ const MAX_WEBHOOK_HEADER_BYTES = 16 * 1024
 const MAX_CONCURRENT_BODY_READS = 32
 const BODY_READ_TIMEOUT_MS = 3_000
 const HEARTBEAT_INTERVAL_MS = 15_000
+const DEFAULT_MAX_STREAM_LIFETIME_MS = 5 * 60_000
 const JSON_CONTENT_TYPE_PATTERN = /^application\/json(?:\s*;\s*charset=utf-8)?$/i
 
 export class ShotGridEventSyncHttp {
 	private activeBodyReads = 0
+	private readonly maxStreamLifetimeMs: number
 
-	constructor(private readonly service: ShotGridEventSyncService) {}
+	constructor(
+		private readonly service: ShotGridEventSyncService,
+		options: { maxStreamLifetimeMs?: number } = {}
+	) {
+		this.maxStreamLifetimeMs = options.maxStreamLifetimeMs ?? DEFAULT_MAX_STREAM_LIFETIME_MS
+		if (
+			!Number.isSafeInteger(this.maxStreamLifetimeMs) ||
+			this.maxStreamLifetimeMs <= 0 ||
+			this.maxStreamLifetimeMs > 24 * 60 * 60_000
+		) {
+			throw new RangeError('maxStreamLifetimeMs must be a positive integer no greater than one day')
+		}
+	}
 
 	async handleWebhook(request: IncomingMessage, response: ServerResponse) {
 		validateHeaderBounds(request)
@@ -92,18 +106,22 @@ export class ShotGridEventSyncHttp {
 		let closed = false
 		const stream = {
 			heartbeat: undefined as ReturnType<typeof setInterval> | undefined,
+			lifetime: undefined as ReturnType<typeof setTimeout> | undefined,
 			unsubscribe: () => {},
 		}
 		const close = () => {
 			if (closed) return
 			closed = true
 			if (stream.heartbeat) clearInterval(stream.heartbeat)
+			if (stream.lifetime) clearTimeout(stream.lifetime)
 			stream.unsubscribe()
 			if (!response.writableEnded) response.end()
 		}
 		const send = (event: ReturnType<ShotGridEventSyncService['getChangesSince']>[number]) => {
 			if (closed || response.destroyed || response.writableEnded) return false
-			const writable = response.write(`id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`)
+			const writable = response.write(
+				`id: ${event.sequence}\ndata: ${JSON.stringify({ sequence: event.sequence })}\n\n`
+			)
 			if (!writable) {
 				close()
 				return false
@@ -125,6 +143,8 @@ export class ShotGridEventSyncHttp {
 			if (!response.write(': heartbeat\n\n')) close()
 		}, HEARTBEAT_INTERVAL_MS)
 		stream.heartbeat.unref?.()
+		stream.lifetime = setTimeout(close, this.maxStreamLifetimeMs)
+		stream.lifetime.unref?.()
 	}
 }
 

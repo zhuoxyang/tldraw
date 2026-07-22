@@ -7,6 +7,7 @@ import {
 	isReviewCollaborationPresence,
 	isReviewCollaborationSession,
 	isReviewChangeEvent,
+	isReviewChangeNotification,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -91,6 +92,12 @@ describe('review contract runtime guards', () => {
 		]) {
 			expect(isReviewChangeEvent(invalid)).toBe(false)
 		}
+	})
+
+	test('accepts only opaque browser change notifications', () => {
+		expect(isReviewChangeNotification({ sequence: 1 })).toBe(true)
+		expect(isReviewChangeNotification({ sequence: 0 })).toBe(false)
+		expect(isReviewChangeNotification({ projectId: 101, sequence: 1 })).toBe(false)
 	})
 
 	test('accepts only bound collaboration session URLs and canonical expirations', () => {

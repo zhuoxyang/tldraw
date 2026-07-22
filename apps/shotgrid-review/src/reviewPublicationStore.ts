@@ -113,6 +113,15 @@ export interface ReviewPublicationStore {
 	): Promise<StoredReviewPublication>
 }
 
+export interface ClearableReviewPublicationStore extends ReviewPublicationStore {
+	/**
+	 * Removes every locally persisted publication attempt, including records from older review
+	 * namespaces. This is intentionally an explicit user action: pending and indeterminate records
+	 * contain the rendered annotation PNG needed for safe retry and reconciliation.
+	 */
+	clearAll(): Promise<void>
+}
+
 export function createStoredReviewPublication(options: {
 	claim?: ReviewPublicationSendClaim | null
 	documentKey: string
@@ -320,7 +329,7 @@ export function upgradeReviewPublicationDatabase(database: IDBDatabase, oldVersi
 export function createIndexedDbReviewPublicationStore(
 	indexedDb: IDBFactory | undefined = globalThis.indexedDB,
 	now: () => number = Date.now
-): ReviewPublicationStore {
+): ClearableReviewPublicationStore {
 	let databasePromise: Promise<IDBDatabase> | undefined
 	const openDatabase = () => {
 		if (!indexedDb) return Promise.reject(new Error('IndexedDB is unavailable in this browser.'))
@@ -451,6 +460,13 @@ export function createIndexedDbReviewPublicationStore(
 			store.put(claimed)
 			await waitForTransaction(transaction)
 			return { record: claimed, status: 'claimed' }
+		},
+
+		async clearAll() {
+			const database = await openDatabase()
+			const transaction = database.transaction(STORE_NAME, 'readwrite')
+			await waitForRequest(transaction.objectStore(STORE_NAME).clear())
+			await waitForTransaction(transaction)
 		},
 
 		async finishSafeFailure(documentKey, publicationId, generation, claimId) {

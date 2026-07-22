@@ -132,6 +132,41 @@ textarea {
 	font-size: 13px;
 }
 
+.review-local-data {
+	align-items: center;
+	display: flex;
+	gap: 6px;
+}
+
+.review-local-data button {
+	background: transparent;
+	border: 1px solid #40516b;
+	border-radius: 6px;
+	color: #cbd5e1;
+	cursor: pointer;
+	font-size: 11px;
+	padding: 5px 8px;
+}
+
+.review-local-data button:hover:not(:disabled) {
+	border-color: #7dd3fc;
+	color: #e0f2fe;
+}
+
+.review-local-data button:disabled {
+	cursor: wait;
+	opacity: 0.55;
+}
+
+.review-local-data span {
+	color: #94a3b8;
+	font-size: 11px;
+}
+
+.review-local-data [role='alert'] {
+	color: #fecaca;
+}
+
 .review-workspace {
 	display: grid;
 	grid-template-columns: 310px minmax(0, 1fr);

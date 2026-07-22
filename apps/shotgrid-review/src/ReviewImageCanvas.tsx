@@ -48,6 +48,7 @@ import {
 	type ReviewAnnotationSource,
 } from './reviewAnnotationSnapshot'
 import { type ReviewApiClient, ReviewApiClientError } from './reviewApiClient'
+import { downloadReviewBlob } from './reviewBlobDownload'
 import {
 	decodeReviewImageDimensions,
 	digestReviewImage,
@@ -456,7 +457,7 @@ function ReadyReviewAnnotationEditor({
 			assertReviewAnnotationRecords(snapshot, { sourceAssetId: assetId, sourceShapeId: shapeId })
 			const envelope = createReviewAnnotationSnapshot({ review, snapshot, source })
 			const serialized = serializeReviewAnnotationSnapshot(envelope)
-			downloadBlob(
+			downloadReviewBlob(
 				new Blob([serialized], { type: 'application/json' }),
 				`${sanitizeReviewFileNameBase(versionName)}.review.json`
 			)
@@ -508,7 +509,7 @@ function ReadyReviewAnnotationEditor({
 		setOperation({ label: 'Rendering full-resolution PNG', status: 'working' })
 		try {
 			const blob = await renderReviewPng(editor, image)
-			downloadBlob(blob, `${sanitizeReviewFileNameBase(versionName)}.annotated.png`)
+			downloadReviewBlob(blob, `${sanitizeReviewFileNameBase(versionName)}.annotated.png`)
 			setOperation({ message: 'Flattened PNG exported.', status: 'success' })
 		} catch (error) {
 			setOperation({ message: editorErrorMessage(error), status: 'error' })
@@ -1121,18 +1122,6 @@ function ReviewCanvasMessage({
 			) : null}
 		</div>
 	)
-}
-
-function downloadBlob(blob: Blob, fileName: string) {
-	const url = URL.createObjectURL(blob)
-	const link = document.createElement('a')
-	link.download = fileName
-	link.href = url
-	link.style.display = 'none'
-	document.body.appendChild(link)
-	link.click()
-	link.remove()
-	setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 function isCurrentPublicationContext(

@@ -1,6 +1,6 @@
 import {
 	type ReviewCollaborationSession,
-	type ReviewChangeEvent,
+	type ReviewChangeNotification,
 	type ReviewDecisionContext,
 	type ReviewDecisionRequest,
 	type ReviewDecisionResult,
@@ -15,7 +15,7 @@ import {
 	type ReviewVersion,
 	isReviewApiErrorEnvelope,
 	isReviewCollaborationSession,
-	isReviewChangeEvent,
+	isReviewChangeNotification,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -92,7 +92,7 @@ export interface ReviewChangeStreamError {
 }
 
 export interface ReviewChangeObserver {
-	onChange(event: ReviewChangeEvent): void
+	onChange(event: ReviewChangeNotification): void
 	onError?(error: ReviewChangeStreamError): void
 	onStatusChange(status: ReviewChangeStreamStatus): void
 }
@@ -231,7 +231,10 @@ export function createReviewApiClient({
 				} catch {
 					change = undefined
 				}
-				if (!isReviewChangeEvent(change) || message.lastEventId !== String(change.sequence)) {
+				if (
+					!isReviewChangeNotification(change) ||
+					message.lastEventId !== String(change.sequence)
+				) {
 					reportError({
 						code: 'INVALID_EVENT',
 						message: 'The review change stream returned an invalid event.',

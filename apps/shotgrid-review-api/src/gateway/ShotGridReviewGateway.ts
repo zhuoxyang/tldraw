@@ -91,6 +91,7 @@ interface ShotGridActivityStreamResponse {
 }
 
 interface ShotGridReviewGatewayOptions {
+	allowedProjectIds?: readonly number[]
 	fetch?: FetchImplementation
 	maxVideoResponseBytes?: number
 	now?(): number
@@ -147,6 +148,7 @@ const VERSION_FIELDS = [
 export class ShotGridReviewGateway implements ReviewGateway {
 	private activeReviewImageRequests = 0
 	private activeReviewVideoRequests = 0
+	private readonly allowedProjectIds: ReadonlySet<number> | undefined
 	private readonly fetch: FetchImplementation
 	private readonly maxVideoResponseBytes: number
 	private readonly now: () => number
@@ -157,6 +159,18 @@ export class ShotGridReviewGateway implements ReviewGateway {
 		private readonly config: ShotGridConnectionConfig,
 		options: ShotGridReviewGatewayOptions = {}
 	) {
+		if (
+			options.allowedProjectIds !== undefined &&
+			(options.allowedProjectIds.length === 0 ||
+				options.allowedProjectIds.some(
+					(projectId) => !Number.isSafeInteger(projectId) || projectId <= 0
+				) ||
+				new Set(options.allowedProjectIds).size !== options.allowedProjectIds.length)
+		) {
+			throw new RangeError('allowedProjectIds must contain unique positive safe integers')
+		}
+		this.allowedProjectIds =
+			options.allowedProjectIds === undefined ? undefined : new Set(options.allowedProjectIds)
 		this.fetch = options.fetch ?? fetch
 		this.maxVideoResponseBytes =
 			options.maxVideoResponseBytes ?? DEFAULT_MAX_REVIEW_VIDEO_RESPONSE_BYTES
@@ -172,6 +186,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async createNote(request: CreateReviewNoteRequest): Promise<ReviewNote> {
+		this.requireAllowedProject(request.projectId)
 		const version = await this.readEntity('versions', request.versionId, 'Version', ['project'])
 		const versionProject = readRelationship(version.relationships, 'project')
 		if (!versionProject || versionProject.type !== 'Project') throw invalidShotGridResponse()
@@ -182,6 +197,7 @@ export class ShotGridReviewGateway implements ReviewGateway {
 				status: 400,
 			})
 		}
+		this.requireAllowedProject(versionProject.id)
 		const response = await this.client.request<ShotGridRecordResponse>('/entity/notes', {
 			body: {
 				content: request.content,
@@ -387,15 +403,20 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			['name', 'sg_status', 'image'],
 			'name'
 		)
-		return entities.map((entity) => ({
-			id: entity.id,
-			name: readString(entity.attributes, 'name') || `Project ${entity.id}`,
-			statusCode: readNullableString(entity.attributes, 'sg_status'),
-			thumbnailUrl: readNullableUrl(entity.attributes, 'image'),
-		}))
+		return entities
+			.filter((entity) => this.isAllowedProject(entity.id))
+			.map((entity) => ({
+				id: entity.id,
+				name: readString(entity.attributes, 'name') || `Project ${entity.id}`,
+				statusCode: readNullableString(entity.attributes, 'sg_status'),
+				// Upstream image URLs can be signed or session-bearing. Project thumbnails need a
+				// dedicated authorized proxy before they may cross the browser boundary.
+				thumbnailUrl: null,
+			}))
 	}
 
 	async listPlaylists(projectId: number): Promise<ReviewPlaylist[]> {
+		this.requireAllowedProject(projectId)
 		await this.readEntity('projects', projectId, 'Project')
 		const entities = await this.search(
 			'playlists',
@@ -403,18 +424,28 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			['code', 'description', 'project', 'updated_at', 'versions'],
 			'-updated_at'
 		)
-		return entities.map((entity) => ({
-			description: readNullableString(entity.attributes, 'description'),
-			id: entity.id,
-			name: readString(entity.attributes, 'code') || `Playlist ${entity.id}`,
-			projectId,
-			updatedAt: readString(entity.attributes, 'updated_at'),
-			versionCount: readRelationshipList(entity.relationships, 'versions').length,
-		}))
+		return entities.map((entity) => {
+			const entityProject = readRelationship(entity.relationships, 'project')
+			if (
+				(entityProject !== null &&
+					(entityProject.type !== 'Project' || entityProject.id !== projectId)) ||
+				(this.allowedProjectIds !== undefined && entityProject === null)
+			) {
+				throw invalidShotGridResponse()
+			}
+			return {
+				description: readNullableString(entity.attributes, 'description'),
+				id: entity.id,
+				name: readString(entity.attributes, 'code') || `Playlist ${entity.id}`,
+				projectId,
+				updatedAt: readString(entity.attributes, 'updated_at'),
+				versionCount: readRelationshipList(entity.relationships, 'versions').length,
+			}
+		})
 	}
 
 	async listVersions(playlistId: number): Promise<ReviewVersion[]> {
-		await this.readEntity('playlists', playlistId, 'Playlist')
+		const projectId = await this.readPlaylistProjectId(playlistId)
 		const entities = await this.search(
 			'versions',
 			[['playlists', 'in', [{ id: playlistId, type: 'Playlist' }]]],
@@ -422,7 +453,11 @@ export class ShotGridReviewGateway implements ReviewGateway {
 			'code'
 		)
 
-		return entities.map((entity) => mapVersion(entity, playlistId, this.config.frameRateMode))
+		return entities.map((entity) => {
+			const version = mapVersion(entity, playlistId, this.config.frameRateMode)
+			if (projectId !== null && version.projectId !== projectId) throw invalidShotGridResponse()
+			return version
+		})
 	}
 
 	async updateVersionDecision(
@@ -495,6 +530,12 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	async uploadAttachment(request: UploadReviewAttachmentRequest): Promise<ReviewAttachmentResult> {
+		if (this.allowedProjectIds !== undefined) {
+			const note = await this.readEntity('notes', request.noteId, 'Note', ['project'])
+			const noteProject = readRelationship(note.relationships, 'project')
+			if (!noteProject || noteProject.type !== 'Project') throw invalidShotGridResponse()
+			this.requireAllowedProject(noteProject.id)
+		}
 		const uploadPath = `/entity/notes/${request.noteId}/_upload`
 		const completeUploadPath = `/api/v1.1${uploadPath}`
 		const ticketResponse = await this.client.request<UploadTicket>(uploadPath, {
@@ -748,13 +789,39 @@ export class ShotGridReviewGateway implements ReviewGateway {
 	}
 
 	private async readVersionForPlaylist(playlistId: number, versionId: number) {
-		await this.readEntity('playlists', playlistId, 'Playlist')
+		const playlistProjectId = await this.readPlaylistProjectId(playlistId)
 		const entity = await this.readEntity('versions', versionId, 'Version', VERSION_FIELDS)
 		const belongsToPlaylist = readRelationshipList(entity.relationships, 'playlists').some(
 			(playlist) => playlist.type === 'Playlist' && playlist.id === playlistId
 		)
 		if (!belongsToPlaylist) throw reviewItemNotFound()
+		const versionProject = readRelationship(entity.relationships, 'project')
+		if (!versionProject || versionProject.type !== 'Project') throw invalidShotGridResponse()
+		if (playlistProjectId !== null && versionProject.id !== playlistProjectId) {
+			throw reviewItemNotFound()
+		}
+		this.requireAllowedProject(versionProject.id)
 		return entity
+	}
+
+	private async readPlaylistProjectId(playlistId: number) {
+		const playlist = await this.readEntity('playlists', playlistId, 'Playlist', ['project'])
+		const project = readRelationship(playlist.relationships, 'project')
+		if (!project) {
+			if (this.allowedProjectIds === undefined) return null
+			throw invalidShotGridResponse()
+		}
+		if (project.type !== 'Project') throw invalidShotGridResponse()
+		this.requireAllowedProject(project.id)
+		return project.id
+	}
+
+	private isAllowedProject(projectId: number) {
+		return this.allowedProjectIds === undefined || this.allowedProjectIds.has(projectId)
+	}
+
+	private requireAllowedProject(projectId: number) {
+		if (!this.isAllowedProject(projectId)) throw reviewItemNotFound()
 	}
 
 	private async fetchReviewImage(
@@ -1107,7 +1174,9 @@ function requireUploadTicket(value: unknown): UploadTicket {
 
 function mapUser(entity: ShotGridEntity): ReviewUser {
 	return {
-		avatarUrl: readNullableUrl(entity.attributes, 'image'),
+		// HumanUser images are upstream URLs and can be signed or session-bearing. Keep them
+		// server-side until an explicitly authorized avatar proxy exists.
+		avatarUrl: null,
 		id: entity.id,
 		kind: 'human',
 		login: readNullableString(entity.attributes, 'login'),

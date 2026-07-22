@@ -125,6 +125,19 @@ describe('ReviewCollaborationService', () => {
 		).toThrow(expect.objectContaining({ code: 'UNAUTHORIZED' }))
 	})
 
+	it('binds each ticket to the opaque proxy principal without burning a stolen attempt', async () => {
+		const service = createService()
+		const session = await service.createSession(201, 301, 'p1_subject-A')
+		const ticket = readTicket(session.socketUrl)
+
+		expect(() => service.consumeSocketTicket(session.roomId, ticket, 'p1_subject-B')).toThrow(
+			expect.objectContaining({ code: 'UNAUTHORIZED' })
+		)
+		expect(service.consumeSocketTicket(session.roomId, ticket, 'p1_subject-A')).toMatchObject({
+			principalId: 'p1_subject-A',
+		})
+	})
+
 	it('verifies the Version-to-Playlist relationship before reading the reviewer', async () => {
 		const getCurrentReviewer = vi.fn(async () => humanReviewer)
 		const service = createService({
@@ -138,6 +151,28 @@ describe('ReviewCollaborationService', () => {
 			expect.objectContaining({ code: 'NOT_FOUND' })
 		)
 		expect(getCurrentReviewer).not.toHaveBeenCalled()
+	})
+
+	it('reauthorizes the exact reviewer, relationship, and media before socket upgrade', async () => {
+		let currentVersion = versionFixture(201, 301)
+		const service = createService({
+			gateway: {
+				getCurrentReviewer: vi.fn(async () => humanReviewer),
+				getVersion: vi.fn(async () => currentVersion),
+			},
+		})
+		const session = await service.createSession(201, 301, 'p1_subject-A')
+		const authorization = service.consumeSocketTicket(
+			session.roomId,
+			readTicket(session.socketUrl),
+			'p1_subject-A'
+		)
+
+		await expect(service.reauthorizeSocket(authorization)).resolves.toBeUndefined()
+		currentVersion = { ...currentVersion, projectId: 202 }
+		await expect(service.reauthorizeSocket(authorization)).rejects.toMatchObject({
+			code: 'UNAUTHORIZED',
+		})
 	})
 
 	it('grants human reviewers editor access and service identities viewer access', async () => {

@@ -6,6 +6,11 @@ import { inflate } from 'node:zlib'
 import { TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from '@tldraw/sync-core'
 import { WebSocketServer } from 'ws'
 import {
+	InMemoryReviewAuditStore,
+	type ReviewAuditOutcome,
+	type ReviewAuditStore,
+} from '../audit/ReviewAuditStore'
+import {
 	ReviewCollaborationError,
 	REVIEW_SYNC_MAX_MESSAGE_SIZE_BYTES,
 	type ReviewCollaborationService,
@@ -14,8 +19,10 @@ import type {
 	ReviewApiErrorCode,
 	ReviewDecisionOption,
 	ReviewDecisionRequest,
+	ReviewDecisionResult,
 	ReviewHealth,
 	ReviewPublicationRequest,
+	ReviewPublicationResult,
 } from '../contracts'
 import { isReviewDecisionRequest } from '../contracts'
 import { ReviewGatewayError } from '../errors'
@@ -43,6 +50,8 @@ const HEADERS_TIMEOUT_MS = 10_000
 const REQUEST_TIMEOUT_MS = 30_000
 const DEFAULT_VIDEO_DOWNSTREAM_IDLE_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
+const DEFAULT_MAX_SOCKET_LIFETIME_MS = 5 * 60_000
+const MOCK_PRINCIPAL_ID = 'p1_mock-local-reviewer'
 const MUTATION_METHODS = ['POST', 'PUT'] as const
 const inflateAsync = promisify(inflate)
 
@@ -54,12 +63,15 @@ interface SafeLogger {
 
 export interface ReviewApiServerOptions {
 	allowedOrigin: string
+	auditStore?: ReviewAuditStore
 	collaboration?: ReviewCollaborationService
 	decisions?: readonly ReviewDecisionOption[]
 	eventSync?: ShotGridEventSyncService
+	fixedActorSubject?: string
 	gateway: ReviewGateway
 	logger?: SafeLogger
 	maxConcurrentPublications?: number
+	maxSocketLifetimeMs?: number
 	mode: GatewayMode
 	publicationDeploymentScope?: string
 	publicationStore?: ReviewPublicationStore
@@ -72,12 +84,42 @@ export interface ReviewApiServerOptions {
 
 interface RouteMatch {
 	allowedMethods: string[]
-	handle(method: string, request: IncomingMessage, response: ServerResponse): Promise<void>
+	handle(
+		method: string,
+		request: IncomingMessage,
+		response: ServerResponse,
+		context: ReviewRequestContext
+	): Promise<void>
 	requiresHumanReviewer: boolean
 }
 
+interface ReviewRequestContext {
+	principalId: string
+	requestId: string
+}
+
 export function createReviewApiServer(options: ReviewApiServerOptions): Server {
+	if (options.mode === 'shotgrid' && !options.auditStore) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
 	if (options.mode === 'shotgrid' && !options.publicationStore) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
+	if (
+		options.mode === 'shotgrid' &&
+		(!options.fixedActorSubject ||
+			options.fixedActorSubject.trim() !== options.fixedActorSubject ||
+			options.fixedActorSubject.length > 512 ||
+			/\p{Cc}/u.test(options.fixedActorSubject))
+	) {
 		throw new ReviewGatewayError({
 			code: 'CONFIGURATION_ERROR',
 			retryable: false,
@@ -146,7 +188,20 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			status: 500,
 		})
 	}
+	const maxSocketLifetimeMs = options.maxSocketLifetimeMs ?? DEFAULT_MAX_SOCKET_LIFETIME_MS
+	if (
+		!Number.isSafeInteger(maxSocketLifetimeMs) ||
+		maxSocketLifetimeMs <= 0 ||
+		maxSocketLifetimeMs > 24 * 60 * 60_000
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
 	const publications = new ReviewPublicationCoordinator(options.gateway, options.publicationStore)
+	const auditStore = options.auditStore ?? new InMemoryReviewAuditStore()
 	const decisions = new ReviewDecisionCoordinator(
 		options.gateway,
 		options.decisions ??
@@ -179,6 +234,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				url.pathname,
 				options.gateway,
 				options.mode,
+				auditStore,
 				decisions,
 				publications,
 				options.collaboration,
@@ -199,12 +255,11 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				return
 			}
 
-			if (
-				options.mode === 'shotgrid' &&
-				url.pathname.startsWith('/api/review/') &&
-				!authenticateTrustedProxy(request, response, requestId, options)
-			) {
-				return
+			let context: ReviewRequestContext = { principalId: MOCK_PRINCIPAL_ID, requestId }
+			if (options.mode === 'shotgrid' && url.pathname.startsWith('/api/review/')) {
+				const authenticated = authenticateTrustedProxy(request, response, requestId, options)
+				if (!authenticated) return
+				context = authenticated
 			}
 
 			const method = request.method ?? 'GET'
@@ -222,7 +277,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				return
 			}
 
-			await route.handle(method, request, response)
+			await route.handle(method, request, response, context)
 		} catch (error) {
 			const normalized = normalizeError(error)
 			logger.error('Review API request failed', {
@@ -251,7 +306,9 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			options.collaboration,
 			options.allowedOrigin,
 			logger,
-			createRequestId
+			createRequestId,
+			options,
+			maxSocketLifetimeMs
 		)
 	}
 	if (options.eventSync) attachEventSyncShutdown(server, options.eventSync, logger)
@@ -296,7 +353,9 @@ function attachReviewCollaborationWebSocket(
 	collaboration: ReviewCollaborationService,
 	allowedOrigin: string,
 	logger: SafeLogger,
-	createRequestId: () => string
+	createRequestId: () => string,
+	options: ReviewApiServerOptions,
+	maxSocketLifetimeMs: number
 ) {
 	let collaborationClosed = false
 	const closeCollaboration = () => {
@@ -329,6 +388,14 @@ function attachReviewCollaborationWebSocket(
 				rejectWebSocketUpgrade(socket, 400)
 				return
 			}
+			const principalId =
+				options.mode === 'shotgrid'
+					? readTrustedProxyPrincipal(request, options)
+					: MOCK_PRINCIPAL_ID
+			if (!principalId) {
+				rejectWebSocketUpgrade(socket, 401)
+				return
+			}
 
 			const url = parseRequestUrl(request.url)
 			const roomMatch = /^\/api\/review\/sync\/(r1_[A-Za-z0-9_-]{43})$/.exec(url.pathname)
@@ -345,22 +412,46 @@ function attachReviewCollaborationWebSocket(
 				return
 			}
 
-			const authorization = collaboration.consumeSocketTicket(roomMatch[1], ticket)
-			webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-				try {
-					collaboration.connectSocket(authorization, { sessionId, socket: webSocket, storeId })
-				} catch (error) {
-					const reason = collaborationSocketCloseReason(error)
-					webSocket.close(TLSyncErrorCloseEventCode, reason)
+			const authorization = collaboration.consumeSocketTicket(roomMatch[1], ticket, principalId)
+			void collaboration.reauthorizeSocket(authorization).then(
+				() => {
+					if (socket.destroyed) return
+					webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+						try {
+							collaboration.connectSocket(authorization, { sessionId, socket: webSocket, storeId })
+							const authorizationLease = setTimeout(() => {
+								webSocket.close(
+									TLSyncErrorCloseEventCode,
+									TLSyncErrorCloseEventReason.NOT_AUTHENTICATED
+								)
+							}, maxSocketLifetimeMs)
+							authorizationLease.unref?.()
+							webSocket.once('close', () => clearTimeout(authorizationLease))
+						} catch (error) {
+							const reason = collaborationSocketCloseReason(error)
+							webSocket.close(TLSyncErrorCloseEventCode, reason)
+							if (!(error instanceof ReviewCollaborationError)) {
+								logger.error('Review collaboration connection failed', {
+									code: 'INTERNAL_ERROR',
+									requestId,
+									status: 500,
+								})
+							}
+						}
+					})
+				},
+				(error: unknown) => {
+					const status = collaborationUpgradeStatus(error)
+					rejectWebSocketUpgrade(socket, status)
 					if (!(error instanceof ReviewCollaborationError)) {
-						logger.error('Review collaboration connection failed', {
+						logger.error('Review collaboration reauthorization failed', {
 							code: 'INTERNAL_ERROR',
 							requestId,
-							status: 500,
+							status,
 						})
 					}
 				}
-			})
+			)
 		} catch (error) {
 			const status = collaborationUpgradeStatus(error)
 			rejectWebSocketUpgrade(socket, status)
@@ -462,19 +553,30 @@ function authenticateTrustedProxy(
 	requestId: string,
 	options: ReviewApiServerOptions
 ) {
+	const principalId = readTrustedProxyPrincipal(request, options)
+	if (!principalId) {
+		sendError(response, 401, 'AUTHENTICATION_REQUIRED', false, requestId)
+		return undefined
+	}
+
+	return { principalId, requestId }
+}
+
+function readTrustedProxyPrincipal(
+	request: IncomingMessage,
+	options: ReviewApiServerOptions
+): string | undefined {
 	const providedToken = readSingleHeader(request, 'x-review-proxy-token') ?? ''
 	const expectedToken = options.trustedProxyToken ?? ''
 	const tokenMatches = expectedToken.length >= 32 && constantTimeEqual(providedToken, expectedToken)
-	const authenticatedLogin = readSingleHeader(request, 'x-review-authenticated-login')
-	const loginMatches =
-		options.sudoAsLogin === undefined || authenticatedLogin === options.sudoAsLogin
-
-	if (!tokenMatches || !loginMatches) {
-		sendError(response, 401, 'AUTHENTICATION_REQUIRED', false, requestId)
-		return false
-	}
-
-	return true
+	const authenticatedSubject = readSingleHeader(request, 'x-review-authenticated-subject')
+	const expectedSubject = options.fixedActorSubject
+	if (!tokenMatches || !expectedSubject || authenticatedSubject !== expectedSubject)
+		return undefined
+	return `p1_${createHash('sha256')
+		.update('shotgrid-review-principal-v1\0', 'utf8')
+		.update(authenticatedSubject, 'utf8')
+		.digest('base64url')}`
 }
 
 function readSingleHeader(request: IncomingMessage, headerName: string) {
@@ -492,6 +594,7 @@ function matchRoute(
 	pathname: string,
 	gateway: ReviewGateway,
 	mode: GatewayMode,
+	auditStore: ReviewAuditStore,
 	decisions: ReviewDecisionCoordinator,
 	publications: ReviewPublicationCoordinator,
 	collaboration: ReviewCollaborationService | undefined,
@@ -567,12 +670,12 @@ function matchRoute(
 		/^\/api\/review\/playlists\/([^/]+)\/versions\/([^/]+)\/collaboration-session$/
 	)
 	if (collaborationSession.matched && collaboration) {
-		return mutationRoute('POST', async (request) => {
+		return mutationRoute('POST', async (request, context) => {
 			requireEmptyRequestBody(request)
 			const playlistId = requirePositiveId(collaborationSession.firstId, 'playlistId')
 			const versionId = requirePositiveId(collaborationSession.secondId, 'versionId')
 			sendJson(response, 201, {
-				data: await collaboration.createSession(playlistId, versionId),
+				data: await collaboration.createSession(playlistId, versionId, context.principalId),
 			})
 		})
 	}
@@ -688,11 +791,33 @@ function matchRoute(
 	if (decision.matched) {
 		return mutationRoute(
 			'PUT',
-			async (request) => {
+			async (request, context) => {
 				const playlistId = requirePositiveId(decision.firstId, 'playlistId')
 				const versionId = requirePositiveId(decision.secondId, 'versionId')
 				const body = await readJson(request, DECISION_BODY_LIMIT)
-				const result = await decisions.decide(playlistId, versionId, parseDecisionRequest(body))
+				const decisionRequest = parseDecisionRequest(body)
+				const auditAttemptId = await beginMutationAudit({
+					action: 'decision',
+					auditStore,
+					context,
+					gateway,
+					playlistId,
+					versionId,
+				})
+				let result: ReviewDecisionResult
+				try {
+					result = await decisions.decide(playlistId, versionId, decisionRequest)
+				} catch (error) {
+					await auditStore.finish(auditAttemptId, auditFailureOutcome(error))
+					throw error
+				}
+				await auditStore.finish(auditAttemptId, {
+					decisionStatus: result.statusCode,
+					errorCode: null,
+					resultAttachmentId: null,
+					resultNoteId: null,
+					status: 'succeeded',
+				})
 				sendJson(response, 200, { data: result })
 			},
 			true
@@ -703,7 +828,7 @@ function matchRoute(
 	if (publication.matched) {
 		return mutationRoute(
 			'PUT',
-			async (request) => {
+			async (request, context) => {
 				const playlistId = requirePositiveId(publication.playlistId, 'playlistId')
 				const versionId = requirePositiveId(publication.versionId, 'versionId')
 				const publicationId = requirePublicationId(publication.publicationId)
@@ -712,13 +837,34 @@ function matchRoute(
 				try {
 					const body = await readJson(request, PUBLICATION_BODY_LIMIT)
 					const publicationRequest = await parsePublicationRequest(body)
-					const result = await publications.publish(
-						publicationActorScope,
-						publicationId,
+					const auditAttemptId = await beginMutationAudit({
+						action: 'publication',
+						auditStore,
+						context,
+						gateway,
 						playlistId,
 						versionId,
-						publicationRequest
-					)
+					})
+					let result: ReviewPublicationResult
+					try {
+						result = await publications.publish(
+							publicationActorScope,
+							publicationId,
+							playlistId,
+							versionId,
+							publicationRequest
+						)
+					} catch (error) {
+						await auditStore.finish(auditAttemptId, auditFailureOutcome(error))
+						throw error
+					}
+					await auditStore.finish(auditAttemptId, {
+						decisionStatus: null,
+						errorCode: null,
+						resultAttachmentId: result.attachment.id,
+						resultNoteId: result.note.id,
+						status: 'succeeded',
+					})
 					sendJson(response, 200, { data: result })
 				} finally {
 					release()
@@ -731,26 +877,89 @@ function matchRoute(
 	return undefined
 
 	function getRoute(
-		handle: (request: IncomingMessage) => Promise<void>,
+		handle: (request: IncomingMessage, context: ReviewRequestContext) => Promise<void>,
 		requiresHumanReviewer = false
 	): RouteMatch {
 		return {
 			allowedMethods: ['GET'],
-			handle: async (_method, request) => handle(request),
+			handle: async (_method, request, _response, context) => handle(request, context),
 			requiresHumanReviewer,
 		}
 	}
 
 	function mutationRoute(
 		method: (typeof MUTATION_METHODS)[number],
-		handle: (request: IncomingMessage) => Promise<void>,
+		handle: (request: IncomingMessage, context: ReviewRequestContext) => Promise<void>,
 		requiresHumanReviewer = false
 	): RouteMatch {
 		return {
 			allowedMethods: [method],
-			handle: async (_method, request) => handle(request),
+			handle: async (_method, request, _response, context) => handle(request, context),
 			requiresHumanReviewer,
 		}
+	}
+}
+
+async function beginMutationAudit(options: {
+	action: 'decision' | 'publication'
+	auditStore: ReviewAuditStore
+	context: ReviewRequestContext
+	gateway: ReviewGateway
+	playlistId: number
+	versionId: number
+}) {
+	const [version, actor] = await Promise.all([
+		options.gateway.getVersion(options.playlistId, options.versionId),
+		options.gateway.getCurrentReviewer(),
+	])
+	if (
+		version.id !== options.versionId ||
+		version.playlistId !== options.playlistId ||
+		!Number.isSafeInteger(version.projectId) ||
+		version.projectId <= 0
+	) {
+		throw new ReviewGatewayError({
+			code: 'NOT_FOUND',
+			retryable: false,
+			status: 404,
+		})
+	}
+	if (actor.kind === 'human' && (actor.id === null || !Number.isSafeInteger(actor.id))) {
+		throw new ReviewGatewayError({
+			code: 'PERMISSION_DENIED',
+			retryable: false,
+			status: 403,
+		})
+	}
+	return await options.auditStore.begin({
+		action: options.action,
+		effectiveActor: { id: actor.id, kind: actor.kind },
+		playlistId: options.playlistId,
+		principalId: options.context.principalId,
+		projectId: version.projectId,
+		requestId: options.context.requestId,
+		versionId: options.versionId,
+	})
+}
+
+function auditFailureOutcome(error: unknown): ReviewAuditOutcome {
+	const normalized = normalizeError(error)
+	const indeterminate =
+		normalized.code === 'DECISION_INDETERMINATE' ||
+		normalized.code === 'PUBLICATION_INCOMPLETE' ||
+		normalized.code === 'PUBLICATION_INDETERMINATE'
+	return {
+		decisionStatus: null,
+		errorCode: normalized.code,
+		resultAttachmentId:
+			normalized.publication && 'attachmentId' in normalized.publication
+				? (normalized.publication.attachmentId ?? null)
+				: null,
+		resultNoteId:
+			normalized.publication && 'noteId' in normalized.publication
+				? normalized.publication.noteId
+				: null,
+		status: indeterminate ? 'indeterminate' : 'failed',
 	}
 }
 

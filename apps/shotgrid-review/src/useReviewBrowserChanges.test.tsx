@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import type {
-	ReviewChangeEvent,
+	ReviewChangeNotification,
 	ReviewHealth,
 	ReviewPlaylist,
 	ReviewProject,
@@ -11,7 +11,11 @@ import type {
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ReviewApiClient, ReviewChangeObserver } from './reviewApiClient'
+import {
+	ReviewApiClientError,
+	type ReviewApiClient,
+	type ReviewChangeObserver,
+} from './reviewApiClient'
 import { useReviewBrowser } from './useReviewBrowser'
 
 const health: ReviewHealth = { mode: 'mock', status: 'ok' }
@@ -50,16 +54,7 @@ const version: ReviewVersion = {
 	submittedBy: null,
 	task: null,
 }
-const changeEvent: ReviewChangeEvent = {
-	attributeName: 'sg_status_list',
-	entity: { id: 301, type: 'Version' },
-	eventLogEntryId: 545175,
-	observedAt: '2026-07-22T08:30:00.000Z',
-	operation: 'update',
-	projectId: 101,
-	sequence: 42,
-	sourceEventId: '11777.3065.0',
-}
+const changeEvent: ReviewChangeNotification = { sequence: 42 }
 
 let root: Root | undefined
 
@@ -167,6 +162,56 @@ describe('useReviewBrowser live changes', () => {
 
 		expect(unsubscribe).toHaveBeenCalledOnce()
 		expect(api.listProjects).toHaveBeenCalledTimes(1)
+	})
+
+	it('clears previously loaded review state when an invalidation reveals revoked access', async () => {
+		vi.useFakeTimers()
+		window.history.replaceState({}, '', '/review/101/201/301')
+		let observer: ReviewChangeObserver | undefined
+		let accessRevoked = false
+		const api = createApi({
+			listProjects: vi.fn(async () => {
+				if (accessRevoked) {
+					throw new ReviewApiClientError({
+						code: 'PERMISSION_DENIED',
+						message: 'untrusted detail',
+						retryable: false,
+						status: 403,
+					})
+				}
+				return [project]
+			}),
+			watchChanges: vi.fn((nextObserver) => {
+				observer = nextObserver
+				return () => {}
+			}),
+		})
+		root = createRoot(document.createElement('div'))
+		let browser: ReturnType<typeof useReviewBrowser> | undefined
+
+		function Harness() {
+			browser = useReviewBrowser(api)
+			return null
+		}
+
+		await act(async () => {
+			root?.render(<Harness />)
+			await settlePromises()
+		})
+		expect(browser?.state.status).toBe('ready')
+
+		accessRevoked = true
+		act(() => observer?.onChange(changeEvent))
+		await act(async () => {
+			vi.advanceTimersByTime(250)
+			await settlePromises()
+		})
+
+		expect(browser?.state).toMatchObject({
+			error: { kind: 'permission', title: 'Permission denied' },
+			status: 'error',
+		})
+		expect(browser?.refreshError).toBeNull()
 	})
 })
 

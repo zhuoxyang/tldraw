@@ -1,4 +1,4 @@
-import { resolve } from 'node:path'
+import { parse, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parseGatewayConfig } from './config'
 import { ReviewGatewayError } from './errors'
@@ -6,6 +6,7 @@ import { ReviewGatewayError } from './errors'
 const PUBLICATION_STORE_DIR = resolve('/var/lib/shotgrid-review-publications')
 const SYNC_STORE_DIR = resolve('/var/lib/shotgrid-review-sync')
 const EVENT_STORE_DIR = resolve('/var/lib/shotgrid-review-events')
+const AUDIT_STORE_DIR = resolve('/var/lib/shotgrid-review-audit')
 
 const LIVE_ENVIRONMENT = {
 	SHOTGRID_GATEWAY_MODE: 'shotgrid',
@@ -15,10 +16,13 @@ const LIVE_ENVIRONMENT = {
 	SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: PUBLICATION_STORE_DIR,
 	SHOTGRID_REVIEW_SYNC_STORE_DIR: SYNC_STORE_DIR,
 	SHOTGRID_REVIEW_EVENT_STORE_DIR: EVENT_STORE_DIR,
+	SHOTGRID_REVIEW_AUDIT_STORE_DIR: AUDIT_STORE_DIR,
+	SHOTGRID_REVIEW_PROJECT_IDS: '101,202,303',
 	SHOTGRID_WEBHOOK_IDS: 'd0af3184-4d29-4f2d-80f0-c5d2f4198f74,01c215c7-ca11-4aa6-9247-96ef778c0a31',
 	SHOTGRID_WEBHOOK_PROJECT_IDS: '101,202',
 	SHOTGRID_WEBHOOK_SECRET: 'shotgrid-webhook-secret-with-32-characters',
 	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
+	REVIEW_FIXED_ACTOR_SUBJECT: 'oidc:studio:reviewer-123',
 	REVIEW_SYNC_SECRET: 'review-sync-secret-with-at-least-32-characters',
 } as const
 
@@ -41,6 +45,7 @@ describe('parseGatewayConfig', () => {
 	it('uses safe local mock defaults', () => {
 		expect(parseGatewayConfig({})).toEqual({
 			mode: 'mock',
+			allowedProjectIds: [101, 102],
 			host: '127.0.0.1',
 			port: 5431,
 			allowedOrigin: 'http://127.0.0.1:5430',
@@ -79,7 +84,11 @@ describe('parseGatewayConfig', () => {
 				SHOTGRID_MAX_RETRIES: '4',
 			})
 		).toEqual({
+			auditMaxEntries: 100_000,
+			auditStoreDir: AUDIT_STORE_DIR,
 			mode: 'shotgrid',
+			allowedProjectIds: [101, 202, 303],
+			fixedActorSubject: 'oidc:studio:reviewer-123',
 			host: '0.0.0.0',
 			port: 6543,
 			allowedOrigin: 'https://review.example.test',
@@ -187,6 +196,7 @@ describe('parseGatewayConfig', () => {
 		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '101'],
 		['SHOTGRID_WEBHOOK_PROJECT_IDS', '0'],
 		['SHOTGRID_WEBHOOK_PROJECT_IDS', '1,1'],
+		['SHOTGRID_REVIEW_PROJECT_IDS', '1,1'],
 		['SHOTGRID_WEBHOOK_IDS', 'not-a-uuid'],
 		[
 			'SHOTGRID_WEBHOOK_IDS',
@@ -199,6 +209,7 @@ describe('parseGatewayConfig', () => {
 	it.each([
 		['SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES', '1024'],
 		['SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNALS', '0'],
+		['SHOTGRID_REVIEW_AUDIT_MAX_ENTRIES', '1'],
 	])('rejects an invalid live %s value', (name, value) => {
 		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: value })
 	})
@@ -219,13 +230,32 @@ describe('parseGatewayConfig', () => {
 		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
 		'SHOTGRID_REVIEW_SYNC_STORE_DIR',
 		'SHOTGRID_REVIEW_EVENT_STORE_DIR',
+		'SHOTGRID_REVIEW_AUDIT_STORE_DIR',
+		'SHOTGRID_REVIEW_PROJECT_IDS',
 		'SHOTGRID_WEBHOOK_IDS',
 		'SHOTGRID_WEBHOOK_PROJECT_IDS',
 		'SHOTGRID_WEBHOOK_SECRET',
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
+		'REVIEW_FIXED_ACTOR_SUBJECT',
 		'REVIEW_SYNC_SECRET',
 	])('requires %s in ShotGrid mode', (name) => {
 		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: undefined })
+	})
+
+	it('requires every webhook project to be within the review allowlist', () => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_PROJECT_IDS: '101',
+		})
+	})
+
+	it.each([
+		['REVIEW_FIXED_ACTOR_SUBJECT', ' reviewer-123'],
+		['REVIEW_API_TRUSTED_PROXY_TOKEN', `${'x'.repeat(32)} `],
+		['REVIEW_SYNC_SECRET', `${'x'.repeat(32)}\n`],
+		['SHOTGRID_SCRIPT_KEY', ' private-key'],
+	])('rejects unsafe whitespace in %s', (name, value) => {
+		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: value })
 	})
 
 	it('requires a strong trusted proxy token without leaking it', () => {
@@ -283,6 +313,25 @@ describe('parseGatewayConfig', () => {
 			...LIVE_ENVIRONMENT,
 			SHOTGRID_REVIEW_EVENT_STORE_DIR: './review-events',
 		})
+	})
+
+	it.each([
+		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
+		'SHOTGRID_REVIEW_SYNC_STORE_DIR',
+		'SHOTGRID_REVIEW_EVENT_STORE_DIR',
+		'SHOTGRID_REVIEW_AUDIT_STORE_DIR',
+	])('rejects a filesystem root for %s', (name) => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			[name]: parse(resolve('.')).root,
+		})
+	})
+
+	it.each([
+		['SHOTGRID_REVIEW_AUDIT_STORE_DIR', ` ${AUDIT_STORE_DIR}`],
+		['SHOTGRID_REVIEW_SYNC_STORE_DIR', '\\\\server\\share\\review-sync'],
+	])('rejects a non-local or whitespace-padded %s', (name, value) => {
+		expectConfigurationError({ ...LIVE_ENVIRONMENT, [name]: value })
 	})
 
 	it.each([

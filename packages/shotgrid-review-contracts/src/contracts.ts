@@ -28,6 +28,11 @@ export interface ReviewChangeEvent {
 	observedAt: string
 }
 
+/** Opaque browser invalidation. Detailed ShotGrid event metadata remains server-side. */
+export interface ReviewChangeNotification {
+	sequence: number
+}
+
 export type ReviewCollaborationPermission = 'editor' | 'viewer'
 
 export interface ReviewCollaborationSession {

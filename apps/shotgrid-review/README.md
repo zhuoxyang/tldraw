@@ -2,7 +2,7 @@
 
 This browser application loads review data exclusively through the server-side ShotGrid review
 gateway. The gateway chooses mock or live ShotGrid mode; browser code never receives ShotGrid
-credentials or the trusted proxy token.
+credentials, the trusted proxy token, or the proxy-authenticated subject.
 
 ## Local development
 
@@ -43,6 +43,13 @@ the API's Version-specific SQLite room; it is not loaded from another reviewer's
 If the gateway exposes only a shared ShotGrid service identity, the app does not initialize human
 publication state for that identity.
 
+Only `VITE_REVIEW_API_BASE_URL`, `VITE_REVIEW_DATA_MODE`, `VITE_REVIEW_STORAGE_NAMESPACE`, and
+`VITE_TLDRAW_LICENSE_KEY` are permitted public build variables. The build and runtime parser reject
+every other `VITE_*` key, even when empty. In ShotGrid mode `VITE_REVIEW_API_BASE_URL` must be a
+same-origin root-relative path such as `/api`; absolute or protocol-relative API URLs are rejected.
+Do not put a ShotGrid URL, login, script key, OAuth token, proxy/webhook secret, or authenticated
+subject in any `VITE_*` value.
+
 Shared annotation editing also requires a human reviewer identity. The collaboration session binds
 the canvas to one Version-specific room, keeps media sources browser-local, and synchronizes only
 the annotation document. A ShotGrid service identity joins as a viewer: it can inspect live shared
@@ -55,11 +62,27 @@ does not open publication IndexedDB state, load Note options, or send publicatio
 service identity may still browse, inspect synchronized annotations, save an editable snapshot, and
 export PNGs. Do not replace this boundary with a session nonce or an in-memory publication fallback.
 
-Live multi-user attribution depends on the trusted reverse proxy mapping each authenticated person
-to the correct ShotGrid reviewer; that deployment work remains tracked by issue #2. A shared
-`SHOTGRID_SUDO_AS_LOGIN` is not a substitute for per-person identity. See the API README for the
-required same-origin WebSocket proxy, single-replica SQLite topology, capacity limits, and recovery
-test.
+The current live boundary accepts exactly one proxy subject configured by
+`REVIEW_FIXED_ACTOR_SUBJECT` and, when mutations are enabled, one effective reviewer configured by
+`SHOTGRID_SUDO_AS_LOGIN`. It is a fixed-principal pilot, not multi-user SSO or per-person
+attribution. Do not route multiple people through that identity. Organization SSO, subject-to-user
+mapping, project entitlements, offboarding/revocation, retention, and multi-instance operation
+remain production gates. See the API README for the required header stripping/injection,
+same-origin SSE/WebSocket proxy, Project allowlist, audit store, single-process SQLite topology,
+capacity limits, and recovery tests.
+
+Live change notifications contain only an opaque monotonic sequence. The client rereads
+authoritative Project → Playlist → Version state and clears the previously loaded review, media,
+and canvas when that refresh reports permission denied or not found. SSE and collaboration sockets
+have five-minute authorization leases, so normal reconnection passes through the trusted proxy and
+server authorization again. The API does not send upstream Project image or HumanUser avatar URLs;
+the app renders those fields without remote images.
+
+The header's **Clear local data** action requires confirmation, removes every browser-persisted
+publication record across review namespaces, releases review-owned download Blob URLs, and remounts
+the active workspace so its media, canvas, and collaboration context are discarded. Pending or
+indeterminate publication retry payloads are intentionally included and cannot be recovered by the
+browser after clearing; authoritative server annotations and ShotGrid records are not deleted.
 
 Review decisions use the deployment's server-side decision mapping; the browser never hard-codes
 studio status meanings. A human reviewer can open the decision control to see the current ShotGrid

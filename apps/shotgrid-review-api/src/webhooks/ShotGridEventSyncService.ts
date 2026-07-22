@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { ReviewChangeEvent } from '@tldraw/shotgrid-review-contracts'
 import { ReviewGatewayError } from '../errors'
+import { prepareSecureSqliteDatabase, prepareSecureStoreDirectory } from '../storage/SecureStore'
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 const MAX_BATCH_EVENTS = 50
@@ -217,10 +217,18 @@ export class ShotGridEventSyncService {
 		this.siteUrl = options.siteUrl
 		this.webhookIds = new Set(readWebhookIds(options))
 
-		mkdirSync(options.storeDir, { recursive: true })
-		this.database = new DatabaseSync(join(options.storeDir, 'shotgrid-event-sync.sqlite'))
+		let secureDatabase: ReturnType<typeof prepareSecureSqliteDatabase>
 		try {
+			const storeDirectory = prepareSecureStoreDirectory(options.storeDir)
+			secureDatabase = prepareSecureSqliteDatabase(storeDirectory, 'shotgrid-event-sync.sqlite')
+		} catch (error) {
+			throw configurationError('The event sync store directory is unavailable.', error)
+		}
+		this.database = new DatabaseSync(secureDatabase.path)
+		try {
+			secureDatabase.hardenFiles()
 			this.initializeDatabase()
+			secureDatabase.hardenFiles()
 			this.readNow()
 		} catch (error) {
 			this.database.close()
@@ -1204,8 +1212,13 @@ function invalidWebhookRequest(message: string) {
 	return webhookError('INVALID_REQUEST', 400, false, message)
 }
 
-function configurationError(message: string) {
-	return webhookError('CONFIGURATION_ERROR', 500, false, message)
+function configurationError(message: string, cause?: unknown) {
+	return new ReviewGatewayError({
+		code: 'CONFIGURATION_ERROR',
+		status: 500,
+		retryable: false,
+		cause: new Error(message, cause === undefined ? undefined : { cause }),
+	})
 }
 
 function webhookError(

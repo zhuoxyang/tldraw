@@ -1,4 +1,4 @@
-import type { ReviewChangeEvent } from '@tldraw/shotgrid-review-contracts'
+import type { ReviewChangeNotification } from '@tldraw/shotgrid-review-contracts'
 import { describe, expect, it, vi } from 'vitest'
 import {
 	createReviewApiClient,
@@ -6,16 +6,7 @@ import {
 	type ReviewEventSource,
 } from './reviewApiClient'
 
-const changeEvent: ReviewChangeEvent = {
-	attributeName: 'sg_status_list',
-	entity: { id: 301, type: 'Version' },
-	eventLogEntryId: 545175,
-	observedAt: '2026-07-22T08:30:00.000Z',
-	operation: 'update',
-	projectId: 101,
-	sequence: 42,
-	sourceEventId: '11777.3065.0',
-}
+const changeEvent: ReviewChangeNotification = { sequence: 42 }
 
 describe('ReviewApiClient change stream', () => {
 	it('opens the protected feed and emits only strictly increasing valid events', () => {
