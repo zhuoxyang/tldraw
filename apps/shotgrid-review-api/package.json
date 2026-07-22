@@ -14,8 +14,10 @@
 	},
 	"scripts": {
 		"dev": "yarn run -T tsx watch src/server.ts",
-		"build": "yarn run -T tsgo --build tsconfig.json && yarn run -T esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js",
+		"build": "yarn run -T tsgo --build tsconfig.json && yarn run -T esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js && yarn run -T esbuild src/ops/reviewDataSnapshotCli.ts --bundle --platform=node --format=esm --outfile=dist/review-data-snapshot.js",
 		"lint": "yarn run -T tsx ../../internal/scripts/lint.ts",
+		"review-data": "node dist/review-data-snapshot.js",
+		"review-data:dev": "yarn run -T tsx src/ops/reviewDataSnapshotCli.ts",
 		"start": "node dist/server.js",
 		"test": "yarn run -T vitest run"
 	},

@@ -1,0 +1,74 @@
+groups:
+  - name: shotgrid-review-pilot
+    rules:
+      - alert: ShotGridReviewEventSyncNotReady
+        expr: shotgrid_review_api_event_sync_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ShotGrid review event synchronization is not ready
+          description: The durable event worker has been unavailable for more than two minutes.
+
+      - alert: ShotGridReviewQueueOldestEventStale
+        expr: shotgrid_review_api_event_sync_queue_oldest_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ShotGrid review webhook processing is delayed
+          description: The oldest queued event has remained unprocessed for more than five minutes.
+
+      - alert: ShotGridReviewEventProcessingFailures
+        expr: increase(shotgrid_review_api_event_sync_failed_events_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: ShotGrid review event processing has failed
+          description: At least one durable event failed during the last ten minutes.
+
+      - alert: ShotGridReviewWebhookSignatureFailures
+        expr: increase(shotgrid_review_api_event_sync_signature_failures_total[10m]) > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: ShotGrid review webhook signatures are failing
+          description: More than five webhook signature failures occurred during the last ten minutes.
+
+      - alert: ShotGridReviewApiServerErrors
+        expr: sum by (instance) (rate(shotgrid_review_api_http_requests_total{status=~"5.."}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ShotGrid review API is returning server errors
+          description: The API has sustained more than 0.1 server errors per second for five minutes.
+
+      - alert: ShotGridReviewStoreDiskSpaceLow
+        expr: shotgrid_review_api_store_filesystem_available_bytes < 1073741824
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: ShotGrid review persistent storage is low on space
+          description: Less than one GiB remains on the filesystem that owns the review stores.
+
+      - alert: ShotGridReviewStoreInodesLow
+        expr: shotgrid_review_api_store_filesystem_free_inodes < 1000
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: ShotGrid review persistent storage is low on inodes
+          description: Fewer than one thousand inodes remain on the filesystem that owns the review stores.
+
+      - alert: ShotGridReviewStoreStatFailure
+        expr: shotgrid_review_api_store_filesystem_stat_error > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ShotGrid review storage telemetry is unavailable
+          description: The API cannot inspect the filesystem that owns the durable review stores.

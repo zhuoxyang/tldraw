@@ -1,0 +1,148 @@
+worker_processes auto;
+pid /tmp/nginx.pid;
+# Ordinary upstream errors can include the WebSocket request line and its one-use ticket.
+# Keep runtime error logging at critical severity; the access log below deliberately omits args.
+error_log /dev/stderr crit;
+
+events {
+	worker_connections 1024;
+}
+
+http {
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+
+	client_body_temp_path /tmp/client-body;
+	fastcgi_temp_path /tmp/fastcgi;
+	proxy_temp_path /tmp/proxy;
+	scgi_temp_path /tmp/scgi;
+	uwsgi_temp_path /tmp/uwsgi;
+
+	map $http_upgrade $review_connection {
+		default upgrade;
+		'' close;
+	}
+
+	map $uri $review_log_route {
+		default app;
+		/api/health api_health;
+		/api/review review_rejected;
+		/api/webhooks/shotgrid shotgrid_webhook;
+		~^/api/review/sync/ review_sync;
+		~^/api/review/ review_http;
+		~^/api/ api_rejected;
+		~^/internal/ internal_rejected;
+	}
+
+	log_format review_safe '$request_method route=$review_log_route status=$status bytes=$body_bytes_sent';
+	access_log /dev/stdout review_safe;
+
+	sendfile on;
+	server_tokens off;
+
+	upstream review_api {
+		server api:5431;
+		keepalive 16;
+	}
+
+	server {
+		listen 8080 default_server;
+		listen [::]:8080 default_server;
+		server_name _;
+
+		root /usr/share/nginx/html;
+		index index.html;
+
+		add_header Referrer-Policy no-referrer always;
+		add_header X-Content-Type-Options nosniff always;
+		add_header X-Frame-Options DENY always;
+
+		location = /_review_auth {
+			internal;
+			proxy_pass ${REVIEW_FORWARD_AUTH_UPSTREAM};
+			proxy_pass_request_body off;
+			proxy_set_header Content-Length "";
+			proxy_set_header Host $proxy_host;
+			proxy_set_header X-Forwarded-For $remote_addr;
+			proxy_set_header X-Forwarded-Host $host;
+			proxy_set_header X-Forwarded-Method $request_method;
+			proxy_set_header X-Forwarded-Proto $scheme;
+			proxy_set_header X-Forwarded-Uri "";
+			proxy_set_header X-Original-URI "";
+			proxy_set_header X-Review-Authenticated-Subject "";
+			proxy_set_header X-Review-Proxy-Token "";
+		}
+
+		location = /api/health {
+			proxy_http_version 1.1;
+			proxy_set_header Connection "";
+			proxy_set_header Host $host;
+			proxy_set_header X-Forwarded-For $remote_addr;
+			proxy_set_header X-Review-Authenticated-Subject "";
+			proxy_set_header X-Review-Proxy-Token "";
+			proxy_pass http://review_api;
+		}
+
+		location = /api/webhooks/shotgrid {
+			client_max_body_size 1m;
+			proxy_buffering off;
+			proxy_http_version 1.1;
+			proxy_request_buffering on;
+			proxy_set_header Connection "";
+			proxy_set_header Host $host;
+			proxy_set_header X-Forwarded-For $remote_addr;
+			proxy_set_header X-Review-Authenticated-Subject "";
+			proxy_set_header X-Review-Proxy-Token "";
+			proxy_pass http://review_api;
+		}
+
+		location = /api/review {
+			auth_request /_review_auth;
+			client_max_body_size 14m;
+			proxy_buffering off;
+			proxy_http_version 1.1;
+			proxy_read_timeout 370s;
+			proxy_send_timeout 30s;
+			proxy_set_header Connection $review_connection;
+			proxy_set_header Host $host;
+			proxy_set_header Upgrade $http_upgrade;
+			proxy_set_header X-Forwarded-For $remote_addr;
+			proxy_set_header X-Review-Authenticated-Subject "${REVIEW_FIXED_ACTOR_SUBJECT}";
+			proxy_set_header X-Review-Proxy-Token "${REVIEW_API_TRUSTED_PROXY_TOKEN}";
+			proxy_pass http://review_api;
+		}
+
+		location ^~ /api/review/ {
+			auth_request /_review_auth;
+			client_max_body_size 14m;
+			proxy_buffering off;
+			proxy_http_version 1.1;
+			proxy_read_timeout 370s;
+			proxy_send_timeout 30s;
+			proxy_set_header Connection $review_connection;
+			proxy_set_header Host $host;
+			proxy_set_header Upgrade $http_upgrade;
+			proxy_set_header X-Forwarded-For $remote_addr;
+			proxy_set_header X-Review-Authenticated-Subject "${REVIEW_FIXED_ACTOR_SUBJECT}";
+			proxy_set_header X-Review-Proxy-Token "${REVIEW_API_TRUSTED_PROXY_TOKEN}";
+			proxy_pass http://review_api;
+		}
+
+		location ^~ /internal/ {
+			return 404;
+		}
+
+		location ^~ /api/ {
+			return 404;
+		}
+
+		location = /api {
+			return 404;
+		}
+
+		location / {
+			auth_request /_review_auth;
+			try_files $uri $uri/ /index.html;
+		}
+	}
+}

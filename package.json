@@ -78,6 +78,7 @@
 		"test-shotgrid-review-api": "yarn workspace shotgrid-review-api test",
 		"test-coverage": "yarn vitest run --coverage && open-cli coverage/index.html",
 		"e2e": "lazy e2e --filter='apps/examples'",
+		"e2e-shotgrid-review": "yarn workspace tldraw predev && yarn workspace shotgrid-review e2e",
 		"e2e-dotcom": "yarn workspace dotcom e2e",
 		"e2e-dotcom-smoke": "yarn workspace dotcom e2e-smoke",
 		"e2e-dotcom-all": "yarn workspace dotcom e2e-all",

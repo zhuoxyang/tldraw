@@ -17,6 +17,7 @@ const PNG_BYTES = makeTestPng()
 const PNG_SHA256 = createHash('sha256').update(PNG_BYTES).digest('hex')
 const PUBLICATION_ID = '018f3f72-1d6b-4c51-8f4b-a12c9d2e3478'
 const TRUSTED_PROXY_TOKEN = 'test-trusted-proxy-token-with-32-characters'
+const METRICS_TOKEN = 'test-metrics-token-with-at-least-32-characters'
 const FIXED_ACTOR_SUBJECT = 'oidc:test:reviewer-123'
 const PUBLICATION_LINKS = {
 	entity: { id: 501, name: 'shot_010', type: 'Shot' },
@@ -82,6 +83,26 @@ describe('createReviewApiServer', () => {
 		).toThrow(expect.objectContaining({ code: 'CONFIGURATION_ERROR', status: 500 }))
 	})
 
+	test.each([undefined, 'short', `${'m'.repeat(32)} `])(
+		'requires a canonical operational metrics token in live mode: %s',
+		(metricsToken) => {
+			expect(() =>
+				createReviewApiServer({
+					allowedOrigin: 'http://127.0.0.1:5430',
+					auditStore: new InMemoryReviewAuditStore(),
+					fixedActorSubject: FIXED_ACTOR_SUBJECT,
+					gateway: makeGateway(),
+					mode: 'shotgrid',
+					publicationDeploymentScope: 'https://studio.example.test',
+					publicationStore: new InMemoryReviewPublicationStore(),
+					serviceActorName: 'review-gateway',
+					trustedProxyToken: TRUSTED_PROXY_TOKEN,
+					...(metricsToken === undefined ? undefined : { metricsToken }),
+				})
+			).toThrow(expect.objectContaining({ code: 'CONFIGURATION_ERROR', status: 500 }))
+		}
+	)
+
 	test('requires a canonical deployment scope for live publication keys', () => {
 		expect(() =>
 			createReviewApiServer({
@@ -128,6 +149,38 @@ describe('createReviewApiServer', () => {
 		expect(gateway.getVersion).toHaveBeenCalledWith(201, 301)
 		expect(gateway.listPlaylists).toHaveBeenCalledWith(101)
 		expect(gateway.listVersions).toHaveBeenCalledWith(201)
+	})
+
+	test('protects bounded Prometheus metrics with a separate operational token', async () => {
+		const logger = { error: vi.fn(), info: vi.fn() }
+		const baseUrl = await start(makeGateway(), logger)
+
+		const unauthenticated = await fetch(`${baseUrl}/internal/metrics`)
+		expect(unauthenticated.status).toBe(401)
+		expect(await unauthenticated.text()).not.toContain(METRICS_TOKEN)
+
+		await expectJson(`${baseUrl}/api/review/playlists/201/versions/301`, 200, {
+			data: VERSION_FIXTURE,
+		})
+		const metrics = await fetch(`${baseUrl}/internal/metrics`, {
+			headers: { 'X-Review-Metrics-Token': METRICS_TOKEN },
+		})
+		expect(metrics.status).toBe(200)
+		expect(metrics.headers.get('content-type')).toBe('text/plain; version=0.0.4; charset=utf-8')
+		const body = await metrics.text()
+		expect(body).toContain(
+			'shotgrid_review_api_http_requests_total{method="GET",route="version",status="200"} 1'
+		)
+		expect(body).toContain(
+			'shotgrid_review_api_http_requests_total{method="GET",route="metrics",status="401"} 1'
+		)
+		expect(body).not.toContain('/api/review/playlists/201/versions/301')
+		expect(body).not.toContain(METRICS_TOKEN)
+		expect(JSON.stringify(logger.info.mock.calls)).not.toContain('/api/review/playlists/201')
+		expect(logger.info).toHaveBeenCalledWith(
+			'request_completed',
+			expect.objectContaining({ method: 'GET', route: 'version', status: 200 })
+		)
 	})
 
 	test('serves a bounded image payload with non-cacheable, non-sniffable headers', async () => {
@@ -1600,6 +1653,7 @@ async function start(
 		| 'auditStore'
 		| 'decisions'
 		| 'fixedActorSubject'
+		| 'metricsToken'
 		| 'mode'
 		| 'publicationDeploymentScope'
 		| 'publicationStore'
@@ -1616,6 +1670,7 @@ async function start(
 		...(options.decisions === undefined ? undefined : { decisions: options.decisions }),
 		gateway,
 		logger,
+		metricsToken: options.metricsToken ?? METRICS_TOKEN,
 		mode: options.mode,
 		publicationStore: options.publicationStore ?? new InMemoryReviewPublicationStore(),
 		requestId: () => 'test-request-id',

@@ -84,6 +84,27 @@ the active workspace so its media, canvas, and collaboration context are discard
 indeterminate publication retry payloads are intentionally included and cannot be recovered by the
 browser after clearing; authoritative server annotations and ShotGrid records are not deleted.
 
+The single-replica pilot container bundle is under [`deploy`](./deploy). A ShotGrid build refuses to
+complete without an explicit `VITE_TLDRAW_LICENSE_KEY` and stable
+`VITE_REVIEW_STORAGE_NAMESPACE`. The bundle keeps server secrets out of build arguments, serves the
+browser and `/api` from one origin, requires forward-auth for the app and review API, and leaves the
+signed ShotGrid webhook as a separate public boundary. See the API README for startup, metrics,
+backup, restore, and production-gate procedures.
+
+Run the real-browser image-review gate from the repository root with:
+
+```sh
+yarn e2e-shotgrid-review
+```
+
+Chromium drives the actual tldraw toolbar and Editor to create an annotation, downloads an editable
+snapshot, closes that browser context, imports the snapshot into a new Editor, moves the reopened
+shape to prove it remains editable, then downloads and parses a PNG at the exact 1920×1080 source
+resolution. A deterministic white source also lets the test assert that non-white annotation pixels
+were actually flattened into the exported PNG. The path is registered as a pull-request gate. It
+validates the browser asset workflow, not organization SSO, real ShotGrid credentials, webhook
+reachability, or a human pilot; those still require the approved sandbox and reviewers.
+
 Review decisions use the deployment's server-side decision mapping; the browser never hard-codes
 studio status meanings. A human reviewer can open the decision control to see the current ShotGrid
 status, configured actions, and recent status history. Each update includes the status observed by

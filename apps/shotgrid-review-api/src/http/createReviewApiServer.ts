@@ -32,6 +32,13 @@ import type {
 	ReviewVideoByteRange,
 	ReviewVideoProxyPayload,
 } from '../gateway/ReviewGateway'
+import {
+	classifyReviewRoute,
+	ReviewMetrics,
+	type ReviewLogger,
+	type ReviewRouteName,
+	type ReviewStoreDirectories,
+} from '../observability/ReviewObservability'
 import { ShotGridEventSyncHttp } from '../webhooks/ShotGridEventSyncHttp'
 import type { ShotGridEventSyncService } from '../webhooks/ShotGridEventSyncService'
 import { ReviewDecisionCoordinator } from './ReviewDecisionCoordinator'
@@ -52,14 +59,11 @@ const DEFAULT_VIDEO_DOWNSTREAM_IDLE_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_CONCURRENT_PUBLICATIONS = 1
 const DEFAULT_MAX_SOCKET_LIFETIME_MS = 5 * 60_000
 const MOCK_PRINCIPAL_ID = 'p1_mock-local-reviewer'
+const MOCK_METRICS_TOKEN = 'local-development-only-review-metrics-token'
 const MUTATION_METHODS = ['POST', 'PUT'] as const
 const inflateAsync = promisify(inflate)
 
 type GatewayMode = 'mock' | 'shotgrid'
-
-interface SafeLogger {
-	error(message: string, context: { code: string; requestId: string; status: number }): void
-}
 
 export interface ReviewApiServerOptions {
 	allowedOrigin: string
@@ -69,14 +73,16 @@ export interface ReviewApiServerOptions {
 	eventSync?: ShotGridEventSyncService
 	fixedActorSubject?: string
 	gateway: ReviewGateway
-	logger?: SafeLogger
+	logger?: ReviewLogger
 	maxConcurrentPublications?: number
 	maxSocketLifetimeMs?: number
+	metricsToken?: string
 	mode: GatewayMode
 	publicationDeploymentScope?: string
 	publicationStore?: ReviewPublicationStore
 	requestId?(): string
 	serviceActorName?: string
+	storeDirectories?: ReviewStoreDirectories
 	sudoAsLogin?: string
 	trustedProxyToken?: string
 	videoDownstreamIdleTimeoutMs?: number
@@ -164,8 +170,26 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			status: 500,
 		})
 	}
+	if (
+		(options.mode === 'shotgrid' || options.metricsToken !== undefined) &&
+		(!options.metricsToken ||
+			options.metricsToken.length < 32 ||
+			options.metricsToken.length > 1_024 ||
+			options.metricsToken.trim() !== options.metricsToken ||
+			/\p{Cc}/u.test(options.metricsToken))
+	) {
+		throw new ReviewGatewayError({
+			code: 'CONFIGURATION_ERROR',
+			retryable: false,
+			status: 500,
+		})
+	}
 	const createRequestId = options.requestId ?? randomUUID
-	const logger = options.logger ?? console
+	const logger: ReviewLogger = options.logger ?? {
+		error: (message, context) => console.error(message, context),
+	}
+	const metrics = new ReviewMetrics()
+	const metricsToken = options.metricsToken ?? MOCK_METRICS_TOKEN
 	const maxConcurrentPublications =
 		options.maxConcurrentPublications ?? DEFAULT_MAX_CONCURRENT_PUBLICATIONS
 	if (!Number.isSafeInteger(maxConcurrentPublications) || maxConcurrentPublications <= 0) {
@@ -224,12 +248,34 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 
 	const server = createServer(async (request, response) => {
 		const requestId = createRequestId()
+		const requestStartedAt = Date.now()
+		const method = normalizeRequestMethod(request.method)
+		let routeName: ReviewRouteName = 'unknown'
+		const finishMetric = metrics.beginRequest(method, () => routeName)
+		let requestRecorded = false
+		const recordRequest = (status: number) => {
+			if (requestRecorded) return
+			requestRecorded = true
+			finishMetric(status)
+			logger.info?.('request_completed', {
+				durationMs: Math.max(0, Date.now() - requestStartedAt),
+				method,
+				requestId,
+				route: routeName,
+				status,
+			})
+		}
+		response.once('finish', () => recordRequest(response.statusCode))
+		response.once('close', () => {
+			if (!response.writableFinished) recordRequest(499)
+		})
 		setStandardHeaders(response, requestId)
 
 		try {
 			if (!applyCors(request, response, options.allowedOrigin, requestId)) return
 
 			const url = parseRequestUrl(request.url)
+			routeName = classifyReviewRoute(url.pathname)
 			const route = matchRoute(
 				url.pathname,
 				options.gateway,
@@ -243,6 +289,9 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				videoDownstreamIdleTimeoutMs,
 				eventSyncHttp,
 				options.eventSync,
+				metrics,
+				metricsToken,
+				options.storeDirectories,
 				response
 			)
 			if (!route) {
@@ -318,7 +367,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 function attachEventSyncShutdown(
 	server: Server,
 	eventSync: ShotGridEventSyncService,
-	logger: SafeLogger
+	logger: ReviewLogger
 ) {
 	let closeStarted = false
 	const closeHttpServer = server.close.bind(server)
@@ -352,7 +401,7 @@ function attachReviewCollaborationWebSocket(
 	server: Server,
 	collaboration: ReviewCollaborationService,
 	allowedOrigin: string,
-	logger: SafeLogger,
+	logger: ReviewLogger,
 	createRequestId: () => string,
 	options: ReviewApiServerOptions,
 	maxSocketLifetimeMs: number
@@ -603,8 +652,22 @@ function matchRoute(
 	videoDownstreamIdleTimeoutMs: number,
 	eventSyncHttp: ShotGridEventSyncHttp | undefined,
 	eventSync: ShotGridEventSyncService | undefined,
+	metrics: ReviewMetrics,
+	metricsToken: string,
+	storeDirectories: ReviewStoreDirectories | undefined,
 	response: ServerResponse
 ): RouteMatch | undefined {
+	if (pathname === '/internal/metrics') {
+		return getRoute(async (request, context) => {
+			const providedToken = readSingleHeader(request, 'x-review-metrics-token') ?? ''
+			if (!constantTimeEqual(providedToken, metricsToken)) {
+				sendError(response, 401, 'AUTHENTICATION_REQUIRED', false, context.requestId)
+				return
+			}
+			sendMetrics(response, metrics.render({ collaboration, eventSync, storeDirectories }))
+		})
+	}
+
 	if (pathname === '/api/webhooks/shotgrid' && eventSyncHttp) {
 		return mutationRoute('POST', async (request) => {
 			await eventSyncHttp.handleWebhook(request, response)
@@ -1587,6 +1650,19 @@ function sendJson(response: ServerResponse, status: number, body: unknown) {
 	response.statusCode = status
 	response.setHeader('Content-Type', 'application/json; charset=utf-8')
 	response.end(JSON.stringify(body))
+}
+
+function sendMetrics(response: ServerResponse, body: string) {
+	if (response.writableEnded) return
+	response.statusCode = 200
+	response.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+	response.end(body)
+}
+
+function normalizeRequestMethod(method: string | undefined) {
+	return method !== undefined && ['GET', 'OPTIONS', 'POST', 'PUT'].includes(method)
+		? method
+		: 'OTHER'
 }
 
 function sendImage(response: ServerResponse, image: ReviewImageProxyPayload) {

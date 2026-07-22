@@ -1,0 +1,146 @@
+name: ShotGrid review gates
+
+on:
+  merge_group:
+  pull_request:
+    paths:
+      - '.github/actions/setup/**'
+      - '.github/actions/setup-playwright/**'
+      - '.github/workflows/playwright-shotgrid-review.yml'
+      - 'apps/shotgrid-review-api/**'
+      - 'apps/shotgrid-review/**'
+      - 'packages/editor/**'
+      - 'packages/shotgrid-review-contracts/**'
+      - 'packages/tldraw/**'
+      - 'packages/tlschema/**'
+      - 'yarn.lock'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/setup/**'
+      - '.github/actions/setup-playwright/**'
+      - '.github/workflows/playwright-shotgrid-review.yml'
+      - 'apps/shotgrid-review-api/**'
+      - 'apps/shotgrid-review/**'
+      - 'packages/editor/**'
+      - 'packages/shotgrid-review-contracts/**'
+      - 'packages/tldraw/**'
+      - 'packages/tlschema/**'
+      - 'yarn.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  cancel-in-progress: true
+  group: shotgrid-review-browser-${{ github.event.pull_request.number || github.ref }}
+
+env:
+  CI: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package-validation:
+    name: Review package validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up repository
+        uses: ./.github/actions/setup
+
+      - name: Test and build contracts
+        run: yarn workspace @tldraw/shotgrid-review-contracts test-ci && yarn workspace @tldraw/shotgrid-review-contracts build
+
+      - name: Test and build API
+        run: yarn workspace shotgrid-review-api test && yarn workspace shotgrid-review-api build
+
+      - name: Test and build browser app
+        run: yarn workspace tldraw predev && yarn workspace shotgrid-review test && yarn workspace shotgrid-review build
+
+  image-review:
+    name: Image review browser gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up repository
+        uses: ./.github/actions/setup
+
+      - name: Set up Chromium
+        uses: ./.github/actions/setup-playwright
+
+      - name: Run image review browser gate
+        run: yarn e2e-shotgrid-review
+
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: shotgrid-review-browser-results
+          path: /tmp/shotgrid-review-playwright-results
+          retention-days: 14
+
+  container-build:
+    name: Pilot container build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Validate Compose model
+        env:
+          ALPINE_IMAGE: alpine:3.21
+          NGINX_IMAGE: nginxinc/nginx-unprivileged:stable-alpine
+          NODE_IMAGE: node:22-bookworm-slim
+          REVIEW_API_TRUSTED_PROXY_TOKEN: ci-review-proxy-token-0000000000000000
+          REVIEW_METRICS_TOKEN: ci-review-metrics-token-000000000000000
+          REVIEW_SYNC_SECRET: ci-review-sync-secret-000000000000000000
+          SHOTGRID_SCRIPT_KEY: ci-shotgrid-script-key-0000000000000000
+          SHOTGRID_WEBHOOK_SECRET: ci-shotgrid-webhook-secret-0000000000000
+        run: docker compose --env-file apps/shotgrid-review/deploy/pilot.env.example --file apps/shotgrid-review/deploy/compose.yaml --profile backup --profile restore config --quiet
+
+      - name: Build API image
+        run: docker build --file apps/shotgrid-review/deploy/Dockerfile --target api --tag shotgrid-review-api:ci .
+
+      - name: Verify snapshot CLI is packaged
+        run: docker run --rm --entrypoint node shotgrid-review-api:ci /app/review-data-snapshot.js --help
+
+      - name: Build gateway image
+        run: |
+          docker build \
+            --file apps/shotgrid-review/deploy/Dockerfile \
+            --target gateway \
+            --build-arg VITE_REVIEW_STORAGE_NAMESPACE=ci-build-validation \
+            --build-arg VITE_TLDRAW_LICENSE_KEY=ci-build-validation-only \
+            --tag shotgrid-review-gateway:ci \
+            .
+
+      - name: Validate generated gateway configuration
+        env:
+          CI_REVIEW_PROXY_TOKEN: ci-review-proxy-token-0000000000000000
+        run: |
+          proxy_secret="$RUNNER_TEMP/shotgrid-review-proxy-token"
+          printf '%s' "$CI_REVIEW_PROXY_TOKEN" > "$proxy_secret"
+          chmod 0444 "$proxy_secret"
+          docker run --rm \
+            --add-host api:127.0.0.1 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0700 \
+            --mount "type=bind,source=$proxy_secret,target=/run/secrets/review_proxy_token,readonly" \
+            --env REVIEW_FIXED_ACTOR_SUBJECT=oidc:ci:reviewer \
+            --env REVIEW_FORWARD_AUTH_UPSTREAM=http://127.0.0.1:4180/oauth2/auth \
+            --entrypoint /usr/local/bin/review-gateway-entrypoint \
+            shotgrid-review-gateway:ci \
+            nginx -t -c /tmp/review-nginx.conf
