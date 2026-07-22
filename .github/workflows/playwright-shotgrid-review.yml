@@ -62,7 +62,7 @@ jobs:
         run: yarn workspace shotgrid-review-api test && yarn workspace shotgrid-review-api build
 
       - name: Test and build browser app
-        run: yarn workspace shotgrid-review test && yarn workspace shotgrid-review build
+        run: yarn workspace tldraw predev && yarn workspace shotgrid-review test && yarn workspace shotgrid-review build
 
   image-review:
     name: Image review browser gate
