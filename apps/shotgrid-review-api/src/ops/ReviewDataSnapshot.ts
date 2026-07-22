@@ -154,6 +154,12 @@ export async function backupReviewData(
 	requireOfflineAcknowledgement(options)
 	const durability = resolveDurability(options.durability)
 	const source = await requireExistingPhysicalDirectory(sourceRoot, 'source store root')
+	assertSeparateTrees(
+		source,
+		validateAbsoluteLocalPath(snapshotTarget, 'snapshot target'),
+		'source store root',
+		'snapshot target'
+	)
 	const target = await requireNewTargetPath(snapshotTarget, 'snapshot target')
 	assertSeparateTrees(source, target, 'source store root', 'snapshot target')
 	await assertExactRootEntries(source, [...REVIEW_DATA_STORE_NAMES], 'source store root')
@@ -228,6 +234,12 @@ export async function restoreReviewData(
 	requireOfflineAcknowledgement(options)
 	const durability = resolveDurability(options.durability)
 	const snapshot = await requireExistingPhysicalDirectory(snapshotRoot, 'snapshot root')
+	assertSeparateTrees(
+		snapshot,
+		validateAbsoluteLocalPath(restoreTarget, 'restore target'),
+		'snapshot root',
+		'restore target'
+	)
 	const target = await requireNewTargetPath(restoreTarget, 'restore target')
 	assertSeparateTrees(snapshot, target, 'snapshot root', 'restore target')
 
