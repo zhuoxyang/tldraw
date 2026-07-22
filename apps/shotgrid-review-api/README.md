@@ -23,6 +23,10 @@ REVIEW_SYNC_SECRET=... # at least 32 random characters; back up separately and d
 SHOTGRID_REVIEW_SYNC_STORE_DIR=/var/lib/shotgrid-review-sync
 SHOTGRID_REVIEW_SYNC_MAX_ROOMS=100 # optional; active rooms in this process, maximum 1000
 SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM=16 # optional; maximum 100
+SHOTGRID_WEBHOOK_IDS=uuid-for-project,uuid-for-playlist,uuid-for-version,uuid-for-note # allowlist
+SHOTGRID_WEBHOOK_SECRET=... # dedicated secret, at least 32 characters
+SHOTGRID_WEBHOOK_PROJECT_IDS=123,456 # explicit pilot allowlist; no wildcard
+SHOTGRID_REVIEW_EVENT_STORE_DIR=/var/lib/shotgrid-review-events
 SHOTGRID_SUDO_AS_LOGIN=reviewer@example.com # optional
 SHOTGRID_REVIEW_DECISIONS_JSON=[{"key":"approve","label":"Approve","statusCode":"apr"},{"key":"needs-changes","label":"Needs changes","statusCode":"chg"}]
 SHOTGRID_REVIEW_VIDEO_FRAME_RATE_MODE=unknown # constant, variable, or unknown
@@ -48,6 +52,12 @@ The API rejects a WebSocket whose `Origin` does not exactly match `REVIEW_APP_OR
 the Node port as a second browser origin, terminate a sync connection as ordinary HTTP, or log its
 short-lived one-use ticket query value.
 
+The ShotGrid callback is the separate public `POST /api/webhooks/shotgrid` endpoint. Do not put the
+trusted browser-proxy token in ShotGrid. Preserve the request body bytes and the single
+`X-SG-SIGNATURE`, `X-SG-WEBHOOK-ID`, `X-SG-DELIVERY-ID`, and `X-SG-WEBHOOK-SITE-URL` headers exactly;
+the API authenticates that boundary with the dedicated webhook secret. The reverse proxy should
+apply a 1 MiB request-body limit and must not decompress or rewrite JSON before forwarding it.
+
 Live note-option lookup, publication, decision context, and decision updates require
 `SHOTGRID_SUDO_AS_LOGIN`. A ShotGrid script identity may browse review data, but the API rejects
 these human-review actions with `403 PERMISSION_DENIED` even when the request presents a valid
@@ -61,6 +71,65 @@ without mappings so a script identity can remain browse-only; decision routes th
 configured code must be valid and not hidden for that Project.
 
 Project and entity authorization remains the reverse proxy's responsibility until the permission hardening work in issue #12 is complete.
+
+## ShotGrid change synchronization
+
+The webhook receiver verifies ShotGrid's HMAC-SHA1 over the exact raw JSON bytes, validates the
+configured site, webhook UUID allowlist, and project allowlist, and durably commits accepted events to SQLite
+before returning `202`. It accepts the official single-event and 1–50 event batch envelopes. The
+acknowledgement path never calls ShotGrid or waits for browser notification work. A queue, database,
+or durability failure returns a non-2xx response so ShotGrid can redeliver.
+
+`SHOTGRID_REVIEW_EVENT_STORE_DIR` is durable operational state. Run one API process with exclusive
+read/write access to it, back it up with the other review stores, and restore it before accepting
+callbacks. The inbox deduplicates by ShotGrid EventLogEntry id across delivery retries, keeps a
+separate delivery fingerprint, retries processing with bounded exponential backoff, and retains a
+dead-letter state for repeated failures. Payload `old_value` and `new_value` are never treated as
+current data: every accepted event is only a project-scoped invalidation. This makes duplicate,
+late, and out-of-order delivery safe because browsers reread current authoritative ShotGrid state.
+
+The browser consumes the protected `GET /api/review/changes` server-sent event stream. Its local
+monotonic sequence supports `Last-Event-ID` replay; bursts are coalesced for 250 ms and then the
+current Project → Playlist → Version hierarchy is reread. Decision context and Note recipient
+options refresh as well, without remounting the collaborative tldraw canvas. A visible badge shows
+whether live updates are connected or reconnecting. `GET /api/review/event-sync-status`, protected
+by the same trusted proxy policy as other review routes, reports bounded queue depth/bytes, oldest
+lag, duplicate/ignored/failure counters, the latest stream sequence, and connected clients. The
+ordinary health endpoint returns `503` if the durable worker is stopped, faulted, or at capacity.
+
+Create separate ShotGrid webhooks per entity type because the current ShotGrid REST API supports
+one entity type per webhook. Put every resulting UUID in `SHOTGRID_WEBHOOK_IDS`; all review hooks
+may use the same dedicated `SHOTGRID_WEBHOOK_SECRET`. Unknown UUIDs fail closed. Use lifecycle
+operations `create`, `update`, `delete`, and, after
+confirming support on the target site, `revive`. Start with this least-privilege update field set:
+
+- Project: `name`, `sg_status`, `image`
+- Playlist: `code`, `description`, `project`, `updated_at`, `versions`
+- Version: `code`, `description`, `project`, `playlists`, `sg_status_list`, `user`, `entity`,
+  `sg_task`, `image`, `sg_uploaded_movie`, `sg_first_frame`, `sg_last_frame`, `frame_count`,
+  `frame_rate`
+- Note: `project`, `note_links`, `subject`, `content`, `addressings_to`, `tasks`,
+  `sg_status_list`, `attachments`
+- Attachment, only if pilot testing proves it is needed: `project`, `attachment_links`,
+  `description`, `filename`, `this_file`
+
+The durable store is scoped to the canonical ShotGrid site, not to the changeable UUID allowlist.
+Adding, replacing, or removing a webhook UUID therefore preserves queued work, deduplication, and
+SSE replay history. Update the allowlist and restart the single API owner; never delete the event
+store as part of webhook rotation.
+
+The receiver acknowledges valid signed events outside that allowlist as ignored and exposes the
+count, preventing a configuration mismatch from causing an endless redelivery loop. It does not
+create or mutate ShotGrid webhooks at startup. Enabling the subscription remains an explicit
+deployment action requiring the real sandbox/pilot project ids, ShotGrid administrator access, a
+dedicated secret in the secret manager, and a publicly reachable HTTPS callback. Test
+`Playlist.versions` relationship changes and `revive` on the chosen site before rollout because
+the Autodesk documentation does not fully specify those behaviours.
+
+The current application has no Version Notes/activity browser; Note events therefore refresh
+review context and make external changes observable but do not display external Note content.
+Adding a bounded paginated Notes panel is a separate product capability, not something webhook
+delivery alone can provide.
 
 Production mapping from the proxy-authenticated person to a distinct ShotGrid human reviewer is
 still tracked by issue #2. Until that trusted-proxy identity mapping is deployed, configuring one

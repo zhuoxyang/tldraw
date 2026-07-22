@@ -23,6 +23,11 @@ const DEFAULT_PUBLICATION_MAX_JOURNAL_COUNT = 10_000
 const DEFAULT_COLLABORATION_MAX_ROOMS = 100
 const DEFAULT_COLLABORATION_MAX_SESSIONS_PER_ROOM = 16
 const DEFAULT_MOCK_COLLABORATION_SECRET = 'local-development-only-review-sync-secret'
+const DEFAULT_MOCK_WEBHOOK_SECRET = 'local-development-only-shotgrid-webhook-secret'
+const DEFAULT_MOCK_WEBHOOK_ID = '00000000-0000-4000-8000-000000000011'
+const DEFAULT_MOCK_WEBHOOK_SITE_URL = 'https://mock.shotgrid.invalid'
+const WEBHOOK_UUID_PATTERN =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MINIMUM_PUBLICATION_MAX_JOURNAL_BYTES = Math.max(
 	1024 * 1024,
 	minimumReviewPublicationJournalBytes(DEFAULT_REVIEW_PUBLICATION_MAX_RECORD_BYTES)
@@ -38,6 +43,14 @@ export interface ShotGridConnectionConfig {
 	maxRetries: number
 }
 
+export interface ShotGridEventSyncConfig {
+	allowedProjectIds: number[]
+	secret: string
+	siteUrl: string
+	storeDir: string
+	webhookIds: string[]
+}
+
 interface GatewayConfigBase {
 	host: string
 	port: number
@@ -47,6 +60,7 @@ interface GatewayConfigBase {
 	collaborationSecret: string
 	collaborationStoreDir: string
 	decisions: ReviewDecisionOption[]
+	eventSync: ShotGridEventSyncConfig
 }
 
 export type GatewayConfig = GatewayConfigBase &
@@ -166,6 +180,56 @@ function parseAbsoluteStoreDirectory(rawValue: string, variableName: string) {
 	return resolve(value)
 }
 
+function parseWebhookSecret(rawValue: string, variableName: string) {
+	if (
+		rawValue.length < 32 ||
+		rawValue.length > 1024 ||
+		rawValue.trim() !== rawValue ||
+		/\p{Cc}/u.test(rawValue)
+	) {
+		throw configurationError(variableName, 'must contain from 32 to 1024 plain characters')
+	}
+	return rawValue
+}
+
+function parseWebhookIds(rawValue: string) {
+	const values = rawValue.split(',').map((value) => value.trim().toLowerCase())
+	if (
+		values.length === 0 ||
+		values.length > 32 ||
+		values.some((value) => !WEBHOOK_UUID_PATTERN.test(value)) ||
+		new Set(values).size !== values.length
+	) {
+		throw configurationError(
+			'SHOTGRID_WEBHOOK_IDS',
+			'must contain from 1 to 32 unique comma-separated UUIDs'
+		)
+	}
+	return values.sort()
+}
+
+function parseWebhookProjectIds(rawValue: string) {
+	const parts = rawValue.split(',').map((part) => part.trim())
+	if (
+		parts.length === 0 ||
+		parts.length > 1_000 ||
+		parts.some((part) => !/^[1-9]\d*$/.test(part))
+	) {
+		throw configurationError(
+			'SHOTGRID_WEBHOOK_PROJECT_IDS',
+			'must be a comma-separated list of positive ShotGrid project ids'
+		)
+	}
+	const ids = parts.map(Number)
+	if (ids.some((id) => !Number.isSafeInteger(id)) || new Set(ids).size !== ids.length) {
+		throw configurationError(
+			'SHOTGRID_WEBHOOK_PROJECT_IDS',
+			'must contain unique positive safe integers'
+		)
+	}
+	return ids
+}
+
 function parseDecisionOptions(
 	environment: GatewayEnvironment,
 	options: { defaultDecisions: readonly ReviewDecisionOption[] }
@@ -256,6 +320,22 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 			decisions: parseDecisionOptions(environment, {
 				defaultDecisions: DEFAULT_MOCK_DECISIONS,
 			}),
+			eventSync: {
+				allowedProjectIds: parseWebhookProjectIds(
+					environment.SHOTGRID_WEBHOOK_PROJECT_IDS || '101,102'
+				),
+				secret: parseWebhookSecret(
+					environment.SHOTGRID_WEBHOOK_SECRET || DEFAULT_MOCK_WEBHOOK_SECRET,
+					'SHOTGRID_WEBHOOK_SECRET'
+				),
+				siteUrl: DEFAULT_MOCK_WEBHOOK_SITE_URL,
+				storeDir: parseAbsoluteStoreDirectory(
+					environment.SHOTGRID_REVIEW_EVENT_STORE_DIR ||
+						resolve(process.cwd(), '.shotgrid-review-events'),
+					'SHOTGRID_REVIEW_EVENT_STORE_DIR'
+				),
+				webhookIds: parseWebhookIds(environment.SHOTGRID_WEBHOOK_IDS || DEFAULT_MOCK_WEBHOOK_ID),
+			},
 		}
 	}
 
@@ -271,6 +351,22 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		readRequired(environment, 'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR'),
 		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR'
 	)
+	const shotgridSiteUrl = parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL'))
+	const eventSync: ShotGridEventSyncConfig = {
+		allowedProjectIds: parseWebhookProjectIds(
+			readRequired(environment, 'SHOTGRID_WEBHOOK_PROJECT_IDS')
+		),
+		secret: parseWebhookSecret(
+			readRequired(environment, 'SHOTGRID_WEBHOOK_SECRET'),
+			'SHOTGRID_WEBHOOK_SECRET'
+		),
+		siteUrl: shotgridSiteUrl,
+		storeDir: parseAbsoluteStoreDirectory(
+			readRequired(environment, 'SHOTGRID_REVIEW_EVENT_STORE_DIR'),
+			'SHOTGRID_REVIEW_EVENT_STORE_DIR'
+		),
+		webhookIds: parseWebhookIds(readRequired(environment, 'SHOTGRID_WEBHOOK_IDS')),
+	}
 	const publicationMaxJournalBytes = parseInteger(
 		environment,
 		'SHOTGRID_REVIEW_PUBLICATION_MAX_JOURNAL_BYTES',
@@ -307,13 +403,14 @@ export function parseGatewayConfig(environment: GatewayEnvironment = process.env
 		collaborationSecret,
 		collaborationStoreDir,
 		decisions,
+		eventSync,
 		publicationMaxJournalBytes,
 		publicationMaxJournalCount,
 		publicationStoreDir,
 		trustedProxyToken,
 		shotgrid: {
 			frameRateMode: parseVideoFrameRateMode(environment),
-			siteUrl: parseSiteUrl(readRequired(environment, 'SHOTGRID_SITE_URL')),
+			siteUrl: shotgridSiteUrl,
 			scriptName,
 			scriptKey,
 			...(sudoAsLogin === undefined ? undefined : { sudoAsLogin }),

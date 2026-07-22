@@ -125,6 +125,26 @@ describe('ReviewImageCanvas media isolation', () => {
 		).toBe(initialKey)
 	})
 
+	it('refreshes Note options for an external change without reloading the canvas source', async () => {
+		imageMocks.fetch.mockResolvedValueOnce(imageBlob('same-source'))
+		const { container, render } = renderCanvas(baseProps())
+
+		await act(async () => render(baseProps()))
+		const persistenceKey = container
+			.querySelector('[data-persistence-key]')
+			?.getAttribute('data-persistence-key')
+		expect(api.getNoteOptions).toHaveBeenCalledTimes(1)
+		expect(imageMocks.fetch).toHaveBeenCalledTimes(1)
+
+		await act(async () => render({ ...baseProps(), externalChangeRevision: 1 }))
+
+		expect(api.getNoteOptions).toHaveBeenCalledTimes(2)
+		expect(imageMocks.fetch).toHaveBeenCalledTimes(1)
+		expect(
+			container.querySelector('[data-persistence-key]')?.getAttribute('data-persistence-key')
+		).toBe(persistenceKey)
+	})
+
 	it('never renders the previous source under a new document key', async () => {
 		imageMocks.fetch.mockResolvedValueOnce(imageBlob('version-301'))
 		const nextImage = deferred<Blob>()

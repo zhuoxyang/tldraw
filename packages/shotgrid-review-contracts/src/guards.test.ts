@@ -6,6 +6,7 @@ import {
 	isReviewArrayOf,
 	isReviewCollaborationPresence,
 	isReviewCollaborationSession,
+	isReviewChangeEvent,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -18,6 +19,7 @@ import {
 	isReviewUser,
 	isReviewVersion,
 	type ReviewVersion,
+	type ReviewChangeEvent,
 	type ReviewVideoMedia,
 } from './index'
 
@@ -59,7 +61,38 @@ const version: ReviewVersion = {
 	task: { id: 601, name: 'Lighting' },
 }
 
+const changeEvent: ReviewChangeEvent = {
+	attributeName: 'sg_status_list',
+	entity: { id: 301, type: 'Version' },
+	eventLogEntryId: 545175,
+	observedAt: '2026-07-22T08:30:00.000Z',
+	operation: 'update',
+	projectId: 101,
+	sequence: 42,
+	sourceEventId: '11777.3065.0',
+}
+
 describe('review contract runtime guards', () => {
+	test('accepts only strict canonical review change events', () => {
+		expect(isReviewChangeEvent(changeEvent)).toBe(true)
+		expect(isReviewChangeEvent({ ...changeEvent, attributeName: null })).toBe(true)
+		for (const invalid of [
+			{ ...changeEvent, sequence: 0 },
+			{ ...changeEvent, eventLogEntryId: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...changeEvent, sourceEventId: '' },
+			{ ...changeEvent, sourceEventId: `x${'a'.repeat(255)}` },
+			{ ...changeEvent, projectId: -1 },
+			{ ...changeEvent, entity: { id: 301, type: 'Shot' } },
+			{ ...changeEvent, entity: { id: 301, type: 'Version', name: 'extra' } },
+			{ ...changeEvent, operation: 'retire' },
+			{ ...changeEvent, attributeName: 7 },
+			{ ...changeEvent, observedAt: '2026-07-22T08:30:00Z' },
+			{ ...changeEvent, unexpected: true },
+		]) {
+			expect(isReviewChangeEvent(invalid)).toBe(false)
+		}
+	})
+
 	test('accepts only bound collaboration session URLs and canonical expirations', () => {
 		const roomId = `r1_${'A'.repeat(43)}`
 		const session = {

@@ -10,6 +10,24 @@ export interface ReviewHealth {
 	status: 'ok'
 }
 
+export type ReviewChangeEntityType = 'Project' | 'Playlist' | 'Version' | 'Note' | 'Attachment'
+
+export type ReviewChangeOperation = 'create' | 'update' | 'delete' | 'revive'
+
+export interface ReviewChangeEvent {
+	sequence: number
+	eventLogEntryId: ReviewEntityId
+	sourceEventId: string
+	projectId: ReviewEntityId
+	entity: {
+		id: ReviewEntityId
+		type: ReviewChangeEntityType
+	}
+	operation: ReviewChangeOperation
+	attributeName: string | null
+	observedAt: string
+}
+
 export type ReviewCollaborationPermission = 'editor' | 'viewer'
 
 export interface ReviewCollaborationSession {

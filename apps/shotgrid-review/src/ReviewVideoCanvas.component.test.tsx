@@ -229,6 +229,29 @@ afterEach(() => {
 })
 
 describe('ReviewVideoCanvas controls', () => {
+	it('keeps the collaborative canvas mounted when external context revision changes', async () => {
+		videoCanvasMocks.metadataReady = true
+		await mountCanvas()
+		const initialMounts = videoCanvasMocks.editorMounts
+
+		await act(async () => {
+			root?.render(
+				<ReviewVideoCanvas
+					documentKey="document-301"
+					externalChangeRevision={1}
+					media={media}
+					persistenceKey="review-301"
+					projectId={101}
+					reviewScope="local-dev:mock:mock"
+					versionId={301}
+					versionName="shot_010_v001"
+				/>
+			)
+		})
+
+		expect(videoCanvasMocks.editorMounts).toBe(initialMounts)
+	})
+
 	it('locks editing during playback and navigates exact neighboring frames', async () => {
 		videoCanvasMocks.metadataReady = true
 		await mountCanvas()

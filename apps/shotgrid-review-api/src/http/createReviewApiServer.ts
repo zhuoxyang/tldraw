@@ -25,6 +25,8 @@ import type {
 	ReviewVideoByteRange,
 	ReviewVideoProxyPayload,
 } from '../gateway/ReviewGateway'
+import { ShotGridEventSyncHttp } from '../webhooks/ShotGridEventSyncHttp'
+import type { ShotGridEventSyncService } from '../webhooks/ShotGridEventSyncService'
 import { ReviewDecisionCoordinator } from './ReviewDecisionCoordinator'
 import { ReviewPublicationCoordinator } from './ReviewPublicationCoordinator'
 import type { ReviewPublicationStore } from './ReviewPublicationStore'
@@ -54,6 +56,7 @@ export interface ReviewApiServerOptions {
 	allowedOrigin: string
 	collaboration?: ReviewCollaborationService
 	decisions?: readonly ReviewDecisionOption[]
+	eventSync?: ShotGridEventSyncService
 	gateway: ReviewGateway
 	logger?: SafeLogger
 	maxConcurrentPublications?: number
@@ -156,6 +159,7 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				: [])
 	)
 	const publicationLimiter = new InFlightLimiter(maxConcurrentPublications)
+	const eventSyncHttp = options.eventSync ? new ShotGridEventSyncHttp(options.eventSync) : undefined
 	const publicationActorScope =
 		options.mode === 'mock'
 			? 'mock:local.reviewer'
@@ -181,6 +185,8 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 				publicationLimiter,
 				publicationActorScope,
 				videoDownstreamIdleTimeoutMs,
+				eventSyncHttp,
+				options.eventSync,
 				response
 			)
 			if (!route) {
@@ -248,7 +254,41 @@ export function createReviewApiServer(options: ReviewApiServerOptions): Server {
 			createRequestId
 		)
 	}
+	if (options.eventSync) attachEventSyncShutdown(server, options.eventSync, logger)
 	return server
+}
+
+function attachEventSyncShutdown(
+	server: Server,
+	eventSync: ShotGridEventSyncService,
+	logger: SafeLogger
+) {
+	let closeStarted = false
+	const closeHttpServer = server.close.bind(server)
+	server.close = ((callback?: (error?: Error) => void) => {
+		if (closeStarted) {
+			if (callback) server.once('close', () => callback())
+			return server
+		}
+		closeStarted = true
+		void eventSync.close().then(
+			() => closeHttpServer(callback),
+			(error: unknown) => {
+				logger.error('Review event sync could not shut down cleanly', {
+					code: 'INTERNAL_ERROR',
+					requestId: 'shutdown',
+					status: 500,
+				})
+				const shutdownError =
+					error instanceof Error ? error : new Error('Event sync shutdown failed')
+				closeHttpServer(() => callback?.(shutdownError))
+			}
+		)
+		return server
+	}) as Server['close']
+	server.once('close', () => {
+		void eventSync.close()
+	})
 }
 
 function attachReviewCollaborationWebSocket(
@@ -458,12 +498,39 @@ function matchRoute(
 	publicationLimiter: InFlightLimiter,
 	publicationActorScope: string,
 	videoDownstreamIdleTimeoutMs: number,
+	eventSyncHttp: ShotGridEventSyncHttp | undefined,
+	eventSync: ShotGridEventSyncService | undefined,
 	response: ServerResponse
 ): RouteMatch | undefined {
+	if (pathname === '/api/webhooks/shotgrid' && eventSyncHttp) {
+		return mutationRoute('POST', async (request) => {
+			await eventSyncHttp.handleWebhook(request, response)
+		})
+	}
+
 	if (pathname === '/api/health') {
 		return getRoute(async () => {
+			if (eventSync && !eventSync.isReady()) {
+				throw new ReviewGatewayError({
+					code: 'COLLABORATION_UNAVAILABLE',
+					retryable: true,
+					status: 503,
+				})
+			}
 			const health: ReviewHealth = { mode, status: 'ok' }
 			sendJson(response, 200, health)
+		})
+	}
+
+	if (pathname === '/api/review/event-sync-status' && eventSyncHttp) {
+		return getRoute(async () => {
+			eventSyncHttp.handleStatus(response)
+		})
+	}
+
+	if (pathname === '/api/review/changes' && eventSyncHttp) {
+		return getRoute(async (request) => {
+			eventSyncHttp.handleChangeStream(request, response)
 		})
 	}
 

@@ -94,6 +94,7 @@ export interface ReviewVideoCanvasProps {
 	allowSnapshotImport?: boolean
 	collaborationReadOnly?: boolean
 	documentKey: string
+	externalChangeRevision?: number
 	licenseKey?: string
 	media: ReviewVideoMedia
 	persistenceKey?: string
@@ -130,6 +131,7 @@ export function ReviewVideoCanvas({
 	allowSnapshotImport = true,
 	collaborationReadOnly = false,
 	documentKey,
+	externalChangeRevision = 0,
 	licenseKey,
 	media,
 	persistenceKey,
@@ -166,10 +168,11 @@ export function ReviewVideoCanvas({
 	const operationInFlightRef = useRef(false)
 	const mountedRef = useRef(true)
 	const editableInputRef = useRef<HTMLInputElement>(null)
-	const review = useMemo<ReviewVideoSnapshotContext>(
-		() => ({ projectId, scope: reviewScope, versionId }),
-		[projectId, reviewScope, versionId]
-	)
+	const review = useMemo<ReviewVideoSnapshotContext>(() => {
+		// Invalidate callbacks that capture review context without persisting this local refresh token.
+		void externalChangeRevision
+		return { projectId, scope: reviewScope, versionId }
+	}, [externalChangeRevision, projectId, reviewScope, versionId])
 
 	useLayoutEffect(() => {
 		mountedRef.current = true
