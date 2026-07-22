@@ -9,6 +9,7 @@ import {
 	InMemoryReviewPublicationStore,
 } from './http/ReviewPublicationStore'
 import { ShotGridClient } from './shotgrid/ShotGridClient'
+import { ShotGridEventSyncService } from './webhooks/ShotGridEventSyncService'
 
 const config = parseGatewayConfig()
 let gateway: ReviewGateway
@@ -38,11 +39,13 @@ const collaboration = new ReviewCollaborationService({
 	secret: config.collaborationSecret,
 	storeDir: config.collaborationStoreDir,
 })
+const eventSync = new ShotGridEventSyncService(config.eventSync)
 
 const server = createReviewApiServer({
 	allowedOrigin: config.allowedOrigin,
 	collaboration,
 	decisions: config.decisions,
+	eventSync,
 	gateway,
 	mode: config.mode,
 	publicationStore,

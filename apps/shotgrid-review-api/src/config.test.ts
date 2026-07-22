@@ -5,6 +5,7 @@ import { ReviewGatewayError } from './errors'
 
 const PUBLICATION_STORE_DIR = resolve('/var/lib/shotgrid-review-publications')
 const SYNC_STORE_DIR = resolve('/var/lib/shotgrid-review-sync')
+const EVENT_STORE_DIR = resolve('/var/lib/shotgrid-review-events')
 
 const LIVE_ENVIRONMENT = {
 	SHOTGRID_GATEWAY_MODE: 'shotgrid',
@@ -13,6 +14,10 @@ const LIVE_ENVIRONMENT = {
 	SHOTGRID_SCRIPT_KEY: 'private-test-key',
 	SHOTGRID_REVIEW_PUBLICATION_STORE_DIR: PUBLICATION_STORE_DIR,
 	SHOTGRID_REVIEW_SYNC_STORE_DIR: SYNC_STORE_DIR,
+	SHOTGRID_REVIEW_EVENT_STORE_DIR: EVENT_STORE_DIR,
+	SHOTGRID_WEBHOOK_IDS: 'd0af3184-4d29-4f2d-80f0-c5d2f4198f74,01c215c7-ca11-4aa6-9247-96ef778c0a31',
+	SHOTGRID_WEBHOOK_PROJECT_IDS: '101,202',
+	SHOTGRID_WEBHOOK_SECRET: 'shotgrid-webhook-secret-with-32-characters',
 	REVIEW_API_TRUSTED_PROXY_TOKEN: 'trusted-proxy-token-with-32-characters',
 	REVIEW_SYNC_SECRET: 'review-sync-secret-with-at-least-32-characters',
 } as const
@@ -52,6 +57,13 @@ describe('parseGatewayConfig', () => {
 					statusCode: 'rev',
 				},
 			],
+			eventSync: {
+				allowedProjectIds: [101, 102],
+				secret: 'local-development-only-shotgrid-webhook-secret',
+				siteUrl: 'https://mock.shotgrid.invalid',
+				storeDir: resolve('.shotgrid-review-events'),
+				webhookIds: ['00000000-0000-4000-8000-000000000011'],
+			},
 		})
 	})
 
@@ -76,6 +88,16 @@ describe('parseGatewayConfig', () => {
 			collaborationSecret: 'review-sync-secret-with-at-least-32-characters',
 			collaborationStoreDir: SYNC_STORE_DIR,
 			decisions: [],
+			eventSync: {
+				allowedProjectIds: [101, 202],
+				secret: 'shotgrid-webhook-secret-with-32-characters',
+				siteUrl: 'https://studio.shotgrid.autodesk.com',
+				storeDir: EVENT_STORE_DIR,
+				webhookIds: [
+					'01c215c7-ca11-4aa6-9247-96ef778c0a31',
+					'd0af3184-4d29-4f2d-80f0-c5d2f4198f74',
+				],
+			},
 			publicationMaxJournalBytes: 4_194_304,
 			publicationMaxJournalCount: 10_000,
 			publicationStoreDir: PUBLICATION_STORE_DIR,
@@ -163,6 +185,13 @@ describe('parseGatewayConfig', () => {
 		['SHOTGRID_REVIEW_SYNC_MAX_ROOMS', '1001'],
 		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '0'],
 		['SHOTGRID_REVIEW_SYNC_MAX_SESSIONS_PER_ROOM', '101'],
+		['SHOTGRID_WEBHOOK_PROJECT_IDS', '0'],
+		['SHOTGRID_WEBHOOK_PROJECT_IDS', '1,1'],
+		['SHOTGRID_WEBHOOK_IDS', 'not-a-uuid'],
+		[
+			'SHOTGRID_WEBHOOK_IDS',
+			'd0af3184-4d29-4f2d-80f0-c5d2f4198f74,d0af3184-4d29-4f2d-80f0-c5d2f4198f74',
+		],
 	])('rejects an invalid %s value', (name, value) => {
 		expectConfigurationError({ [name]: value })
 	})
@@ -189,6 +218,10 @@ describe('parseGatewayConfig', () => {
 		'SHOTGRID_SCRIPT_KEY',
 		'SHOTGRID_REVIEW_PUBLICATION_STORE_DIR',
 		'SHOTGRID_REVIEW_SYNC_STORE_DIR',
+		'SHOTGRID_REVIEW_EVENT_STORE_DIR',
+		'SHOTGRID_WEBHOOK_IDS',
+		'SHOTGRID_WEBHOOK_PROJECT_IDS',
+		'SHOTGRID_WEBHOOK_SECRET',
 		'REVIEW_API_TRUSTED_PROXY_TOKEN',
 		'REVIEW_SYNC_SECRET',
 	])('requires %s in ShotGrid mode', (name) => {
@@ -219,6 +252,18 @@ describe('parseGatewayConfig', () => {
 		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
 	})
 
+	it('requires a strong webhook secret without leaking it', () => {
+		const secret = 'short-webhook-secret'
+		const error = expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_WEBHOOK_SECRET: secret,
+		})
+
+		expect(error.message).not.toContain(secret)
+		expect(String(error.cause)).not.toContain(secret)
+		expect(JSON.stringify(error.toApiErrorEnvelope())).not.toContain(secret)
+	})
+
 	it('requires an absolute durable publication store in live mode', () => {
 		expectConfigurationError({
 			...LIVE_ENVIRONMENT,
@@ -230,6 +275,13 @@ describe('parseGatewayConfig', () => {
 		expectConfigurationError({
 			...LIVE_ENVIRONMENT,
 			SHOTGRID_REVIEW_SYNC_STORE_DIR: './review-sync',
+		})
+	})
+
+	it('requires an absolute durable event store in live mode', () => {
+		expectConfigurationError({
+			...LIVE_ENVIRONMENT,
+			SHOTGRID_REVIEW_EVENT_STORE_DIR: './review-events',
 		})
 	})
 

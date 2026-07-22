@@ -5,6 +5,7 @@ import {
 	type ReviewApiErrorEnvelope,
 	type ReviewCollaborationPresence,
 	type ReviewCollaborationSession,
+	type ReviewChangeEvent,
 	type ReviewDecisionContext,
 	type ReviewDecisionHistoryEntry,
 	type ReviewDecisionOption,
@@ -57,6 +58,10 @@ const REVIEW_COLLABORATION_COLORS = new Set([
 	'#FF9F43',
 	'#6C5CE7',
 ])
+const REVIEW_CHANGE_ENTITY_TYPES = new Set(['Project', 'Playlist', 'Version', 'Note', 'Attachment'])
+const REVIEW_CHANGE_OPERATIONS = new Set(['create', 'update', 'delete', 'revive'])
+const MAX_REVIEW_CHANGE_SOURCE_EVENT_ID_LENGTH = 255
+const MAX_REVIEW_CHANGE_ATTRIBUTE_NAME_LENGTH = 255
 
 export function isReviewApiDataEnvelope<T>(
 	value: unknown,
@@ -82,6 +87,42 @@ export function isReviewHealth(value: unknown): value is ReviewHealth {
 		hasOnlyKeys(record, ['mode', 'status']) &&
 		(record.mode === 'mock' || record.mode === 'shotgrid') &&
 		record.status === 'ok'
+	)
+}
+
+export function isReviewChangeEvent(value: unknown): value is ReviewChangeEvent {
+	const record = readRecord(value)
+	if (
+		record === null ||
+		!hasOnlyKeys(record, [
+			'attributeName',
+			'entity',
+			'eventLogEntryId',
+			'observedAt',
+			'operation',
+			'projectId',
+			'sequence',
+			'sourceEventId',
+		]) ||
+		!isPositiveId(record.sequence) ||
+		!isPositiveId(record.eventLogEntryId) ||
+		!isBoundedReviewChangeSourceEventId(record.sourceEventId) ||
+		!isPositiveId(record.projectId) ||
+		typeof record.operation !== 'string' ||
+		!REVIEW_CHANGE_OPERATIONS.has(record.operation) ||
+		!isNullableReviewChangeAttributeName(record.attributeName) ||
+		!isCanonicalIsoTimestamp(record.observedAt)
+	) {
+		return false
+	}
+
+	const entity = readRecord(record.entity)
+	return (
+		entity !== null &&
+		hasOnlyKeys(entity, ['id', 'type']) &&
+		isPositiveId(entity.id) &&
+		typeof entity.type === 'string' &&
+		REVIEW_CHANGE_ENTITY_TYPES.has(entity.type)
 	)
 }
 
@@ -552,6 +593,25 @@ function isCanonicalIsoTimestamp(value: unknown): value is string {
 	if (typeof value !== 'string' || value.length !== 24) return false
 	const parsed = new Date(value)
 	return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
+}
+
+function isBoundedReviewChangeSourceEventId(value: unknown): value is string {
+	return (
+		typeof value === 'string' &&
+		value.length > 0 &&
+		value.length <= MAX_REVIEW_CHANGE_SOURCE_EVENT_ID_LENGTH &&
+		value.trim() === value &&
+		!/[\p{Bidi_Control}\p{Cc}]/u.test(value)
+	)
+}
+
+function isNullableReviewChangeAttributeName(value: unknown): value is string | null {
+	return (
+		value === null ||
+		(typeof value === 'string' &&
+			value.length <= MAX_REVIEW_CHANGE_ATTRIBUTE_NAME_LENGTH &&
+			!/[\p{Bidi_Control}\p{Cc}]/u.test(value))
+	)
 }
 
 function isBoundedPublicationLinks(value: unknown): value is ReviewPublicationLinks {

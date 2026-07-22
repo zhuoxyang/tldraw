@@ -134,3 +134,5 @@ skills/pr-walkthrough/video/public/audio-*
 skills/pr-walkthrough/video/public/manifest.json
 todo.md
 /.shotgrid-review-sync/
+/.shotgrid-review-events/
+/apps/shotgrid-review-api/.shotgrid-review-events/

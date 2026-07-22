@@ -96,6 +96,25 @@ textarea {
 	padding: 6px 9px;
 }
 
+.change-stream-badge {
+	border: 1px solid;
+	border-radius: 999px;
+	font-size: 12px;
+	padding: 6px 9px;
+}
+
+.change-stream-badge--live {
+	background: #0e3b2c;
+	border-color: #176346;
+	color: #86efac;
+}
+
+.change-stream-badge--reconnecting {
+	background: #3b2f0e;
+	border-color: #765d1d;
+	color: #fde68a;
+}
+
 .mode-badge--mock {
 	background: #27213f;
 	border-color: #594a8a;

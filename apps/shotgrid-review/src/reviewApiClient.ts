@@ -1,5 +1,6 @@
 import {
 	type ReviewCollaborationSession,
+	type ReviewChangeEvent,
 	type ReviewDecisionContext,
 	type ReviewDecisionRequest,
 	type ReviewDecisionResult,
@@ -14,6 +15,7 @@ import {
 	type ReviewVersion,
 	isReviewApiErrorEnvelope,
 	isReviewCollaborationSession,
+	isReviewChangeEvent,
 	isReviewDecisionContext,
 	isReviewDecisionRequest,
 	isReviewDecisionResult,
@@ -39,6 +41,7 @@ const MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
 const MAX_RESPONSE_ITEMS = 10_000
 
 export interface ReviewApiClient {
+	watchChanges(observer: ReviewChangeObserver): () => void
 	createCollaborationSession(
 		playlistId: number,
 		versionId: number,
@@ -77,8 +80,30 @@ export interface ReviewApiClient {
 
 export interface CreateReviewApiClientOptions {
 	baseUrl: string
+	eventSourceFactory?: ReviewEventSourceFactory
 	fetch?: FetchImplementation
 }
+
+export type ReviewChangeStreamStatus = 'connecting' | 'live' | 'offline'
+
+export interface ReviewChangeStreamError {
+	code: 'CONNECTION_ERROR' | 'INVALID_EVENT'
+	message: string
+}
+
+export interface ReviewChangeObserver {
+	onChange(event: ReviewChangeEvent): void
+	onError?(error: ReviewChangeStreamError): void
+	onStatusChange(status: ReviewChangeStreamStatus): void
+}
+
+export interface ReviewEventSource {
+	addEventListener(type: string, listener: EventListener): void
+	close(): void
+	removeEventListener(type: string, listener: EventListener): void
+}
+
+export type ReviewEventSourceFactory = (url: string) => ReviewEventSource
 
 interface ReviewApiClientErrorOptions {
 	code: string
@@ -109,6 +134,7 @@ export class ReviewApiClientError extends Error {
 
 export function createReviewApiClient({
 	baseUrl,
+	eventSourceFactory = createBrowserEventSource,
 	fetch: fetchImplementation = globalThis.fetch,
 }: CreateReviewApiClientOptions): ReviewApiClient {
 	const normalizedBaseUrl = normalizeBaseUrl(baseUrl)
@@ -174,6 +200,73 @@ export function createReviewApiClient({
 	}
 
 	return {
+		watchChanges(observer) {
+			let closed = false
+			let lastSequence = 0
+			let status: ReviewChangeStreamStatus | undefined
+			let source: ReviewEventSource | undefined
+
+			const updateStatus = (nextStatus: ReviewChangeStreamStatus) => {
+				if (closed || status === nextStatus) return
+				status = nextStatus
+				observer.onStatusChange(nextStatus)
+			}
+			const reportError = (error: ReviewChangeStreamError) => {
+				if (!closed) observer.onError?.(error)
+			}
+			const handleOpen: EventListener = () => updateStatus('live')
+			const handleError: EventListener = () => {
+				updateStatus('offline')
+				reportError({
+					code: 'CONNECTION_ERROR',
+					message: 'The review change stream connection was interrupted.',
+				})
+			}
+			const handleMessage: EventListener = (rawEvent) => {
+				if (closed) return
+				const message = rawEvent as MessageEvent<unknown>
+				let change: unknown
+				try {
+					change = typeof message.data === 'string' ? JSON.parse(message.data) : undefined
+				} catch {
+					change = undefined
+				}
+				if (!isReviewChangeEvent(change) || message.lastEventId !== String(change.sequence)) {
+					reportError({
+						code: 'INVALID_EVENT',
+						message: 'The review change stream returned an invalid event.',
+					})
+					return
+				}
+				if (change.sequence <= lastSequence) return
+				lastSequence = change.sequence
+				observer.onChange(change)
+			}
+
+			updateStatus('connecting')
+			try {
+				source = eventSourceFactory(`${normalizedBaseUrl}/review/changes`)
+				source.addEventListener('open', handleOpen)
+				source.addEventListener('error', handleError)
+				source.addEventListener('message', handleMessage)
+			} catch {
+				updateStatus('offline')
+				reportError({
+					code: 'CONNECTION_ERROR',
+					message: 'The review change stream could not be opened.',
+				})
+			}
+
+			return () => {
+				if (closed) return
+				closed = true
+				source?.removeEventListener('open', handleOpen)
+				source?.removeEventListener('error', handleError)
+				source?.removeEventListener('message', handleMessage)
+				source?.close()
+			}
+		},
+
 		async createCollaborationSession(playlistId, versionId, signal) {
 			const validPlaylistId = requirePositiveId(playlistId, 'playlistId')
 			const validVersionId = requirePositiveId(versionId, 'versionId')
@@ -336,6 +429,13 @@ export function createReviewApiClient({
 			return result
 		},
 	}
+}
+
+function createBrowserEventSource(url: string): ReviewEventSource {
+	if (typeof globalThis.EventSource !== 'function') {
+		throw new Error('EventSource is unavailable')
+	}
+	return new globalThis.EventSource(url, { withCredentials: true })
 }
 
 export function decodedCanonicalBase64Length(value: string): number | null {

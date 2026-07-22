@@ -12,7 +12,14 @@ import { useReviewBrowser } from './useReviewBrowser'
 
 const reviewApi = createReviewApiClient({ baseUrl: reviewConfig.apiBaseUrl })
 
-function ReviewHeader({ state }: { state?: ReviewBrowserLoadResult }) {
+function ReviewHeader({
+	changeStreamStatus,
+	state,
+}: {
+	changeStreamStatus: ReturnType<typeof useReviewBrowser>['changeStreamStatus']
+	state?: ReviewBrowserLoadResult
+}) {
+	const changeStreamLive = changeStreamStatus === 'live'
 	return (
 		<header className="review-header">
 			<div>
@@ -20,6 +27,16 @@ function ReviewHeader({ state }: { state?: ReviewBrowserLoadResult }) {
 				<h1>ShotGrid review</h1>
 			</div>
 			<div className="review-header__status">
+				<span
+					className={`change-stream-badge change-stream-badge--${changeStreamLive ? 'live' : 'reconnecting'}`}
+					title={
+						changeStreamLive
+							? 'ShotGrid changes are updating this review automatically.'
+							: 'Automatic ShotGrid updates are reconnecting.'
+					}
+				>
+					{changeStreamLive ? 'Live updates' : 'Reconnecting'}
+				</span>
 				{state ? (
 					<span className={`mode-badge mode-badge--${state.health.mode}`}>
 						{state.health.mode === 'mock' ? 'Mock API' : 'ShotGrid API'}
@@ -71,6 +88,7 @@ function ReviewMessage({
 
 function ReviewWorkspace({
 	busy,
+	externalChangeRevision,
 	onRefresh,
 	onSelectPlaylist,
 	onSelectProject,
@@ -80,6 +98,7 @@ function ReviewWorkspace({
 	state,
 }: {
 	busy: boolean
+	externalChangeRevision: number
 	onRefresh(): void
 	onSelectPlaylist(id: number): void
 	onSelectProject(id: number): void
@@ -160,6 +179,7 @@ function ReviewWorkspace({
 			{state.status === 'ready' ? (
 				<ActiveReview
 					busy={busy}
+					externalChangeRevision={externalChangeRevision}
 					onRefresh={onRefresh}
 					refreshError={refreshError}
 					refreshing={refreshing}
@@ -193,12 +213,14 @@ function EmptyReview({ scope }: { scope: 'playlists' | 'projects' | 'versions' }
 
 function ActiveReview({
 	busy,
+	externalChangeRevision,
 	onRefresh,
 	refreshError,
 	refreshing,
 	state,
 }: {
 	busy: boolean
+	externalChangeRevision: number
 	onRefresh(): void
 	refreshError: ReturnType<typeof useReviewBrowser>['refreshError']
 	refreshing: boolean
@@ -228,6 +250,7 @@ function ActiveReview({
 						access={reviewDecisionAccessForReviewerKind(reviewer.kind)}
 						api={reviewApi}
 						disabled={busy || refreshing}
+						externalChangeRevision={externalChangeRevision}
 						onStatusRefresh={onRefresh}
 						playlistId={playlist.id}
 						versionId={version.id}
@@ -262,6 +285,7 @@ function ActiveReview({
 										api={reviewApi}
 										collaborationReadOnly={collaboration.isViewer || collaboration.isOffline}
 										documentKey={`${canvasKey}:playlist-${playlist.id}`}
+										externalChangeRevision={externalChangeRevision}
 										licenseKey={reviewConfig.tldrawLicenseKey}
 										media={version.media}
 										playlistId={playlist.id}
@@ -277,6 +301,7 @@ function ActiveReview({
 										allowSnapshotImport={false}
 										collaborationReadOnly={collaboration.isViewer || collaboration.isOffline}
 										documentKey={`${canvasKey}:playlist-${playlist.id}`}
+										externalChangeRevision={externalChangeRevision}
 										key={`${canvasKey}:playlist-${playlist.id}:attachment-${version.media.attachmentId}`}
 										licenseKey={reviewConfig.tldrawLicenseKey}
 										media={version.media}
@@ -393,6 +418,8 @@ function formatVideoMetadata(media: Extract<ReviewMedia, { kind: 'video' }>) {
 
 function App() {
 	const {
+		changeStreamStatus,
+		externalChangeRevision,
 		navigating,
 		refresh,
 		refreshError,
@@ -407,7 +434,7 @@ function App() {
 
 	return (
 		<div className="review-app">
-			<ReviewHeader state={loadedState} />
+			<ReviewHeader changeStreamStatus={changeStreamStatus} state={loadedState} />
 			{state.status === 'loading' ? (
 				<ReviewMessage busy title="Loading review workspace">
 					Fetching your permitted ShotGrid projects, Playlists, and Versions.
@@ -424,6 +451,7 @@ function App() {
 			) : (
 				<ReviewWorkspace
 					busy={navigating}
+					externalChangeRevision={externalChangeRevision}
 					onRefresh={refresh}
 					onSelectPlaylist={selectPlaylist}
 					onSelectProject={selectProject}

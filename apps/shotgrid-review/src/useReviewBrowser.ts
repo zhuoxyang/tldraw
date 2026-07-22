@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ReviewApiClientError, type ReviewApiClient } from './reviewApiClient'
+import {
+	ReviewApiClientError,
+	type ReviewApiClient,
+	type ReviewChangeStreamStatus,
+} from './reviewApiClient'
 import {
 	loadReviewBrowser,
 	refreshReadyReviewBrowser,
@@ -31,8 +35,13 @@ export function useReviewBrowser(api: ReviewApiClient) {
 	const [navigating, setNavigating] = useState(false)
 	const [refreshError, setRefreshError] = useState<ReviewBrowserDisplayError | null>(null)
 	const [refreshing, setRefreshing] = useState(false)
+	const [changeStreamStatus, setChangeStreamStatus] =
+		useState<ReviewChangeStreamStatus>('connecting')
+	const [externalChangeRevision, setExternalChangeRevision] = useState(0)
 	const abortControllerRef = useRef<AbortController | null>(null)
+	const externalReloadControllerRef = useRef<AbortController | null>(null)
 	const hasLoadedStateRef = useRef(false)
+	const loadingRef = useRef(false)
 	const navigatingRef = useRef(false)
 	const refreshingRef = useRef(false)
 	const lastLoadRef = useRef<{
@@ -42,9 +51,11 @@ export function useReviewBrowser(api: ReviewApiClient) {
 
 	const load = useCallback(
 		async (request: ReviewSelectionRequest, historyMode: HistoryMode, showLoading = true) => {
+			externalReloadControllerRef.current?.abort()
 			abortControllerRef.current?.abort()
 			const controller = new AbortController()
 			abortControllerRef.current = controller
+			loadingRef.current = true
 			refreshingRef.current = false
 			setRefreshing(false)
 			setRefreshError(null)
@@ -78,6 +89,7 @@ export function useReviewBrowser(api: ReviewApiClient) {
 				setState({ error: toReviewBrowserDisplayError(error), status: 'error' })
 			} finally {
 				if (abortControllerRef.current === controller) {
+					loadingRef.current = false
 					navigatingRef.current = false
 					setNavigating(false)
 				}
@@ -109,9 +121,75 @@ export function useReviewBrowser(api: ReviewApiClient) {
 		window.addEventListener('popstate', loadCurrentPath)
 		return () => {
 			abortControllerRef.current?.abort()
+			externalReloadControllerRef.current?.abort()
 			window.removeEventListener('popstate', loadCurrentPath)
 		}
 	}, [load])
+
+	useEffect(() => {
+		let active = true
+		let reloadTimer: ReturnType<typeof setTimeout> | undefined
+
+		const scheduleReload = () => {
+			if (!active) return
+			if (reloadTimer !== undefined) clearTimeout(reloadTimer)
+			reloadTimer = setTimeout(() => void reloadCurrentRoute(), 250)
+		}
+
+		const reloadCurrentRoute = async () => {
+			reloadTimer = undefined
+			if (!active) return
+			if (loadingRef.current || navigatingRef.current || refreshingRef.current) {
+				scheduleReload()
+				return
+			}
+
+			const resolved = resolveReviewPath(window.location.pathname)
+			if (!resolved) return
+			const pathname = window.location.pathname
+			const controller = new AbortController()
+			externalReloadControllerRef.current?.abort()
+			externalReloadControllerRef.current = controller
+
+			try {
+				const result = await loadReviewBrowser(api, resolved.request, controller.signal)
+				if (controller.signal.aborted || !active || pathname !== window.location.pathname) {
+					return
+				}
+				hasLoadedStateRef.current = true
+				setRefreshError(null)
+				setState(result)
+				setExternalChangeRevision((revision) => revision + 1)
+			} catch (error) {
+				if (controller.signal.aborted || !active || isAbortError(error)) return
+				const displayError = toReviewBrowserDisplayError(error)
+				if (displayError.kind === 'not-found') {
+					hasLoadedStateRef.current = false
+					setState({ error: displayError, status: 'error' })
+				} else {
+					setRefreshError(displayError)
+				}
+			} finally {
+				if (externalReloadControllerRef.current === controller) {
+					externalReloadControllerRef.current = null
+				}
+			}
+		}
+
+		const unsubscribe = api.watchChanges({
+			onChange: scheduleReload,
+			onStatusChange(status) {
+				if (active) setChangeStreamStatus(status)
+			},
+		})
+		return () => {
+			active = false
+			if (reloadTimer !== undefined) clearTimeout(reloadTimer)
+			externalReloadControllerRef.current?.abort()
+			externalReloadControllerRef.current = null
+			unsubscribe()
+		}
+	}, [api])
 
 	const selectProject = useCallback(
 		(projectId: number) => {
@@ -167,6 +245,7 @@ export function useReviewBrowser(api: ReviewApiClient) {
 
 	const refresh = useCallback(() => {
 		if (state.status !== 'ready' || refreshingRef.current || navigatingRef.current) return
+		externalReloadControllerRef.current?.abort()
 		abortControllerRef.current?.abort()
 		const controller = new AbortController()
 		abortControllerRef.current = controller
@@ -197,6 +276,8 @@ export function useReviewBrowser(api: ReviewApiClient) {
 	}, [load])
 
 	return {
+		changeStreamStatus,
+		externalChangeRevision,
 		navigating,
 		refresh,
 		refreshError,

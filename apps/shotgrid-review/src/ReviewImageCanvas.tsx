@@ -123,6 +123,7 @@ export interface ReviewAnnotationEditorProps {
 	api: ReviewApiClient
 	collaborationReadOnly?: boolean
 	documentKey: string
+	externalChangeRevision?: number
 	licenseKey?: string
 	media: ReviewImageMedia
 	persistenceKey?: string
@@ -240,6 +241,7 @@ function ReadyReviewAnnotationEditor({
 	api,
 	collaborationReadOnly = false,
 	documentKey,
+	externalChangeRevision = 0,
 	image,
 	licenseKey,
 	persistenceKey,
@@ -274,10 +276,11 @@ function ReadyReviewAnnotationEditor({
 	collaborationReadOnlyRef.current = collaborationReadOnly
 	const noteOptionsRef = useRef(noteOptions)
 	noteOptionsRef.current = noteOptions
-	const review = useMemo<ReviewAnnotationContext>(
-		() => ({ projectId, scope: reviewScope, versionId: image.versionId }),
-		[image.versionId, projectId, reviewScope]
-	)
+	const review = useMemo<ReviewAnnotationContext>(() => {
+		// Invalidate callbacks that capture review context without persisting this local refresh token.
+		void externalChangeRevision
+		return { projectId, scope: reviewScope, versionId: image.versionId }
+	}, [externalChangeRevision, image.versionId, projectId, reviewScope])
 	const source = useMemo<ReviewAnnotationSource>(
 		() => ({
 			contentType: image.contentType,
@@ -392,7 +395,14 @@ function ReadyReviewAnnotationEditor({
 				}
 			})
 		return () => controller.abort()
-	}, [api, image.versionId, noteOptionsAttempt, playlistId, publicationAccess.status])
+	}, [
+		api,
+		externalChangeRevision,
+		image.versionId,
+		noteOptionsAttempt,
+		playlistId,
+		publicationAccess.status,
+	])
 
 	useEffect(() => {
 		if (!editor) return

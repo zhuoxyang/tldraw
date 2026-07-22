@@ -49,6 +49,7 @@ export function ReviewDecisionPanel({
 	access,
 	api,
 	disabled,
+	externalChangeRevision = 0,
 	onStatusRefresh,
 	playlistId,
 	versionId,
@@ -56,6 +57,7 @@ export function ReviewDecisionPanel({
 	access: ReviewDecisionAccess
 	api: ReviewApiClient
 	disabled: boolean
+	externalChangeRevision?: number
 	onStatusRefresh(): void
 	playlistId: number
 	versionId: number
@@ -124,7 +126,7 @@ export function ReviewDecisionPanel({
 				if (loadControllerRef.current === controller) loadControllerRef.current = null
 			})
 		return () => controller.abort()
-	}, [access.status, api, loadAttempt, playlistId, versionId])
+	}, [access.status, api, externalChangeRevision, loadAttempt, playlistId, versionId])
 
 	if (access.status === 'disabled') return null
 

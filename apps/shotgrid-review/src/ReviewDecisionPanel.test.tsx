@@ -111,6 +111,20 @@ describe('ReviewDecisionPanel', () => {
 		expect(container.textContent).toContain('Review lead')
 	})
 
+	it('reloads decision context for an external change without collapsing the panel', async () => {
+		const api = reviewApi({
+			getDecisionContext: vi.fn(async () => context),
+		})
+		const container = await renderPanel(api)
+		openPanel(container)
+		expect(container.textContent).toContain('Decision history')
+
+		await rerenderPanel(api, { externalChangeRevision: 1 })
+
+		expect(api.getDecisionContext).toHaveBeenCalledTimes(2)
+		expect(container.textContent).toContain('Decision history')
+	})
+
 	it('labels a truncated activity response as recent rather than a complete audit', async () => {
 		const api = reviewApi({
 			getDecisionContext: vi.fn(async () => ({
@@ -395,6 +409,7 @@ function reviewApi(overrides: Partial<ReviewApiClient> = {}) {
 const defaultProps = {
 	access: reviewDecisionAccessForReviewerKind('human'),
 	disabled: false,
+	externalChangeRevision: 0,
 	onStatusRefresh: () => undefined,
 	playlistId: 201,
 	versionId: 301,
